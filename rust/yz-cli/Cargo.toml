@@ -1,0 +1,20 @@
+[package]
+name = "yz-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "yz"
+path = "src/main.rs"
+
+[dependencies]
+yz-core = { path = "../yz-core" }
+yz-features = { path = "../yz-features" }
+yz-mcts = { path = "../yz-mcts" }
+yz-runtime = { path = "../yz-runtime" }
+yz-infer = { path = "../yz-infer" }
+yz-replay = { path = "../yz-replay" }
+yz-eval = { path = "../yz-eval" }
+yz-oracle = { path = "../yz-oracle" }
+yz-logging = { path = "../yz-logging" }
+

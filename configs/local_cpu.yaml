@@ -1,0 +1,35 @@
+# E0S1 placeholder config — full schema validation deferred to E0S2
+# See PRD section 13 for expected knobs
+
+# Inference endpoint
+inference:
+  bind: "unix:///tmp/yatzy_infer.sock"
+  device: "cpu"
+  max_batch: 32
+  max_wait_us: 1000
+
+# MCTS settings
+mcts:
+  c_puct: 1.5
+  budget_reroll: 100
+  budget_mark: 200
+  max_inflight_per_game: 4
+
+# Self-play
+selfplay:
+  games_per_iteration: 100
+  workers: 4
+  threads_per_worker: 2
+
+# Training
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  epochs: 10
+
+# Gating
+gating:
+  games: 100
+  win_rate_threshold: 0.55
+  paired_seed_swap: true
+
