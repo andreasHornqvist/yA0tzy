@@ -88,7 +88,10 @@ uv run pytest                        # Run Python tests (future)
 
 ### Configuration
 - All runtime knobs live in YAML files under `configs/`
-- Schema validation via Pydantic (Python side) — to be added in E0S2
+- Schema validation in both languages:
+  - **Rust**: `yz_core::Config` with serde (`rust/yz-core/src/config.rs`)
+  - **Python**: Pydantic models (`python/yatzy_az/config.py`)
+- The same YAML file loads in both Rust and Python
 - Config files are passed to both `yz` and `yatzy_az` CLIs
 
 ### Data Flow
@@ -118,6 +121,8 @@ uv run pytest                        # Run Python tests (future)
 | Looking for... | Location |
 |----------------|----------|
 | Game rules & scoring | `rust/yz-core/` |
+| Config schema (Rust) | `rust/yz-core/src/config.rs` |
+| Config schema (Python) | `python/yatzy_az/config.py` |
 | MCTS implementation | `rust/yz-mcts/` |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
@@ -155,7 +160,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E0S1 complete** (workspace + package skeleton)
+Current status: **E0S2 complete** (unified config schema)
 
 ---
 

@@ -1,35 +1,56 @@
-# E0S1 placeholder config — full schema validation deferred to E0S2
-# See PRD section 13 for expected knobs
+# yA0tzy Configuration - Local CPU
+# This config is validated by both Rust (serde) and Python (pydantic).
+# See documentation/prd.md for detailed knob descriptions.
 
-# Inference endpoint
+# Inference server settings
 inference:
+  # Bind address: "unix:///path/to/sock" or "tcp://host:port"
   bind: "unix:///tmp/yatzy_infer.sock"
+  # Device: "cpu" or "cuda"
   device: "cpu"
+  # Maximum batch size before flushing inference requests
   max_batch: 32
+  # Maximum wait time (microseconds) before flushing a partial batch
   max_wait_us: 1000
 
-# MCTS settings
+# MCTS (Monte Carlo Tree Search) settings
 mcts:
+  # PUCT exploration constant
   c_puct: 1.5
+  # Simulation budget for reroll decisions
   budget_reroll: 100
+  # Simulation budget for mark (category selection) decisions
   budget_mark: 200
+  # Maximum in-flight inference requests per game
   max_inflight_per_game: 4
+  # Dirichlet noise alpha (self-play only, not used in gating)
+  dirichlet_alpha: 0.3
+  # Dirichlet noise epsilon - fraction of noise mixed into priors (self-play only)
+  dirichlet_epsilon: 0.25
 
-# Self-play
+# Self-play settings
 selfplay:
+  # Number of games to generate per training iteration
   games_per_iteration: 100
+  # Number of worker processes
   workers: 4
+  # Number of threads per worker process
   threads_per_worker: 2
 
-# Training
+# Training settings
 training:
+  # Mini-batch size for gradient updates
   batch_size: 256
+  # Learning rate
   learning_rate: 0.001
+  # Number of epochs per training iteration
   epochs: 10
 
-# Gating
+# Gating (candidate vs best evaluation) settings
 gating:
+  # Number of games to play for evaluation
   games: 100
+  # Win rate threshold for promotion (0.55 = 55%)
   win_rate_threshold: 0.55
+  # Use paired seeds with side swap for reduced variance
   paired_seed_swap: true
-

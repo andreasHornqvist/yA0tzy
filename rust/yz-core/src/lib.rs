@@ -1,6 +1,11 @@
-//! Core rules/state/scoring lives here (placeholder for E0S1).
+//! yz-core: Game rules, scoring, state representation, and configuration.
 
-pub const VERSION: &str = "0.1.0";
+pub mod config;
+
+pub use config::{Config, ConfigError};
+
+/// Crate version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
@@ -11,5 +16,3 @@ mod tests {
         assert!(!VERSION.is_empty());
     }
 }
-
-

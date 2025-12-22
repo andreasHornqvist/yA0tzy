@@ -8,7 +8,10 @@ license = "MIT"
 authors = [
     { name = "Andreas Hornqvist" }
 ]
-dependencies = []
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
 
 [project.scripts]
 yatzy-az = "yatzy_az.__main__:main"
@@ -19,4 +22,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["yatzy_az"]
-
