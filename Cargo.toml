@@ -11,6 +11,7 @@ members = [
   "rust/yz-oracle",
   "rust/yz-logging",
   "rust/yz-cli",
+  "rust/swedish_yatzy_dp",
 ]
 
 [workspace.package]
@@ -20,5 +21,19 @@ license = "MIT OR Apache-2.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Optimize dev/test builds for the heavy oracle DP computation
+# Without this, tests take minutes instead of seconds
+[profile.dev.package.swedish_yatzy_dp]
+opt-level = 3
+
+[profile.test.package.swedish_yatzy_dp]
+opt-level = 3
+
+[profile.dev.package.yz-oracle]
+opt-level = 3
+
+[profile.test.package.yz-oracle]
+opt-level = 3
 
 

@@ -12,6 +12,15 @@
 use std::env;
 use std::process;
 
+/// Print the oracle's optimal expected score for a fresh game.
+fn cmd_oracle_expected() {
+    println!("Building oracle DP table...");
+    let info = yz_oracle::get_expected_score();
+    println!();
+    println!("Optimal expected score: {:.4}", info.expected_score);
+    println!("Build time: {:.2}s", info.build_time_secs);
+}
+
 fn print_help() {
     eprintln!(
         r#"yz - AlphaZero Yatzy CLI
@@ -63,7 +72,7 @@ fn main() {
             }
             match args[2].as_str() {
                 "expected" => {
-                    println!("Oracle expected score: ~248.44 (not yet implemented)");
+                    cmd_oracle_expected();
                 }
                 "sim" => {
                     println!("Oracle simulation (not yet implemented)");

@@ -27,7 +27,8 @@ yA0tzy/
 │   ├── yz-eval/              # Model gating (candidate vs best evaluation)
 │   ├── yz-oracle/            # Adapter to swedish_yatzy_dp perfect-play oracle
 │   ├── yz-logging/           # NDJSON event logging, metrics
-│   └── yz-cli/               # `yz` binary (CLI entrypoint)
+│   ├── yz-cli/               # `yz` binary (CLI entrypoint)
+│   └── swedish_yatzy_dp/     # Vendored oracle (optimal-play DP solver)
 │
 ├── python/                   # Python package
 │   ├── pyproject.toml        # PEP 621 metadata (uv-compatible)
@@ -135,6 +136,8 @@ See `.github/workflows/ci.yml` for details.
 | Game rules & scoring | `rust/yz-core/` |
 | Config schema (Rust) | `rust/yz-core/src/config.rs` |
 | Config schema (Python) | `python/yatzy_az/config.py` |
+| Oracle (optimal play solver) | `rust/swedish_yatzy_dp/` |
+| Oracle adapter | `rust/yz-oracle/` |
 | MCTS implementation | `rust/yz-mcts/` |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
@@ -172,7 +175,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E0S3 complete** (CI + formatting)
+Current status: **E1S1 complete** (oracle vendored, `yz oracle expected` works)
 
 ---
 

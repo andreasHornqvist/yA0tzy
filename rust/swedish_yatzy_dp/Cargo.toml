@@ -1,0 +1,15 @@
+[package]
+name = "swedish_yatzy_dp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Optimal-play oracle for Swedish/Scandinavian Yatzy"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rustc-hash = "2.1"      # Fast hashing for integer keys
+rayon = "1.10"          # Parallel iteration
+
+# Note: Profile settings moved to workspace root for consistency

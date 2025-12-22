@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-
+swedish_yatzy_dp = { path = "../swedish_yatzy_dp" }
