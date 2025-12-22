@@ -11,5 +11,3 @@ mod tests {
         assert!(!VERSION.is_empty());
     }
 }
-
-

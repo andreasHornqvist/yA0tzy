@@ -42,7 +42,8 @@ def main() -> int:
         description="AlphaZero-style training for 2-player Yatzy",
     )
     parser.add_argument(
-        "-V", "--version",
+        "-V",
+        "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
@@ -87,4 +88,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

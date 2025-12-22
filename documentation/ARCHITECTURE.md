@@ -69,13 +69,25 @@ yA0tzy/
 cargo test --workspace          # Run all Rust tests
 cargo build --release           # Release build
 cargo run --bin yz -- --help    # Run CLI
+cargo fmt --check               # Check formatting
+cargo clippy --workspace -- -D warnings  # Lint
 
 # Python
 cd python
-uv run python -m yatzy_az --help    # Run Python CLI
-uv sync                              # Install dependencies
-uv run pytest                        # Run Python tests (future)
+uv sync --all-extras                 # Install all dependencies (including dev)
+uv run python -m yatzy_az --help     # Run Python CLI
+uv run ruff check .                  # Lint
+uv run ruff format --check .         # Check formatting
+uv run pytest                        # Run tests (future)
 ```
+
+### CI
+
+GitHub Actions runs on every push/PR to `main`:
+- **Rust**: fmt, clippy, test
+- **Python**: ruff check, ruff format, config validation
+
+See `.github/workflows/ci.yml` for details.
 
 ---
 
@@ -160,7 +172,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E0S2 complete** (unified config schema)
+Current status: **E0S3 complete** (CI + formatting)
 
 ---
 

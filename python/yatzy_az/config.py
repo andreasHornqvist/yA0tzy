@@ -5,7 +5,6 @@ Rust and Python components. The same YAML file should load in both.
 """
 
 from pathlib import Path
-from typing import Union
 
 import yaml
 from pydantic import BaseModel, Field
@@ -32,9 +31,7 @@ class MctsConfig(BaseModel):
     budget_mark: int = Field(
         description="Simulation budget for mark (category selection) decisions"
     )
-    max_inflight_per_game: int = Field(
-        description="Maximum in-flight inference requests per game"
-    )
+    max_inflight_per_game: int = Field(description="Maximum in-flight inference requests per game")
     dirichlet_alpha: float = Field(
         default=0.3, description="Dirichlet noise alpha (self-play only)"
     )
@@ -66,9 +63,7 @@ class GatingConfig(BaseModel):
     """Gating (candidate vs best evaluation) configuration."""
 
     games: int = Field(description="Number of games to play for evaluation")
-    win_rate_threshold: float = Field(
-        description="Win rate threshold for promotion (0.55 = 55%)"
-    )
+    win_rate_threshold: float = Field(description="Win rate threshold for promotion (0.55 = 55%)")
     paired_seed_swap: bool = Field(
         description="Use paired seeds with side swap for reduced variance"
     )
@@ -84,7 +79,7 @@ class Config(BaseModel):
     gating: GatingConfig
 
 
-def load_config(path: Union[str, Path]) -> Config:
+def load_config(path: str | Path) -> Config:
     """Load configuration from a YAML file.
 
     Args:
@@ -134,4 +129,3 @@ if __name__ == "__main__":
     config = load_config(config_path)
     print(f"Loaded config from {config_path}")
     print(config.model_dump_json(indent=2))
-
