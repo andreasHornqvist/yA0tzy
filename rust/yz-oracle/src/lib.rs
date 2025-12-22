@@ -6,7 +6,11 @@
 use std::time::Instant;
 
 // Re-export core oracle types
-pub use swedish_yatzy_dp::{Action, YatzyDP, CAT_NAMES, FULL_MASK, NUM_CATS};
+pub use swedish_yatzy_dp::game::scores_for_dice;
+pub use swedish_yatzy_dp::{Action, CAT_NAMES, FULL_MASK, NUM_CATS, YatzyDP};
+
+#[cfg(test)]
+mod golden_tests;
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

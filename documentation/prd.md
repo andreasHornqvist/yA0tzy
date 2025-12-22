@@ -828,6 +828,20 @@ Below are epics with implementable stories. Each story includes **deliverable + 
 
 ---
 
+## Epic R1 — Refactor: Code quality & tech debt
+
+**Goal:** Address accumulated tech debt and code quality issues without changing functionality.
+
+**Stories**
+
+1. **Fix oracle clippy warnings**
+
+   * Remove `#![allow(...)]` directives from `swedish_yatzy_dp` and fix the underlying clippy issues
+   * Refactor `needless_range_loop`, `comparison_chain`, `manual_contains`, `new_without_default`, `wrong_self_convention` warnings
+   * **AC:** `cargo clippy --workspace -- -D warnings` passes without any `#![allow(...)]` in the oracle crate.
+
+---
+
 ## 17) Risks & mitigations (v1)
 
 * **Rules drift**: mitigated by oracle-aligned tests + scorer parity tests.
