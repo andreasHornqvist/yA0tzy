@@ -136,6 +136,7 @@ See `.github/workflows/ci.yml` for details.
 | Game rules & scoring | `rust/yz-core/` |
 | Config schema (Rust) | `rust/yz-core/src/config.rs` |
 | Config schema (Python) | `python/yatzy_az/config.py` |
+| Feature schema + encoder | `rust/yz-features/` |
 | Oracle (optimal play solver) | `rust/swedish_yatzy_dp/` |
 | Oracle adapter | `rust/yz-oracle/` |
 | MCTS implementation | `rust/yz-mcts/` |
@@ -152,7 +153,7 @@ See `.github/workflows/ci.yml` for details.
 
 | Adding... | Put it in |
 |-----------|-----------|
-| New game logic | `rust/yz-core/` |
+| New game logic (actions/scoring/chance) | `rust/yz-core/` |
 | New feature encoding | `rust/yz-features/` |
 | MCTS improvements | `rust/yz-mcts/` |
 | New model architecture | `python/yatzy_az/model/` |
@@ -175,7 +176,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E1S3 complete** (oracle simulation command)
+Current status: **E3S1 complete** (FeatureSchema v1 + canonical encoder)
 
 ---
 
