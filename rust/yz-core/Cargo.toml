@@ -11,3 +11,4 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "1"
+swedish_yatzy_dp = { path = "../swedish_yatzy_dp" }

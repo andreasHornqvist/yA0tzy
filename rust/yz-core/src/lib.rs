@@ -5,6 +5,9 @@ pub mod action;
 mod action_legal_tests;
 pub mod config;
 pub mod legal;
+pub mod scoring;
+#[cfg(test)]
+mod scoring_tests;
 
 pub use action::{
     action_to_index, avail_bit_for_cat, index_to_action, is_mark_index, mark_cat_from_index,
@@ -12,6 +15,7 @@ pub use action::{
 };
 pub use config::{Config, ConfigError};
 pub use legal::legal_action_mask;
+pub use scoring::{apply_mark_score, scores_for_dice};
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
