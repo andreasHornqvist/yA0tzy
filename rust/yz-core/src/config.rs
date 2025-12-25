@@ -102,6 +102,13 @@ pub struct GatingConfig {
     pub win_rate_threshold: f64,
     /// Whether to use paired seed + side swap for reduced variance.
     pub paired_seed_swap: bool,
+    /// Whether to use deterministic event-keyed chance for gating/eval (optional).
+    #[serde(default = "default_gating_deterministic_chance")]
+    pub deterministic_chance: bool,
+}
+
+fn default_gating_deterministic_chance() -> bool {
+    true
 }
 
 impl Config {
@@ -137,6 +144,7 @@ mod tests {
         assert_eq!(config.training.batch_size, 256);
         assert_eq!(config.gating.games, 100);
         assert!(config.gating.paired_seed_swap);
+        assert!(config.gating.deterministic_chance);
     }
 
     #[test]

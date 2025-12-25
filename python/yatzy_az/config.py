@@ -67,6 +67,13 @@ class GatingConfig(BaseModel):
     paired_seed_swap: bool = Field(
         description="Use paired seeds with side swap for reduced variance"
     )
+    deterministic_chance: bool = Field(
+        default=True,
+        description=(
+            "Use deterministic event-keyed chance stream for gating/eval (optional). "
+            "Recommended for reproducible experiments; disable for more realistic variance."
+        ),
+    )
 
 
 class Config(BaseModel):

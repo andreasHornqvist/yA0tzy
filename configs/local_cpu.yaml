@@ -54,3 +54,5 @@ gating:
   win_rate_threshold: 0.55
   # Use paired seeds with side swap for reduced variance
   paired_seed_swap: true
+  # Optional: use deterministic event-keyed chance stream for reproducible evals
+  deterministic_chance: true

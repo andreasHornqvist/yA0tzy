@@ -3,6 +3,9 @@
 pub mod action;
 #[cfg(test)]
 mod action_legal_tests;
+pub mod chance;
+#[cfg(test)]
+mod chance_tests;
 pub mod config;
 pub mod legal;
 pub mod scoring;
@@ -13,6 +16,7 @@ pub use action::{
     action_to_index, avail_bit_for_cat, index_to_action, is_mark_index, mark_cat_from_index,
     Action, A, NUM_CATS,
 };
+pub use chance::{apply_keepmask, roll5, EventKey};
 pub use config::{Config, ConfigError};
 pub use legal::legal_action_mask;
 pub use scoring::{apply_mark_score, scores_for_dice};

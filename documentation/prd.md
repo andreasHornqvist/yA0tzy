@@ -191,9 +191,10 @@ This is critical to avoid “duplicate dice index exploits”: rerolling one of 
 ### 6.2 Modes
 
 * **Self-play mode**: can use fast RNG seeded per episode; determinism not required.
-* **Gating/eval mode**: strict determinism:
+* **Gating/eval mode**: determinism is an **option** (recommended for model selection experiments and debugging, but not required):
 
-  * deterministic chance stream
+  * **Optional deterministic chance stream** (event-keyed). Use this when you want reproducible comparisons / ablations.
+  * For long-running training pipelines, avoid making chance deterministic globally to reduce the risk of overfitting to specific seed streams.
   * no Dirichlet noise
   * temperature=0
   * deterministic tie-breaking
