@@ -2,40 +2,6 @@
 
 use crate::schema::{F, SCORE_NORM};
 
-/// Minimal game-state view needed for encoding.
-///
-/// This is intentionally small and self-contained (no dependency on a full engine struct yet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlayerView {
-    /// Category availability mask (oracle convention: bit (14-cat) is 1 if available).
-    pub avail_mask: u16,
-    /// Upper total (clamped to 63).
-    pub upper_total_cap: u8,
-    /// Total score so far.
-    pub total_score: i16,
-}
-
-/// Minimal game-state view for encoding, including player-to-move.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GameStateView {
-    pub players: [PlayerView; 2],
-    /// Dice (sorted ascending).
-    pub dice_sorted: [u8; 5],
-    pub rerolls_left: u8,
-    pub player_to_move: u8, // 0 or 1
-}
-
-impl GameStateView {
-    pub fn swap_players(self) -> Self {
-        Self {
-            players: [self.players[1], self.players[0]],
-            dice_sorted: self.dice_sorted,
-            rerolls_left: self.rerolls_left,
-            player_to_move: 1u8.saturating_sub(self.player_to_move),
-        }
-    }
-}
-
 fn filled_count_from_avail(avail_mask: u16) -> u8 {
     // 15 categories total. filled_count = 15 - popcount(avail_mask).
     let avail = (avail_mask & 0x7FFF).count_ones() as u8;
@@ -60,7 +26,7 @@ fn push_scalar(out: &mut [f32], offset: &mut usize, v: f32) {
 }
 
 /// Encode state into feature vector v1, from POV of `player_to_move`.
-pub fn encode_state_v1(s: &GameStateView) -> [f32; F] {
+pub fn encode_state_v1(s: &yz_core::GameState) -> [f32; F] {
     assert!(s.player_to_move <= 1, "player_to_move must be 0 or 1");
     let me = s.players[s.player_to_move as usize];
     let opp = s.players[(1 - s.player_to_move) as usize];

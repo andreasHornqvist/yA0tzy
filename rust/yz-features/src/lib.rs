@@ -3,7 +3,7 @@
 pub mod encode;
 pub mod schema;
 
-pub use encode::{encode_state_v1, GameStateView, PlayerView};
+pub use encode::encode_state_v1;
 pub use schema::{F, FEATURE_SCHEMA_ID, SCORE_NORM};
 
 /// Crate version.
@@ -20,14 +20,14 @@ mod tests {
 
     #[test]
     fn swap_players_encoding_is_consistent() {
-        let s = GameStateView {
+        let s = yz_core::GameState {
             players: [
-                PlayerView {
+                yz_core::PlayerState {
                     avail_mask: 0x7FFF,
                     upper_total_cap: 10,
                     total_score: 50,
                 },
-                PlayerView {
+                yz_core::PlayerState {
                     avail_mask: 0x7FFF & !(1u16 << 14), // ones filled for opp
                     upper_total_cap: 20,
                     total_score: 60,

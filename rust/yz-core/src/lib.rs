@@ -11,6 +11,9 @@ pub mod legal;
 pub mod scoring;
 #[cfg(test)]
 mod scoring_tests;
+pub mod state;
+#[cfg(test)]
+mod state_tests;
 
 pub use action::{
     action_to_index, avail_bit_for_cat, index_to_action, is_mark_index, mark_cat_from_index,
@@ -20,6 +23,7 @@ pub use chance::{apply_keepmask, roll5, EventKey};
 pub use config::{Config, ConfigError};
 pub use legal::legal_action_mask;
 pub use scoring::{apply_mark_score, scores_for_dice};
+pub use state::{outcome_to_z, GameState, PlayerState};
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
