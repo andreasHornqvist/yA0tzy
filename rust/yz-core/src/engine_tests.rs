@@ -69,6 +69,41 @@ fn deterministic_reproducibility_same_seed_same_actions() {
 }
 
 #[test]
+fn golden_keepmask_transition_deterministic_hardcoded() {
+    // Golden: lock in deterministic event-key mapping at the engine layer.
+    //
+    // Setup chosen so round_idx=0 (FULL_MASK) and this KeepMask consumes roll_idx=1
+    // (first reroll from rerolls_left=2).
+    let episode_seed = 123_456_789u64;
+    let mut ctx = TurnContext::new_deterministic(episode_seed);
+
+    let s = crate::GameState {
+        players: [
+            crate::PlayerState {
+                avail_mask: crate::FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+            crate::PlayerState {
+                avail_mask: crate::FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+        ],
+        dice_sorted: [1, 1, 1, 1, 1],
+        rerolls_left: 2,
+        player_to_move: 0,
+    };
+
+    let next = apply_action(s, Action::KeepMask(0), &mut ctx).unwrap();
+    assert_eq!(next.rerolls_left, 1);
+    assert_invariants(&next);
+
+    // Golden expected dice for EventKey{episode_seed=123456789, player=0, round_idx=0, roll_idx=1}.
+    assert_eq!(next.dice_sorted, [2, 3, 5, 5, 6]);
+}
+
+#[test]
 fn random_playout_terminates_in_30_marks_deterministic_mode() {
     let mut ctx = TurnContext::new_deterministic(1234);
     let mut s = initial_state(&mut ctx);
@@ -131,6 +166,48 @@ fn random_playout_terminates_in_30_marks_rng_mode() {
 
     assert!(is_terminal(&s), "playout did not terminate");
     assert_eq!(marks, 30);
+}
+
+#[test]
+fn golden_mark_transition_bonus_clamp_and_turn_reset() {
+    // Golden: mark transition must apply bonus/clamp and advance to next player's fresh turn dice.
+    let episode_seed = 123_456_789u64;
+    let mut ctx = TurnContext::new_deterministic(episode_seed);
+
+    // Player 0 is about to cross the upper bonus boundary by marking sixes with five 6s.
+    let s = crate::GameState {
+        players: [
+            crate::PlayerState {
+                avail_mask: crate::FULL_MASK,
+                upper_total_cap: 60,
+                total_score: 100,
+            },
+            crate::PlayerState {
+                avail_mask: crate::FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+        ],
+        dice_sorted: [6, 6, 6, 6, 6],
+        rerolls_left: 0,
+        player_to_move: 0,
+    };
+
+    let next = apply_action(s, Action::Mark(5), &mut ctx).unwrap();
+    assert_invariants(&next);
+
+    // p0 update: cat 5 filled, +80 delta (30 raw + 50 bonus), upper_total_cap clamped to 63.
+    let expected_p0_avail = crate::FULL_MASK & !crate::avail_bit_for_cat(5);
+    assert_eq!(next.players[0].avail_mask, expected_p0_avail);
+    assert_eq!(next.players[0].upper_total_cap, 63);
+    assert_eq!(next.players[0].total_score, 180);
+
+    // Turn reset for p1
+    assert_eq!(next.player_to_move, 1);
+    assert_eq!(next.rerolls_left, 2);
+
+    // Golden expected dice for EventKey{episode_seed=123456789, player=1, round_idx=0, roll_idx=0}.
+    assert_eq!(next.dice_sorted, [2, 5, 5, 6, 6]);
 }
 
 fn terminal_state(scores: (i16, i16), player_to_move: u8) -> crate::GameState {
@@ -198,4 +275,57 @@ fn terminal_z_antisymmetry_under_swap_players() {
         assert_eq!(z, 0.0);
         assert_eq!(z2, 0.0);
     }
+}
+
+#[test]
+fn deterministic_full_game_trajectory_is_reproducible() {
+    fn policy(s: &crate::GameState) -> Action {
+        if s.rerolls_left > 0 {
+            return Action::KeepMask(0);
+        }
+        // Lowest available category.
+        let p = s.player_to_move as usize;
+        for cat in 0u8..15 {
+            if (s.players[p].avail_mask & crate::avail_bit_for_cat(cat)) != 0 {
+                return Action::Mark(cat);
+            }
+        }
+        panic!("no available categories but not terminal?");
+    }
+
+    let seed = 2025u64;
+
+    let mut ctx1 = TurnContext::new_deterministic(seed);
+    let mut s1 = initial_state(&mut ctx1);
+    let mut marks1 = 0usize;
+    for _ in 0..10_000 {
+        if is_terminal(&s1) {
+            break;
+        }
+        let a = policy(&s1);
+        if matches!(a, Action::Mark(_)) {
+            marks1 += 1;
+        }
+        s1 = apply_action(s1, a, &mut ctx1).unwrap();
+    }
+    assert!(is_terminal(&s1));
+    assert_eq!(marks1, 30);
+
+    let mut ctx2 = TurnContext::new_deterministic(seed);
+    let mut s2 = initial_state(&mut ctx2);
+    let mut marks2 = 0usize;
+    for _ in 0..10_000 {
+        if is_terminal(&s2) {
+            break;
+        }
+        let a = policy(&s2);
+        if matches!(a, Action::Mark(_)) {
+            marks2 += 1;
+        }
+        s2 = apply_action(s2, a, &mut ctx2).unwrap();
+    }
+    assert!(is_terminal(&s2));
+    assert_eq!(marks2, 30);
+
+    assert_eq!(s1, s2);
 }
