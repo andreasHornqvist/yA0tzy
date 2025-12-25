@@ -7,6 +7,9 @@ pub mod chance;
 #[cfg(test)]
 mod chance_tests;
 pub mod config;
+pub mod engine;
+#[cfg(test)]
+mod engine_tests;
 pub mod legal;
 pub mod scoring;
 #[cfg(test)]
@@ -21,6 +24,9 @@ pub use action::{
 };
 pub use chance::{apply_keepmask, roll5, EventKey};
 pub use config::{Config, ConfigError};
+pub use engine::{
+    apply_action, initial_state, is_terminal, ApplyError, ChanceMode, TurnContext, FULL_MASK,
+};
 pub use legal::legal_action_mask;
 pub use scoring::{apply_mark_score, scores_for_dice};
 pub use state::{outcome_to_z, GameState, PlayerState};

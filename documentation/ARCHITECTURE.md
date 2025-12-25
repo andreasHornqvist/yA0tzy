@@ -135,6 +135,7 @@ See `.github/workflows/ci.yml` for details.
 |----------------|----------|
 | Game rules & scoring | `rust/yz-core/` |
 | Canonical GameState + POV swap | `rust/yz-core/src/state.rs` |
+| Game rules engine (state transitions) | `rust/yz-core/src/engine.rs` |
 | Config schema (Rust) | `rust/yz-core/src/config.rs` |
 | Config schema (Python) | `python/yatzy_az/config.py` |
 | Feature schema + encoder | `rust/yz-features/` |
@@ -177,7 +178,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E3S2 complete** (canonical GameState + POV swap semantics)
+Current status: **E3.5.1 complete** (yz-core rules engine: apply_action transitions)
 
 ---
 
