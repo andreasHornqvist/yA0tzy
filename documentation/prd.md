@@ -634,7 +634,7 @@ Below are epics with implementable stories. Each story includes **deliverable + 
    * encode from POV of current player
    * **Value/sign contract:** NN `value` is interpreted from the POV of the **encoded player-to-move**. Therefore, when traversing an edge that changes `player_to_move`, MCTS backup must **negate** the child value when expressing it in the parent node’s POV (avoid double-flips by defining one convention and sticking to it everywhere).
    * **AC:** swapping players produces consistent mirrored encoding.
-   * **AC (antisymmetry sanity):** for any state `s`, define `swap_players(s)` as: swap per-player boards/totals, flip `player_to_move`, keep turn state (`dice`, `rerolls_left`) identical. Then `encode(s)` and `encode(swap_players(s))` must be consistent mirror/permute views, and terminal/backup targets must satisfy `z(s) = -z(swap_players(s))` (and similarly `V(s) ≈ -V(swap_players(s))` under deterministic policy/inference).
+   * **AC (swap sanity):** for any state `s`, define `swap_players(s)` as: swap per-player boards/totals, flip `player_to_move`, keep turn state (`dice`, `rerolls_left`) identical. Then `encode(s)` and `encode(swap_players(s))` must be consistent mirror/permute views.\n+\n+     **Value/sign note:** if your value target is defined from the POV of the **encoded player-to-move**, then swapping players *and* flipping `player_to_move` leaves that POV invariant. In that convention, terminal/backup targets satisfy `z(s) = z(swap_players(s))` (and similarly `V(s) ≈ V(swap_players(s))`).\n+\n+     Antisymmetry holds when comparing the **same fixed POV** across swapped states (e.g. player-0 POV), not when also flipping the POV with `player_to_move`.
 
 ---
 
@@ -664,7 +664,7 @@ Below are epics with implementable stories. Each story includes **deliverable + 
    * Define terminal condition: both players have filled all 15 categories.
    * Define winner/draw: compare `total_score` at terminal (and define tie handling).
    * Provide helper to compute `z` from POV of encoded player-to-move (used by replay writer later).
-   * **AC:** `z(s) = -z(swap_players(s))` holds for terminal outcomes.
+   * **AC:** for terminal outcomes, if `z` is defined from the POV of `player_to_move`, then `z(s) = z(swap_players(s))` (because `swap_players` also flips `player_to_move`). Antisymmetry holds only when comparing the same fixed POV across swapped states.
 
 3. **Golden transition tests**
 

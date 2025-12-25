@@ -7,7 +7,7 @@ use crate::action::{action_to_index, avail_bit_for_cat, Action, NUM_CATS};
 use crate::chance::{self, EventKey};
 use crate::legal::legal_action_mask;
 use crate::scoring::apply_mark_score;
-use crate::state::{GameState, PlayerState};
+use crate::state::{outcome_to_z, GameState, PlayerState};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
@@ -99,6 +99,41 @@ pub fn initial_state(ctx: &mut TurnContext) -> GameState {
 /// Terminal when both players have filled all 15 categories.
 pub fn is_terminal(s: &GameState) -> bool {
     s.players[0].avail_mask == 0 && s.players[1].avail_mask == 0
+}
+
+/// Determine winner at terminal.
+///
+/// Returns:
+/// - `0` if player 0 wins
+/// - `1` if player 1 wins
+/// - `2` for draw
+pub fn terminal_winner(state: &GameState) -> Result<u8, ApplyError> {
+    if !is_terminal(state) {
+        return Err(ApplyError::InvalidState {
+            msg: "terminal_winner called on non-terminal state",
+        });
+    }
+
+    let s0 = state.players[0].total_score;
+    let s1 = state.players[1].total_score;
+    if s0 > s1 {
+        Ok(0)
+    } else if s1 > s0 {
+        Ok(1)
+    } else {
+        Ok(2)
+    }
+}
+
+/// Compute terminal `z` from the POV of `pov_player` (0 or 1).
+pub fn terminal_z_from_pov(state: &GameState, pov_player: u8) -> Result<f32, ApplyError> {
+    let winner = terminal_winner(state)?;
+    Ok(outcome_to_z(winner, pov_player))
+}
+
+/// Compute terminal `z` from the POV of the encoded `player_to_move`.
+pub fn terminal_z_from_player_to_move(state: &GameState) -> Result<f32, ApplyError> {
+    terminal_z_from_pov(state, state.player_to_move)
 }
 
 /// Apply an action to a state, producing the next state (or an error if illegal).

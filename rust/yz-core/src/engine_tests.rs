@@ -1,5 +1,8 @@
 use crate::action::{index_to_action, Action, A};
-use crate::engine::{apply_action, initial_state, is_terminal, ApplyError, TurnContext};
+use crate::engine::{
+    apply_action, initial_state, is_terminal, terminal_winner, terminal_z_from_player_to_move,
+    ApplyError, TurnContext,
+};
 use crate::legal::legal_action_mask;
 
 use rand::Rng;
@@ -128,4 +131,71 @@ fn random_playout_terminates_in_30_marks_rng_mode() {
 
     assert!(is_terminal(&s), "playout did not terminate");
     assert_eq!(marks, 30);
+}
+
+fn terminal_state(scores: (i16, i16), player_to_move: u8) -> crate::GameState {
+    crate::GameState {
+        players: [
+            crate::PlayerState {
+                avail_mask: 0,
+                upper_total_cap: 0,
+                total_score: scores.0,
+            },
+            crate::PlayerState {
+                avail_mask: 0,
+                upper_total_cap: 0,
+                total_score: scores.1,
+            },
+        ],
+        dice_sorted: [1, 1, 1, 1, 1],
+        rerolls_left: 0,
+        player_to_move,
+    }
+}
+
+#[test]
+fn terminal_winner_and_draw_cases() {
+    // p0 wins
+    let s = terminal_state((10, 9), 0);
+    assert_eq!(terminal_winner(&s).unwrap(), 0);
+
+    // p1 wins
+    let s = terminal_state((9, 10), 0);
+    assert_eq!(terminal_winner(&s).unwrap(), 1);
+
+    // draw
+    let s = terminal_state((10, 10), 0);
+    assert_eq!(terminal_winner(&s).unwrap(), 2);
+}
+
+#[test]
+fn terminal_z_antisymmetry_under_swap_players() {
+    // NOTE: `terminal_z_from_player_to_move` returns z from the POV of `player_to_move`.
+    // Because `swap_players()` also flips `player_to_move`, the terminal z is invariant under
+    // swapping players (we're always measuring from the current player's POV).
+
+    // p0 win
+    for player_to_move in [0u8, 1u8] {
+        let s = terminal_state((20, 10), player_to_move);
+        let z = terminal_z_from_player_to_move(&s).unwrap();
+        let z2 = terminal_z_from_player_to_move(&s.swap_players()).unwrap();
+        assert_eq!(z, z2);
+    }
+
+    // p1 win
+    for player_to_move in [0u8, 1u8] {
+        let s = terminal_state((10, 20), player_to_move);
+        let z = terminal_z_from_player_to_move(&s).unwrap();
+        let z2 = terminal_z_from_player_to_move(&s.swap_players()).unwrap();
+        assert_eq!(z, z2);
+    }
+
+    // draw
+    for player_to_move in [0u8, 1u8] {
+        let s = terminal_state((10, 10), player_to_move);
+        let z = terminal_z_from_player_to_move(&s).unwrap();
+        let z2 = terminal_z_from_player_to_move(&s.swap_players()).unwrap();
+        assert_eq!(z, 0.0);
+        assert_eq!(z2, 0.0);
+    }
 }

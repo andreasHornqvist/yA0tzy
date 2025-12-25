@@ -178,7 +178,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E3.5.1 complete** (yz-core rules engine: apply_action transitions)
+Current status: **E3.5.2 complete** (terminal winner/draw + z POV helpers)
 
 ---
 
