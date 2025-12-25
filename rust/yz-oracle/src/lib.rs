@@ -7,7 +7,7 @@ use std::time::Instant;
 
 // Re-export core oracle types
 pub use swedish_yatzy_dp::game::scores_for_dice;
-pub use swedish_yatzy_dp::{Action, CAT_NAMES, FULL_MASK, NUM_CATS, YatzyDP};
+pub use swedish_yatzy_dp::{Action, YatzyDP, CAT_NAMES, FULL_MASK, NUM_CATS};
 
 #[cfg(test)]
 mod golden_tests;
@@ -54,6 +54,57 @@ pub fn oracle() -> &'static YatzyDP {
     ORACLE.get_or_init(YatzyDP::new)
 }
 
+/// Summary statistics for a simulation run.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreSummary {
+    pub mean: f64,
+    pub median: i32,
+    pub std_dev: f64,
+    pub min: i32,
+    pub max: i32,
+}
+
+/// Report from oracle solitaire simulation.
+#[derive(Debug, Clone)]
+pub struct SimulationReport {
+    pub scores: Vec<i32>,
+    pub bonus_count: usize,
+    pub bonus_rate: f64,
+    pub summary: ScoreSummary,
+}
+
+/// Simulate `n` oracle solitaire games with RNG seed `seed`.
+///
+/// Uses the vendored oracle's simulation utilities.
+pub fn simulate(n: usize, seed: u64) -> SimulationReport {
+    let sim = swedish_yatzy_dp::eval::simulate_games(oracle(), n, seed);
+    let s = swedish_yatzy_dp::eval::summarize_scores(&sim.scores);
+    let summary = ScoreSummary {
+        mean: s.mean,
+        median: s.median,
+        std_dev: s.std_dev,
+        min: s.min,
+        max: s.max,
+    };
+    let bonus_rate = if n == 0 {
+        0.0
+    } else {
+        sim.bonus_count as f64 / n as f64
+    };
+
+    SimulationReport {
+        scores: sim.scores,
+        bonus_count: sim.bonus_count,
+        bonus_rate,
+        summary,
+    }
+}
+
+/// Print a score histogram (bucket size = 10).
+pub fn print_histogram(scores: &[i32]) {
+    swedish_yatzy_dp::eval::print_histogram(scores);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +144,13 @@ mod tests {
 
         // EV should be reasonable
         assert!(ev > 200.0 && ev < 300.0);
+    }
+
+    #[test]
+    fn simulate_smoke() {
+        let report = simulate(100, 0);
+        assert_eq!(report.scores.len(), 100);
+        assert!(report.summary.mean > 200.0);
+        assert!(report.bonus_rate >= 0.0 && report.bonus_rate <= 1.0);
     }
 }

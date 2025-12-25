@@ -175,7 +175,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E1S2 complete** (golden tests for masks/actions)
+Current status: **E1S3 complete** (oracle simulation command)
 
 ---
 

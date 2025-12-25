@@ -416,4 +416,3 @@ fn oracle_respects_avail_mask() {
         }
     }
 }
-

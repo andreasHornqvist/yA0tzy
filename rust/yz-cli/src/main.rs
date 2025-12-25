@@ -21,6 +21,84 @@ fn cmd_oracle_expected() {
     println!("Build time: {:.2}s", info.build_time_secs);
 }
 
+fn cmd_oracle_sim(args: &[String]) {
+    let mut games: usize = 10_000;
+    let mut seed: u64 = 0;
+    let mut no_hist = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz oracle sim
+
+USAGE:
+    yz oracle sim [--games N] [--seed S] [--no-hist]
+
+OPTIONS:
+    --games N    Number of games to simulate (default: 10000)
+    --seed S     RNG seed (default: 0)
+    --no-hist    Skip printing histogram
+"#
+                );
+                return;
+            }
+            "--games" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --games");
+                    process::exit(1);
+                }
+                games = args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --games value: {}", args[i + 1]);
+                    process::exit(1);
+                });
+                i += 2;
+            }
+            "--seed" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --seed");
+                    process::exit(1);
+                }
+                seed = args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --seed value: {}", args[i + 1]);
+                    process::exit(1);
+                });
+                i += 2;
+            }
+            "--no-hist" => {
+                no_hist = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("Unknown option for `yz oracle sim`: {}", other);
+                eprintln!("Run `yz oracle sim --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    println!("Building oracle DP table...");
+    let _ = yz_oracle::oracle(); // build+cache
+    println!("Running simulation...");
+
+    let report = yz_oracle::simulate(games, seed);
+    let s = report.summary;
+
+    println!();
+    println!("Evaluation:");
+    println!("  - Games: {}", games);
+    println!(
+        "  - Score: mean={:.2}, median={}, std={:.2}, min={}, max={}",
+        s.mean, s.median, s.std_dev, s.min, s.max
+    );
+    println!("  - Upper bonus rate: {:.1}%", report.bonus_rate * 100.0);
+
+    if !no_hist {
+        yz_oracle::print_histogram(&report.scores);
+    }
+}
+
 fn print_help() {
     eprintln!(
         r#"yz - AlphaZero Yatzy CLI
@@ -75,8 +153,7 @@ fn main() {
                     cmd_oracle_expected();
                 }
                 "sim" => {
-                    println!("Oracle simulation (not yet implemented)");
-                    println!("Usage: yz oracle sim --games N --seed S");
+                    cmd_oracle_sim(&args[3..]);
                 }
                 _ => {
                     eprintln!("Unknown oracle subcommand: {}", args[2]);
