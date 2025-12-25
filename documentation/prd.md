@@ -617,7 +617,9 @@ Below are epics with implementable stories. Each story includes **deliverable + 
 2. **Canonical player-to-move encoding**
 
    * encode from POV of current player
+   * **Value/sign contract:** NN `value` is interpreted from the POV of the **encoded player-to-move**. Therefore, when traversing an edge that changes `player_to_move`, MCTS backup must **negate** the child value when expressing it in the parent node’s POV (avoid double-flips by defining one convention and sticking to it everywhere).
    * **AC:** swapping players produces consistent mirrored encoding.
+   * **AC (antisymmetry sanity):** for any state `s`, define `swap_players(s)` as: swap per-player boards/totals, flip `player_to_move`, keep turn state (`dice`, `rerolls_left`) identical. Then `encode(s)` and `encode(swap_players(s))` must be consistent mirror/permute views, and terminal/backup targets must satisfy `z(s) = -z(swap_players(s))` (and similarly `V(s) ≈ -V(swap_players(s))` under deterministic policy/inference).
 
 ---
 
