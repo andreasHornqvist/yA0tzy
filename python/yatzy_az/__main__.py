@@ -61,8 +61,6 @@ def main() -> int:
         "train",
         help="Train candidate model from replay shards",
     )
-    p_train.add_argument("--replay", required=True, help="Path to replay shards directory")
-    # E8S1 scope: dataset loader + batch iteration only. Best/out used in later stories.
     train_mod.add_args(p_train)
     p_train.set_defaults(func=cmd_train)
 
