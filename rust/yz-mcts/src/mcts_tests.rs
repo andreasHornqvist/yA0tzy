@@ -1,4 +1,13 @@
 use crate::{apply_temperature, ChanceMode, Mcts, MctsConfig, UniformInference};
+use yz_core::A;
+
+struct BadInference;
+
+impl crate::Inference for BadInference {
+    fn eval(&self, _features: &[f32], _legal: &[bool; A]) -> ([f32; A], f32) {
+        ([f32::NAN; A], 0.0)
+    }
+}
 
 #[test]
 fn pi_is_valid_distribution_and_respects_legality() {
@@ -136,4 +145,42 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
         &infer,
     );
     assert_eq!(r1.pi, r2.pi);
+}
+
+#[test]
+fn fallback_can_be_triggered_and_returns_uniform_pi() {
+    let cfg = MctsConfig {
+        c_puct: 1.5,
+        simulations: 64,
+        dirichlet_alpha: 0.3,
+        dirichlet_epsilon: 0.0,
+    };
+
+    let mut ctx = yz_core::TurnContext::new_deterministic(42);
+    let root = yz_core::initial_state(&mut ctx);
+    let legal = yz_core::legal_action_mask(
+        root.players[root.player_to_move as usize].avail_mask,
+        root.rerolls_left,
+    );
+
+    let mut m = Mcts::new(cfg).unwrap();
+    let r = m.run_search(
+        root,
+        ChanceMode::Deterministic { episode_seed: 42 },
+        &BadInference,
+    );
+
+    assert!(r.fallbacks > 0, "expected fallback counter to increment");
+    let expected = {
+        let mut out = [0.0f32; A];
+        let cnt = legal.iter().filter(|&&ok| ok).count();
+        let u = 1.0 / (cnt as f32);
+        for (i, &ok) in legal.iter().enumerate() {
+            if ok {
+                out[i] = u;
+            }
+        }
+        out
+    };
+    assert_eq!(r.pi, expected);
 }

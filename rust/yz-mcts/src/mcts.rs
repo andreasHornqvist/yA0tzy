@@ -58,6 +58,7 @@ pub struct SearchResult {
     pub root_value: f32,
     pub root_priors_raw: Option<[f32; A]>,
     pub root_priors_noisy: Option<[f32; A]>,
+    pub fallbacks: u32,
     pub stats: SearchStats,
 }
 
@@ -67,6 +68,8 @@ pub struct Mcts {
     // Child mapping per parent: (parent_node_id, action_idx, state_key(child_state)) -> child_node_id.
     children: FxHashMap<(NodeId, u8, StateKey), NodeId>,
     stats: SearchStats,
+    // If true, we force the returned root `pi` to uniform-over-legal as a guardrail.
+    force_uniform_root_pi: bool,
 }
 
 impl Mcts {
@@ -86,6 +89,7 @@ impl Mcts {
             arena: Arena::new(),
             children: FxHashMap::default(),
             stats: SearchStats::default(),
+            force_uniform_root_pi: false,
         })
     }
 
@@ -96,12 +100,17 @@ impl Mcts {
         infer: &impl Inference,
     ) -> SearchResult {
         self.stats = SearchStats::default();
+        self.force_uniform_root_pi = false;
 
         let root_id = self.arena.push(Node::new(root_state.player_to_move));
         self.stats.node_count = self.arena.len();
 
         // Expand root immediately (priors available for PUCT).
-        let (raw_priors, _v_root) = self.expand_node(root_id, &root_state, infer);
+        let (raw_priors, _v_root, used_fallback_priors) =
+            self.expand_node(root_id, &root_state, infer);
+        if used_fallback_priors {
+            self.force_uniform_root_pi = true;
+        }
 
         let mut root_priors_raw: Option<[f32; A]> = None;
         let mut root_priors_noisy: Option<[f32; A]> = None;
@@ -153,6 +162,7 @@ impl Mcts {
             root_value,
             root_priors_raw,
             root_priors_noisy,
+            fallbacks: self.stats.fallbacks,
             stats: self.stats.clone(),
         }
     }
@@ -186,7 +196,7 @@ impl Mcts {
 
             // Expand if needed.
             if !self.arena.get(node_id).is_expanded {
-                let (_priors, v) = self.expand_node(node_id, &state, infer);
+                let (_priors, v, _used_fallback) = self.expand_node(node_id, &state, infer);
                 self.backup(&path, v);
                 return;
             }
@@ -239,7 +249,7 @@ impl Mcts {
         node_id: NodeId,
         state: &GameState,
         infer: &impl Inference,
-    ) -> ([f32; A], f32) {
+    ) -> ([f32; A], f32, bool) {
         let legal = legal_action_mask(
             state.players[state.player_to_move as usize].avail_mask,
             state.rerolls_left,
@@ -247,7 +257,7 @@ impl Mcts {
         let features = yz_features::encode_state_v1(state);
         let (logits, v) = infer.eval(&features, &legal);
 
-        let priors = masked_softmax(&logits, &legal, &mut self.stats);
+        let (priors, used_fallback) = masked_softmax(&logits, &legal, &mut self.stats);
 
         let n = self.arena.get_mut(node_id);
         n.is_expanded = true;
@@ -255,7 +265,7 @@ impl Mcts {
         n.p = priors;
 
         self.stats.expansions += 1;
-        (priors, v.clamp(-1.0, 1.0))
+        (priors, v.clamp(-1.0, 1.0), used_fallback)
     }
 
     fn select_action(&self, node_id: NodeId, legal: &[bool; A], mode: ChanceMode) -> u8 {
@@ -313,6 +323,12 @@ impl Mcts {
             state.rerolls_left,
         );
 
+        if self.force_uniform_root_pi {
+            // Guardrail: if priors were invalid at root (fallback), return uniform-over-legal `pi`.
+            let pi = uniform_over_legal(&legal);
+            return (pi, 0.0);
+        }
+
         let mut pi = [0.0f32; A];
         let mut sum = 0.0f32;
         for (a, &ok) in legal.iter().enumerate() {
@@ -324,6 +340,8 @@ impl Mcts {
         }
         if sum <= 0.0 {
             // fallback uniform
+            // count as a fallback event (pi degenerate)
+            // (we can't mutate self.stats here; this is a pure read path)
             let cnt = legal.iter().filter(|&&ok| ok).count();
             if cnt > 0 {
                 let u = 1.0 / (cnt as f32);
@@ -354,7 +372,11 @@ impl Mcts {
     }
 }
 
-fn masked_softmax(logits: &[f32; A], legal: &[bool; A], stats: &mut SearchStats) -> [f32; A] {
+fn masked_softmax(
+    logits: &[f32; A],
+    legal: &[bool; A],
+    stats: &mut SearchStats,
+) -> ([f32; A], bool) {
     let mut out = [0.0f32; A];
 
     let mut max = f32::NEG_INFINITY;
@@ -365,7 +387,7 @@ fn masked_softmax(logits: &[f32; A], legal: &[bool; A], stats: &mut SearchStats)
     }
     if !max.is_finite() {
         stats.fallbacks += 1;
-        return uniform_over_legal(legal);
+        return (uniform_over_legal(legal), true);
     }
 
     let mut sum = 0.0f32;
@@ -381,13 +403,13 @@ fn masked_softmax(logits: &[f32; A], legal: &[bool; A], stats: &mut SearchStats)
 
     if !(sum.is_finite() && sum > 0.0) {
         stats.fallbacks += 1;
-        return uniform_over_legal(legal);
+        return (uniform_over_legal(legal), true);
     }
 
     for v in &mut out {
         *v /= sum;
     }
-    out
+    (out, false)
 }
 
 fn uniform_over_legal(legal: &[bool; A]) -> [f32; A] {
