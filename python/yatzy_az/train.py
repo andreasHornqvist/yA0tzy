@@ -216,5 +216,18 @@ def run_from_args(args: argparse.Namespace) -> int:
     }
     (out_dir / "candidate.meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
+    # E8.5.1: if this is a standard run layout (runs/<id>/models), update runs/<id>/run.json.
+    run_root = out_dir.parent
+    try:
+        from .run_manifest import load_manifest, save_manifest_atomic
+
+        m = load_manifest(run_root)
+        m["train_step"] = int(step)
+        m["candidate_checkpoint"] = str(Path("models") / ckpt_path.name)
+        save_manifest_atomic(run_root, m)
+    except Exception:
+        # Best-effort; training can still run without a manifest.
+        pass
+
     print(f"saved: {ckpt_path}")
     return 0

@@ -832,6 +832,51 @@ Below are epics with implementable stories. Each story includes **deliverable + 
 
 ---
 
+## Epic E8.5 — Iteration controller (crash-safe runs + resume)
+
+**Goal:** make full training iterations (self-play → train → gate) **restartable** and **auditable** using run artifacts alone.
+
+This epic exists because a “resumable trainer” requires more than just model weights:
+- training needs **periodic autosave** of model+optimizer state
+- we need a stable **run manifest** that pins which replay data was used, plus git/config hashes
+- resume behavior must be explicit (continue mid-train vs start a fresh iteration from best)
+
+**Stories**
+
+1. **Run directory + manifest (single source of truth)**
+
+   * Define a run layout under `runs/<run_id>/` (replay, logs, models, manifests).
+   * Add `run.json` (or `iteration.json`) containing:
+     * `git_hash`, `config_hash`, schema ids (`protocol_version`, `feature_schema_id`, `action_space_id`, `ruleset_id`)
+     * paths/ids for inputs (replay shard directory, seed set id if applicable)
+     * counters: `selfplay_games`, `train_step`, `gate_games`
+   * **AC:** you can reconstruct “what happened” for a run without external state.
+
+2. **Trainer autosave + atomic checkpoints**
+
+   * Trainer writes `candidate.pt` that includes:
+     * model weights
+     * optimizer state
+     * `train_step` and training hyperparams
+   * Autosave every N steps and write via temp+rename (crash-safe).
+   * **AC:** killing training mid-run leaves a valid last checkpoint that can be resumed.
+
+3. **Explicit resume semantics**
+
+   * Support:
+     * **Resume**: continue candidate training from `candidate.pt` + optimizer state.
+     * **New iteration**: initialize candidate from best **with optimizer reset** (never reuse moments).
+   * **AC:** tests cover both codepaths; “reuse Adam moments” regression is impossible.
+
+4. **Replay snapshot semantics (resume-friendly)**
+
+   * Define what it means to “train on replay”:
+     * either snapshot a fixed list of shard filenames at iteration start, or
+     * support incremental training with a persisted “cursor” / last-seen shard index.
+   * **AC:** resuming training does not silently change the training dataset without recording it in the manifest.
+
+---
+
 ## Epic E9 — Gating (yz-eval) + promotion
 
 **Goal:** stable evaluation + promotion logic.

@@ -247,6 +247,55 @@ OPTIONS:
         process::exit(1);
     });
 
+    let models_dir = PathBuf::from(&out).join("models");
+    std::fs::create_dir_all(&models_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create models dir: {e}");
+        process::exit(1);
+    });
+
+    // E8.5.1: run manifest (runs/<id>/run.json).
+    let run_json = PathBuf::from(&out).join("run.json");
+    let config_bytes = std::fs::read(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read config file: {e}");
+        process::exit(1);
+    });
+    let config_hash = yz_logging::hash_config_bytes(&config_bytes);
+    let run_id = PathBuf::from(&out)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&out)
+        .to_string();
+    let mut manifest = yz_logging::RunManifestV1 {
+        run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
+        run_id,
+        created_ts_ms: yz_logging::now_ms(),
+        protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+        feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+        action_space_id: "oracle_keepmask_v1".to_string(),
+        ruleset_id: "swedish_scandinavian_v1".to_string(),
+        git_hash: yz_logging::try_git_hash(),
+        config_hash: Some(config_hash),
+        replay_dir: "replay".to_string(),
+        logs_dir: "logs".to_string(),
+        models_dir: "models".to_string(),
+        selfplay_games_completed: 0,
+        train_step: 0,
+        best_checkpoint: None,
+        candidate_checkpoint: None,
+    };
+    // If a manifest already exists (resume), keep its created_ts_ms/run_id.
+    if let Ok(existing) = yz_logging::read_manifest(&run_json) {
+        manifest.created_ts_ms = existing.created_ts_ms;
+        manifest.run_id = existing.run_id;
+        manifest.train_step = existing.train_step;
+        manifest.best_checkpoint = existing.best_checkpoint;
+        manifest.candidate_checkpoint = existing.candidate_checkpoint;
+    }
+    yz_logging::write_manifest_atomic(&run_json, &manifest).unwrap_or_else(|e| {
+        eprintln!("Failed to write run manifest: {e:?}");
+        process::exit(1);
+    });
+
     let backend = connect_infer_backend(&infer);
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
         out_dir: replay_dir,
@@ -322,6 +371,10 @@ OPTIONS:
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
                 completed_games += 1;
+                if completed_games % 10 == 0 || completed_games == games {
+                    manifest.selfplay_games_completed = completed_games as u64;
+                    let _ = yz_logging::write_manifest_atomic(&run_json, &manifest);
+                }
                 if completed_games >= games {
                     break;
                 }
@@ -347,6 +400,10 @@ OPTIONS:
     });
     let _ = loggers.iter.flush();
     let _ = loggers.roots.flush();
+
+    // Final manifest update.
+    manifest.selfplay_games_completed = completed_games as u64;
+    let _ = yz_logging::write_manifest_atomic(&run_json, &manifest);
 
     println!("Self-play complete. Games={games} out={out}");
 }
