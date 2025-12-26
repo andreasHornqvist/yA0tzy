@@ -44,6 +44,12 @@ pub struct RunManifestV1 {
     // Artifacts.
     pub best_checkpoint: Option<String>,
     pub candidate_checkpoint: Option<String>,
+
+    // Gating/promotion (Epic E8.5.2).
+    pub promotion_decision: Option<String>, // "promote" | "reject"
+    pub promotion_ts_ms: Option<u64>,
+    pub gate_games: Option<u64>,
+    pub gate_win_rate: Option<f64>,
 }
 
 pub fn now_ms() -> u64 {
@@ -322,6 +328,10 @@ mod tests {
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            promotion_decision: None,
+            promotion_ts_ms: None,
+            gate_games: None,
+            gate_win_rate: None,
         };
         write_manifest_atomic(&run_json, &m).unwrap();
 

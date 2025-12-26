@@ -282,6 +282,10 @@ OPTIONS:
         train_step: 0,
         best_checkpoint: None,
         candidate_checkpoint: None,
+        promotion_decision: None,
+        promotion_ts_ms: None,
+        gate_games: None,
+        gate_win_rate: None,
     };
     // If a manifest already exists (resume), keep its created_ts_ms/run_id.
     if let Ok(existing) = yz_logging::read_manifest(&run_json) {
@@ -290,6 +294,10 @@ OPTIONS:
         manifest.train_step = existing.train_step;
         manifest.best_checkpoint = existing.best_checkpoint;
         manifest.candidate_checkpoint = existing.candidate_checkpoint;
+        manifest.promotion_decision = existing.promotion_decision;
+        manifest.promotion_ts_ms = existing.promotion_ts_ms;
+        manifest.gate_games = existing.gate_games;
+        manifest.gate_win_rate = existing.gate_win_rate;
     }
     yz_logging::write_manifest_atomic(&run_json, &manifest).unwrap_or_else(|e| {
         eprintln!("Failed to write run manifest: {e:?}");
@@ -430,6 +438,139 @@ fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
     panic!("Unsupported infer endpoint: {endpoint}");
 }
 
+fn cmd_iter_finalize(args: &[String]) {
+    let mut run: Option<String> = None;
+    let mut decision: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz iter finalize
+
+USAGE:
+    yz iter finalize --run runs/<id>/ --decision promote|reject
+
+OPTIONS:
+    --run DIR            Run directory (contains run.json, models/, replay/, logs/)
+    --decision D         promote|reject
+"#
+                );
+                return;
+            }
+            "--run" => {
+                run = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--decision" => {
+                decision = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz iter finalize`: {}", other);
+                eprintln!("Run `yz iter finalize --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let run = run.unwrap_or_else(|| {
+        eprintln!("Missing --run");
+        process::exit(1);
+    });
+    let decision = decision.unwrap_or_else(|| {
+        eprintln!("Missing --decision");
+        process::exit(1);
+    });
+    if decision != "promote" && decision != "reject" {
+        eprintln!("Invalid --decision (expected promote|reject)");
+        process::exit(1);
+    }
+
+    let run_dir = PathBuf::from(&run);
+    let run_json = run_dir.join("run.json");
+    let mut manifest = yz_logging::read_manifest(&run_json).unwrap_or_else(|e| {
+        eprintln!("Failed to read run manifest: {e:?}");
+        process::exit(1);
+    });
+
+    let models_dir = run_dir.join(&manifest.models_dir);
+    let candidate_pt = models_dir.join("candidate.pt");
+    if !candidate_pt.exists() {
+        eprintln!("Missing candidate checkpoint: {}", candidate_pt.display());
+        process::exit(1);
+    }
+
+    // Promote: copy candidate -> best atomically via temp+rename.
+    if decision == "promote" {
+        let best_pt = models_dir.join("best.pt");
+        let tmp_best = models_dir.join("best.pt.tmp");
+        let bytes = std::fs::read(&candidate_pt).unwrap_or_else(|e| {
+            eprintln!("Failed to read candidate.pt: {e}");
+            process::exit(1);
+        });
+        std::fs::write(&tmp_best, bytes).unwrap_or_else(|e| {
+            eprintln!("Failed to write tmp best.pt: {e}");
+            process::exit(1);
+        });
+        std::fs::rename(&tmp_best, &best_pt).unwrap_or_else(|e| {
+            eprintln!("Failed to rename best.pt: {e}");
+            process::exit(1);
+        });
+
+        // best.meta.json: derived from candidate.meta.json if present, else minimal.
+        let cand_meta = models_dir.join("candidate.meta.json");
+        let best_meta = models_dir.join("best.meta.json");
+        if cand_meta.exists() {
+            let tmp_meta = models_dir.join("best.meta.json.tmp");
+            let meta_bytes = std::fs::read(&cand_meta).unwrap_or_else(|e| {
+                eprintln!("Failed to read candidate.meta.json: {e}");
+                process::exit(1);
+            });
+            std::fs::write(&tmp_meta, meta_bytes).unwrap_or_else(|e| {
+                eprintln!("Failed to write tmp best.meta.json: {e}");
+                process::exit(1);
+            });
+            std::fs::rename(&tmp_meta, &best_meta).unwrap_or_else(|e| {
+                eprintln!("Failed to rename best.meta.json: {e}");
+                process::exit(1);
+            });
+        } else {
+            let tmp_meta = models_dir.join("best.meta.json.tmp");
+            let meta = serde_json::json!({
+                "protocol_version": manifest.protocol_version,
+                "feature_schema_id": manifest.feature_schema_id,
+                "action_space_id": manifest.action_space_id,
+                "ruleset_id": manifest.ruleset_id,
+            });
+            std::fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta).unwrap()).unwrap_or_else(
+                |e| {
+                    eprintln!("Failed to write tmp best.meta.json: {e}");
+                    process::exit(1);
+                },
+            );
+            std::fs::rename(&tmp_meta, &best_meta).unwrap_or_else(|e| {
+                eprintln!("Failed to rename best.meta.json: {e}");
+                process::exit(1);
+            });
+        }
+
+        manifest.best_checkpoint = Some("models/best.pt".to_string());
+    }
+
+    manifest.promotion_decision = Some(decision.clone());
+    manifest.promotion_ts_ms = Some(yz_logging::now_ms());
+    manifest.candidate_checkpoint = Some("models/candidate.pt".to_string());
+
+    yz_logging::write_manifest_atomic(&run_json, &manifest).unwrap_or_else(|e| {
+        eprintln!("Failed to write run manifest: {e:?}");
+        process::exit(1);
+    });
+
+    println!("Finalize complete. decision={decision} run={}", run_dir.display());
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -465,6 +606,22 @@ fn main() {
         }
         "selfplay" => {
             cmd_selfplay(&args[2..]);
+        }
+        "iter" => {
+            if args.len() < 3 {
+                eprintln!("Usage: yz iter finalize [OPTIONS]");
+                process::exit(1);
+            }
+            match args[2].as_str() {
+                "finalize" => {
+                    cmd_iter_finalize(&args[3..]);
+                }
+                other => {
+                    eprintln!("Unknown iter subcommand: {other}");
+                    eprintln!("Usage: yz iter finalize [OPTIONS]");
+                    process::exit(1);
+                }
+            }
         }
         "gate" => {
             println!("Gating (not yet implemented)");

@@ -17,4 +17,8 @@ yz-replay = { path = "../yz-replay" }
 yz-eval = { path = "../yz-eval" }
 yz-oracle = { path = "../yz-oracle" }
 yz-logging = { path = "../yz-logging" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
