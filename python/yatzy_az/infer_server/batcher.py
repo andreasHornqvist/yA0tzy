@@ -19,15 +19,30 @@ class _Queued:
 
 
 @dataclass(slots=True)
-class BatcherStats:
-    total_requests: int = 0
-    total_batches: int = 0
+class ModelStats:
+    requests_total: int = 0
+    batches_total: int = 0
     batch_hist: dict[int, int] | None = None
     max_batch_seen: int = 0
 
     def __post_init__(self) -> None:
         if self.batch_hist is None:
             self.batch_hist = {}
+
+
+@dataclass(slots=True)
+class BatcherStats:
+    requests_total: int = 0
+    batches_total: int = 0
+    batch_hist: dict[int, int] | None = None
+    max_batch_seen: int = 0
+    by_model: dict[int, ModelStats] | None = None
+
+    def __post_init__(self) -> None:
+        if self.batch_hist is None:
+            self.batch_hist = {}
+        if self.by_model is None:
+            self.by_model = {}
 
 
 class Batcher:
@@ -78,27 +93,50 @@ class Batcher:
         self._stop.set()
 
     def _apply_batch(self, batch: list[_Queued]) -> None:
-        self._stats.total_batches += 1
-        self._stats.total_requests += len(batch)
+        self._stats.batches_total += 1
+        self._stats.requests_total += len(batch)
         self._stats.max_batch_seen = max(self._stats.max_batch_seen, len(batch))
         self._stats.batch_hist[len(batch)] = self._stats.batch_hist.get(len(batch), 0) + 1
 
-        # For v1 dummy, we process per-request but keep model_id routing.
-        # In the real server, we'd group by model_id and stack tensors per group.
+        # Route by model_id. We process each model_id group in one call to `infer_batch`.
+        groups: dict[int, list[_Queued]] = {}
         for item in batch:
-            if item.fut.cancelled():
-                continue
-            model = self._models.get(item.req.model_id)
+            groups.setdefault(item.req.model_id, []).append(item)
+
+        for model_id, items in groups.items():
+            ms = self._stats.by_model.get(model_id)
+            if ms is None:
+                ms = ModelStats()
+                self._stats.by_model[model_id] = ms
+            ms.batches_total += 1
+            ms.requests_total += len(items)
+            ms.max_batch_seen = max(ms.max_batch_seen, len(items))
+            ms.batch_hist[len(items)] = ms.batch_hist.get(len(items), 0) + 1
+
+            model = self._models.get(model_id)
             if model is None:
-                item.fut.set_exception(ValueError(f"unknown model_id: {item.req.model_id}"))
+                for item in items:
+                    if not item.fut.cancelled():
+                        item.fut.set_exception(ValueError(f"unknown model_id: {model_id}"))
                 continue
 
-            out = model.infer_batch([item.req.features], [item.req.legal_mask])[0]
-            item.fut.set_result(
-                InferResponseV1(
-                    request_id=item.req.request_id,
-                    policy_logits=out.policy_logits,
-                    value=out.value,
-                    margin=out.margin,
+            feats = [it.req.features for it in items]
+            masks = [it.req.legal_mask for it in items]
+            outs = model.infer_batch(feats, masks)
+            if len(outs) != len(items):
+                for item in items:
+                    if not item.fut.cancelled():
+                        item.fut.set_exception(RuntimeError("model returned wrong batch size"))
+                continue
+
+            for item, out in zip(items, outs, strict=True):
+                if item.fut.cancelled():
+                    continue
+                item.fut.set_result(
+                    InferResponseV1(
+                        request_id=item.req.request_id,
+                        policy_logits=out.policy_logits,
+                        value=out.value,
+                        margin=out.margin,
+                    )
                 )
-            )

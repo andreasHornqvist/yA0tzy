@@ -182,7 +182,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E6S1 complete** (Python asyncio UDS inference server + protocol v1 codec + dynamic batching)
+Current status: **E6S2 complete** (Python infer-server supports multi-model routing via `model_id` + per-model stats)
 
 ---
 

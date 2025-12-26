@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 
 from .batcher import Batcher
-from .model import DummyModel
+from .model import build_model
 from .protocol_v1 import (
     DecodeError,
     InferResponseV1,
@@ -37,6 +37,10 @@ class ServerConfig:
     max_batch: int
     max_wait_us: int
     print_stats_every_s: float
+    best_id: int
+    cand_id: int
+    best_spec: str
+    cand_spec: str
 
 
 async def _handle_conn(
@@ -69,8 +73,8 @@ async def serve(config: ServerConfig) -> None:
     scheme, addr = _parse_bind(config.bind)
 
     model_by_id = {
-        0: DummyModel(),
-        7: DummyModel(),  # convenience default used by some Rust tests
+        int(config.best_id): build_model(config.best_spec),
+        int(config.cand_id): build_model(config.cand_spec),
     }
     batcher = Batcher(model_by_id, max_batch=config.max_batch, max_wait_us=config.max_wait_us)
     batcher_task = asyncio.create_task(batcher.run())
@@ -131,21 +135,33 @@ async def _print_stats_loop(batcher: Batcher, every_s: float) -> None:
         await asyncio.sleep(every_s)
         now = time.monotonic()
         dt = max(1e-9, now - last_t)
-        total = batcher.stats.total_requests
+        total = batcher.stats.requests_total
         rps = (total - last_req) / dt
         last_t = now
         last_req = total
         # Simple, human-friendly log.
         print(
             f"[infer-server] req_total={total} rps={rps:.1f} "
-            f"batches={batcher.stats.total_batches} max_batch_seen={batcher.stats.max_batch_seen}"
+            f"batches={batcher.stats.batches_total} max_batch_seen={batcher.stats.max_batch_seen}"
         )
+        # Per-model stats.
+        for model_id, ms in sorted(batcher.stats.by_model.items()):
+            print(
+                f"  [model {model_id}] req_total={ms.requests_total} batches={ms.batches_total} "
+                f"max_batch_seen={ms.max_batch_seen}"
+            )
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
     # Note: `--bind` is defined in the top-level CLI for help grouping.
     p.add_argument("--max-batch", type=int, default=256, help="Batch flush size threshold")
     p.add_argument("--max-wait-us", type=int, default=2000, help="Max queue wait before flush")
+    p.add_argument("--best", default="dummy", help="Best model spec (e.g. dummy or dummy:0.1)")
+    p.add_argument(
+        "--cand", default="dummy", help="Candidate model spec (e.g. dummy or dummy:-0.1)"
+    )
+    p.add_argument("--best-id", type=int, default=0, help="model_id for best")
+    p.add_argument("--cand-id", type=int, default=1, help="model_id for candidate")
     p.add_argument(
         "--print-stats-every-s",
         type=float,
@@ -160,6 +176,10 @@ def run_from_args(args: argparse.Namespace) -> int:
         max_batch=args.max_batch,
         max_wait_us=args.max_wait_us,
         print_stats_every_s=args.print_stats_every_s,
+        best_id=args.best_id,
+        cand_id=args.cand_id,
+        best_spec=args.best,
+        cand_spec=args.cand,
     )
     asyncio.run(serve(cfg))
     return 0
