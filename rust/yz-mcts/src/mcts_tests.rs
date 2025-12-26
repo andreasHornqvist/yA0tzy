@@ -16,6 +16,8 @@ fn pi_is_valid_distribution_and_respects_legality() {
         simulations: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
+        max_inflight: 8,
+        virtual_loss: 1.0,
     })
     .unwrap();
     let infer = UniformInference;
@@ -53,6 +55,8 @@ fn eval_mode_is_deterministic() {
         simulations: 128,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
+        max_inflight: 8,
+        virtual_loss: 1.0,
     };
     let infer = UniformInference;
 
@@ -83,6 +87,8 @@ fn root_noise_is_only_applied_in_rng_mode() {
         simulations: 32,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
+        max_inflight: 8,
+        virtual_loss: 1.0,
     };
     let infer = UniformInference;
 
@@ -115,6 +121,8 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
         simulations: 128,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
+        max_inflight: 8,
+        virtual_loss: 1.0,
     };
     let infer = UniformInference;
 
@@ -154,6 +162,8 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
         simulations: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
+        max_inflight: 8,
+        virtual_loss: 1.0,
     };
 
     let mut ctx = yz_core::TurnContext::new_deterministic(42);
@@ -183,4 +193,37 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
         out
     };
     assert_eq!(r.pi, expected);
+}
+
+#[test]
+fn virtual_loss_reduces_pending_collisions() {
+    let infer = UniformInference;
+    let mut ctx = yz_core::TurnContext::new_deterministic(1);
+    let root = yz_core::initial_state(&mut ctx);
+
+    let cfg_no_vl = MctsConfig {
+        c_puct: 1.5,
+        simulations: 64,
+        dirichlet_alpha: 0.3,
+        dirichlet_epsilon: 0.0,
+        max_inflight: 8,
+        virtual_loss: 0.0,
+    };
+    let cfg_vl = MctsConfig {
+        virtual_loss: 1.0,
+        ..cfg_no_vl
+    };
+
+    let mut m0 = Mcts::new(cfg_no_vl).unwrap();
+    let r0 = m0.run_search(root, ChanceMode::Deterministic { episode_seed: 1 }, &infer);
+
+    let mut m1 = Mcts::new(cfg_vl).unwrap();
+    let r1 = m1.run_search(root, ChanceMode::Deterministic { episode_seed: 1 }, &infer);
+
+    assert!(
+        r1.stats.pending_collisions < r0.stats.pending_collisions,
+        "expected collisions to decrease with virtual loss: no_vl={} vl={}",
+        r0.stats.pending_collisions,
+        r1.stats.pending_collisions
+    );
 }

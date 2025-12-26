@@ -178,7 +178,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E4S3 complete** (fallback-to-uniform + fallback counters in yz-mcts)
+Current status: **E4S4 complete** (in-flight leaf scaffolding + virtual loss reservation in yz-mcts)
 
 ---
 

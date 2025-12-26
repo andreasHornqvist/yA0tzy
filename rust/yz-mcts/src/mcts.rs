@@ -11,6 +11,8 @@ use rustc_hash::FxHashMap;
 use thiserror::Error;
 use yz_core::{index_to_action, legal_action_mask, GameState, A};
 
+type Ticket = u64;
+
 #[derive(Clone, Copy)]
 pub enum ChanceMode {
     /// Self-play style: sample dice with a PRNG. Determinism not required.
@@ -27,6 +29,10 @@ pub struct MctsConfig {
     pub dirichlet_alpha: f32,
     /// Root Dirichlet epsilon mix-in fraction (self-play only).
     pub dirichlet_epsilon: f32,
+    /// Maximum in-flight leaf evaluations per search.
+    pub max_inflight: usize,
+    /// Virtual loss to apply while a leaf is pending.
+    pub virtual_loss: f32,
 }
 
 impl Default for MctsConfig {
@@ -36,6 +42,8 @@ impl Default for MctsConfig {
             simulations: 64,
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.25,
+            max_inflight: 8,
+            virtual_loss: 1.0,
         }
     }
 }
@@ -51,6 +59,8 @@ pub struct SearchStats {
     pub node_count: usize,
     pub expansions: u32,
     pub fallbacks: u32,
+    pub pending_count_max: usize,
+    pub pending_collisions: u32,
 }
 
 pub struct SearchResult {
@@ -60,6 +70,21 @@ pub struct SearchResult {
     pub root_priors_noisy: Option<[f32; A]>,
     pub fallbacks: u32,
     pub stats: SearchStats,
+}
+
+struct PendingEval {
+    ticket: Ticket,
+    leaf_node: NodeId,
+    leaf_state: GameState,
+    path: Vec<(NodeId, usize, u8, u8)>,
+}
+
+enum LeafSelection {
+    Terminal {
+        path: Vec<(NodeId, usize, u8, u8)>,
+        z: f32,
+    },
+    Pending(PendingEval),
 }
 
 pub struct Mcts {
@@ -82,6 +107,16 @@ impl Mcts {
         if cfg.simulations == 0 {
             return Err(MctsError::InvalidConfig {
                 msg: "simulations must be > 0",
+            });
+        }
+        if cfg.max_inflight == 0 {
+            return Err(MctsError::InvalidConfig {
+                msg: "max_inflight must be > 0",
+            });
+        }
+        if !(cfg.virtual_loss.is_finite() && cfg.virtual_loss >= 0.0) {
+            return Err(MctsError::InvalidConfig {
+                msg: "virtual_loss must be finite and >= 0",
             });
         }
         Ok(Self {
@@ -140,19 +175,60 @@ impl Mcts {
             }
         }
 
-        for sim in 0..self.cfg.simulations {
-            let mut ctx = match mode {
-                ChanceMode::Deterministic { episode_seed } => {
-                    yz_core::TurnContext::new_deterministic(episode_seed)
-                }
-                ChanceMode::Rng { seed } => {
-                    // Derive a per-sim seed to decorrelate rollouts.
-                    let sim_seed = seed ^ ((sim as u64).wrapping_mul(0x9E3779B97F4A7C15));
-                    yz_core::TurnContext::new_rng(sim_seed)
-                }
-            };
+        // In-flight leaf pipeline scaffolding (E4S4): enqueue leaf evals up to max_inflight,
+        // then drain one (still synchronous stub inference).
+        let mut completed: u32 = 0;
+        let mut ticket: Ticket = 0;
+        let mut pending: std::collections::VecDeque<PendingEval> =
+            std::collections::VecDeque::new();
 
-            self.simulate(root_id, root_state, &mut ctx, infer, mode);
+        while completed < self.cfg.simulations {
+            while pending.len() < self.cfg.max_inflight
+                && (completed as usize + pending.len()) < (self.cfg.simulations as usize)
+            {
+                ticket += 1;
+                let mut ctx = match mode {
+                    ChanceMode::Deterministic { episode_seed } => {
+                        yz_core::TurnContext::new_deterministic(episode_seed)
+                    }
+                    ChanceMode::Rng { seed } => {
+                        let sel_seed = seed ^ ticket.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        yz_core::TurnContext::new_rng(sel_seed)
+                    }
+                };
+
+                match self.select_leaf_and_reserve(root_id, root_state, &mut ctx, mode) {
+                    LeafSelection::Terminal { path, z } => {
+                        self.backup_with_virtual_loss(&path, z);
+                        completed += 1;
+                    }
+                    LeafSelection::Pending(mut pe) => {
+                        pe.ticket = ticket;
+                        pending.push_back(pe);
+                        self.stats.pending_count_max =
+                            self.stats.pending_count_max.max(pending.len());
+                    }
+                }
+            }
+
+            if let Some(pe) = pending.pop_front() {
+                let legal = legal_action_mask(
+                    pe.leaf_state.players[pe.leaf_state.player_to_move as usize].avail_mask,
+                    pe.leaf_state.rerolls_left,
+                );
+                let features = yz_features::encode_state_v1(&pe.leaf_state);
+                let (logits, v) = infer.eval(&features, &legal);
+                let (priors, _used_fallback) = masked_softmax(&logits, &legal, &mut self.stats);
+
+                let leaf = self.arena.get_mut(pe.leaf_node);
+                if !leaf.is_expanded {
+                    leaf.is_expanded = true;
+                    leaf.to_play = pe.leaf_state.player_to_move;
+                    leaf.p = priors;
+                }
+                self.backup_with_virtual_loss(&pe.path, v.clamp(-1.0, 1.0));
+                completed += 1;
+            }
         }
 
         let (pi, root_value) = self.root_pi_value(root_id, &root_state);
@@ -167,57 +243,51 @@ impl Mcts {
         }
     }
 
-    fn simulate(
+    fn select_leaf_and_reserve(
         &mut self,
         root_id: NodeId,
-        mut state: GameState,
+        root_state: GameState,
         ctx: &mut yz_core::TurnContext,
-        infer: &impl Inference,
         mode: ChanceMode,
-    ) {
-        // Path as (node_id, action_idx) so we can update stats on the way back.
-        let mut path: Vec<(
-            NodeId,
-            usize,
-            u8, /* parent to_play */
-            u8, /* child to_play */
-        )> = Vec::new();
+    ) -> LeafSelection {
+        let mut path: Vec<(NodeId, usize, u8, u8)> = Vec::new();
         let mut node_id = root_id;
+        let mut state = root_state;
 
         loop {
             let node_to_play = self.arena.get(node_id).to_play;
 
-            // Terminal leaf value.
             if yz_core::is_terminal(&state) {
                 let z = yz_core::terminal_z_from_player_to_move(&state).unwrap_or(0.0);
-                self.backup(&path, z);
-                return;
+                // Reserve path (even though terminal) to keep accounting consistent.
+                self.apply_virtual_loss_path(&path);
+                return LeafSelection::Terminal { path, z };
             }
 
-            // Expand if needed.
             if !self.arena.get(node_id).is_expanded {
-                let (_priors, v, _used_fallback) = self.expand_node(node_id, &state, infer);
-                self.backup(&path, v);
-                return;
+                // Leaf node to be evaluated.
+                self.apply_virtual_loss_path(&path);
+                let pe = PendingEval {
+                    ticket: 0,
+                    leaf_node: node_id,
+                    leaf_state: state,
+                    path,
+                };
+                return LeafSelection::Pending(pe);
             }
 
-            // Select action by PUCT.
             let legal = legal_action_mask(
                 state.players[state.player_to_move as usize].avail_mask,
                 state.rerolls_left,
             );
-            let a_idx = self.select_action(node_id, &legal, mode);
-
-            // Apply action -> stochastic next state.
+            let a_idx = self.select_action(node_id, &legal, mode) as usize;
             let action = index_to_action(a_idx as u8);
             let next_state = match yz_core::apply_action(state, action, ctx) {
                 Ok(s2) => s2,
                 Err(_) => {
-                    // Should not happen if legal mask is consistent; treat as fallback.
                     self.stats.fallbacks += 1;
-                    let v = 0.0;
-                    self.backup(&path, v);
-                    return;
+                    self.apply_virtual_loss_path(&path);
+                    return LeafSelection::Terminal { path, z: 0.0 };
                 }
             };
 
@@ -232,16 +302,36 @@ impl Mcts {
                 cid
             };
 
-            path.push((
-                node_id,
-                a_idx as usize,
-                node_to_play,
-                next_state.player_to_move,
-            ));
-
+            path.push((node_id, a_idx, node_to_play, next_state.player_to_move));
             node_id = child_id;
             state = next_state;
         }
+    }
+
+    fn apply_virtual_loss_path(&mut self, path: &[(NodeId, usize, u8, u8)]) {
+        if path.is_empty() {
+            return;
+        }
+        for &(node_id, a_idx, _pt, _ct) in path {
+            let n = self.arena.get_mut(node_id);
+            n.vl_n[a_idx] = n.vl_n[a_idx].saturating_add(1);
+            n.vl_w[a_idx] += self.cfg.virtual_loss;
+            n.vl_sum = n.vl_sum.saturating_add(1);
+        }
+    }
+
+    fn remove_virtual_loss_path(&mut self, path: &[(NodeId, usize, u8, u8)]) {
+        for &(node_id, a_idx, _pt, _ct) in path.iter().rev() {
+            let n = self.arena.get_mut(node_id);
+            n.vl_n[a_idx] = n.vl_n[a_idx].saturating_sub(1);
+            n.vl_w[a_idx] -= self.cfg.virtual_loss;
+            n.vl_sum = n.vl_sum.saturating_sub(1);
+        }
+    }
+
+    fn backup_with_virtual_loss(&mut self, path: &[(NodeId, usize, u8, u8)], v_leaf: f32) {
+        self.remove_virtual_loss_path(path);
+        self.backup(path, v_leaf);
     }
 
     fn expand_node(
@@ -268,9 +358,15 @@ impl Mcts {
         (priors, v.clamp(-1.0, 1.0), used_fallback)
     }
 
-    fn select_action(&self, node_id: NodeId, legal: &[bool; A], mode: ChanceMode) -> u8 {
+    fn select_action(&mut self, node_id: NodeId, legal: &[bool; A], mode: ChanceMode) -> u8 {
         let n = self.arena.get(node_id);
-        let sqrt_sum = (n.n_sum as f32).sqrt();
+        let use_vl = self.cfg.virtual_loss > 0.0;
+        let n_sum_eff = if use_vl {
+            n.n_sum.saturating_add(n.vl_sum)
+        } else {
+            n.n_sum
+        };
+        let sqrt_sum = (n_sum_eff as f32).sqrt();
 
         let mut best_score = f32::NEG_INFINITY;
         let mut best_a: u8 = 0;
@@ -279,8 +375,13 @@ impl Mcts {
             if !ok {
                 continue;
             }
-            let q = n.q(a);
-            let u = self.cfg.c_puct * n.p[a] * sqrt_sum / (1.0 + (n.n[a] as f32));
+            let q = n.q_eff(a, use_vl);
+            let n_eff = if use_vl {
+                n.n[a].saturating_add(n.vl_n[a]) as f32
+            } else {
+                n.n[a] as f32
+            };
+            let u = self.cfg.c_puct * n.p[a] * sqrt_sum / (1.0 + n_eff);
             let score = q + u;
 
             if score > best_score {
@@ -292,6 +393,11 @@ impl Mcts {
                     best_a = a as u8;
                 }
             }
+        }
+
+        // Collision: chose an edge that already has a pending reservation.
+        if self.arena.get(node_id).vl_n[best_a as usize] > 0 {
+            self.stats.pending_collisions += 1;
         }
 
         best_a

@@ -16,6 +16,11 @@ pub struct Node {
     pub w: [f32; A],
     pub p: [f32; A],
     pub n_sum: u32,
+
+    // Virtual loss bookkeeping (in-flight leaf eval scaffolding).
+    pub vl_n: [u32; A],
+    pub vl_w: [f32; A],
+    pub vl_sum: u32,
 }
 
 impl Node {
@@ -29,6 +34,9 @@ impl Node {
             w: [0.0f32; A],
             p: [0.0f32; A],
             n_sum: 0,
+            vl_n: [0u32; A],
+            vl_w: [0.0f32; A],
+            vl_sum: 0,
         }
     }
 
@@ -38,6 +46,19 @@ impl Node {
             0.0
         } else {
             self.w[a] / (n as f32)
+        }
+    }
+
+    pub fn q_eff(&self, a: usize, use_virtual_loss: bool) -> f32 {
+        if !use_virtual_loss {
+            return self.q(a);
+        }
+        let n = self.n[a].saturating_add(self.vl_n[a]);
+        if n == 0 {
+            0.0
+        } else {
+            let w = self.w[a] - self.vl_w[a];
+            w / (n as f32)
         }
     }
 }
