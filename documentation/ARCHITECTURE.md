@@ -142,6 +142,7 @@ See `.github/workflows/ci.yml` for details.
 | Oracle (optimal play solver) | `rust/swedish_yatzy_dp/` |
 | Oracle adapter | `rust/yz-oracle/` |
 | MCTS implementation (PUCT) | `rust/yz-mcts/` (`src/mcts.rs`) |
+| Inference protocol (Rust↔Python) | `rust/yz-infer/` (`src/protocol.rs`, `src/codec.rs`, `src/frame.rs`) |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
