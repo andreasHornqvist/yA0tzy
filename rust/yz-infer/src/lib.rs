@@ -1,11 +1,20 @@
 //! yz-infer: Socket protocol + inference client for Rust ↔ Python communication.
 
+pub mod client;
 pub mod codec;
 pub mod frame;
 pub mod protocol;
 
+pub use client::{
+    ClientError, ClientOptions, ClientStatsSnapshot, InferenceClient, LatencyHistogramSnapshot,
+    LatencySummary, Ticket,
+};
+
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod client_tests;
 
 #[cfg(test)]
 mod tests {

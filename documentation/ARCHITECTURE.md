@@ -143,6 +143,7 @@ See `.github/workflows/ci.yml` for details.
 | Oracle adapter | `rust/yz-oracle/` |
 | MCTS implementation (PUCT) | `rust/yz-mcts/` (`src/mcts.rs`) |
 | Inference protocol (Rust↔Python) | `rust/yz-infer/` (`src/protocol.rs`, `src/codec.rs`, `src/frame.rs`) |
+| Inference client (background IO, tickets, routing) | `rust/yz-infer/` (`src/client.rs`) |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
@@ -179,7 +180,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E4S4 complete** (in-flight leaf scaffolding + virtual loss reservation in yz-mcts)
+Current status: **E5S2 complete** (`yz-infer` `InferenceClient` with background IO + routing + backpressure + latency stats)
 
 ---
 
