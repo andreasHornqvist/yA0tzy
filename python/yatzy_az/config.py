@@ -39,6 +39,13 @@ class MctsConfig(BaseModel):
         default=0.25,
         description="Dirichlet noise epsilon - fraction of noise mixed into priors",
     )
+    temperature_schedule: dict = Field(
+        default_factory=lambda: {"kind": "constant", "t0": 1.0},
+        description=(
+            "Executed-move temperature schedule (does not affect replay pi targets). "
+            'Example: {"kind":"step","t0":1.0,"t1":0.0,"cutoff_ply":10}'
+        ),
+    )
 
 
 class SelfplayConfig(BaseModel):

@@ -13,7 +13,7 @@ pub mod node;
 pub mod state_key;
 
 pub use infer::{Inference, UniformInference};
-pub use mcts::{ChanceMode, Mcts, MctsConfig, SearchResult, SearchStats};
+pub use mcts::{apply_temperature, ChanceMode, Mcts, MctsConfig, SearchResult, SearchStats};
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

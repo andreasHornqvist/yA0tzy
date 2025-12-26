@@ -704,6 +704,18 @@ Below are epics with implementable stories. Each story includes **deliverable + 
 2. **Root noise + temperature semantics**
 
    * noise only in self-play; temperature only for executed move
+   * **Root Dirichlet noise (self-play only)**:
+     * compute legal action set `L`
+     * sample `η ~ Dirichlet(α)` over `|L|` legal actions
+     * mix at root: `P_noisy[a] = (1-ε) * P_raw[a] + ε * η[a]` for `a ∈ L`, and `0` for illegal
+     * keep `P_raw` as the “clean” priors; use `P_noisy` only for root exploration in self-play
+     * log both `P_raw` and `P_noisy` at root
+   * **Temperature (executed move only)**:
+     * replay target `pi_target` is always normalized visit counts from MCTS (temperature must not alter this)
+     * executed distribution:
+       * if `T>0`: \(\\pi_{exec}(a) \\propto (\\pi_{target}(a))^{1/T}\\) over legal actions
+       * if `T=0`: choose `argmax_a pi_target[a]` with deterministic tie-break
+     * temperature schedules `T(t)` are supported (see §7.3); `t` is a caller-provided global ply index
    * **AC:** logs show raw vs noisy priors; pi target unaffected by temp.
 
 3. **Fallback detection**
@@ -733,6 +745,21 @@ Below are epics with implementable stories. Each story includes **deliverable + 
 
    * tickets + response routing + latency histograms
    * **AC:** handles thousands of concurrent requests without deadlock.
+
+3. **Integrate InferenceClient into yz-mcts**
+
+   * Replace the “stub inference” path in `yz-mcts` with `yz-infer::InferenceClient` for leaf evaluation:
+     * `yz-mcts` submits leaf evaluation requests (features + legal mask + schema ids) to the client
+     * `yz-mcts` receives `(policy_logits[A], value)` responses and applies masked-softmax priors + backup sign convention
+   * This integration must support both:
+     * **Self-play mode** (Dirichlet root noise enabled, temperature schedule for executed move)
+     * **Eval/gating mode** (no root noise, temperature=0, deterministic tie-breaking; deterministic chance optional per gating config)
+   * Provide a **dummy inference server** (Rust) for tests that returns:
+     * uniform logits over legal moves
+     * value = 0
+     * preserves `request_id` routing
+   * **AC:** `cargo test --package yz-mcts` exercises the async leaf path using the dummy server (including multiple in-flight requests) and produces a valid `pi`.
+   * **AC:** end-to-end roundtrip: `yz-mcts` → `InferenceClient` → dummy server → `InferenceClient` → `yz-mcts` works without deadlocks and logs latency histograms.
 
 ---
 

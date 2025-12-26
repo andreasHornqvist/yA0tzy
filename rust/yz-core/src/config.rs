@@ -61,6 +61,12 @@ pub struct MctsConfig {
     /// Dirichlet noise epsilon - fraction of noise to mix in (only used in self-play).
     #[serde(default = "default_dirichlet_epsilon")]
     pub dirichlet_epsilon: f32,
+
+    /// Temperature schedule for executed-move sampling (PRD §7.3 / Epic E4S2).
+    ///
+    /// Note: temperature never changes replay `pi` targets (visit-count distribution).
+    #[serde(default)]
+    pub temperature_schedule: TemperatureSchedule,
 }
 
 fn default_dirichlet_alpha() -> f32 {
@@ -69,6 +75,22 @@ fn default_dirichlet_alpha() -> f32 {
 
 fn default_dirichlet_epsilon() -> f32 {
     0.25
+}
+
+/// Executed-move temperature schedule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TemperatureSchedule {
+    /// Constant temperature `t0`.
+    Constant { t0: f32 },
+    /// Step schedule: use `t0` while `ply < cutoff_ply`, else use `t1`.
+    Step { t0: f32, t1: f32, cutoff_ply: u32 },
+}
+
+impl Default for TemperatureSchedule {
+    fn default() -> Self {
+        TemperatureSchedule::Constant { t0: 1.0 }
+    }
 }
 
 /// Self-play configuration.

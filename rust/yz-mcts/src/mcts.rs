@@ -4,6 +4,9 @@ use crate::arena::Arena;
 use crate::infer::Inference;
 use crate::node::{Node, NodeId};
 use crate::state_key::{state_key, StateKey};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, Gamma};
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 use yz_core::{index_to_action, legal_action_mask, GameState, A};
@@ -20,6 +23,10 @@ pub enum ChanceMode {
 pub struct MctsConfig {
     pub c_puct: f32,
     pub simulations: u32,
+    /// Root Dirichlet alpha (self-play only).
+    pub dirichlet_alpha: f32,
+    /// Root Dirichlet epsilon mix-in fraction (self-play only).
+    pub dirichlet_epsilon: f32,
 }
 
 impl Default for MctsConfig {
@@ -27,6 +34,8 @@ impl Default for MctsConfig {
         Self {
             c_puct: 1.5,
             simulations: 64,
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.25,
         }
     }
 }
@@ -47,6 +56,8 @@ pub struct SearchStats {
 pub struct SearchResult {
     pub pi: [f32; A],
     pub root_value: f32,
+    pub root_priors_raw: Option<[f32; A]>,
+    pub root_priors_noisy: Option<[f32; A]>,
     pub stats: SearchStats,
 }
 
@@ -90,7 +101,35 @@ impl Mcts {
         self.stats.node_count = self.arena.len();
 
         // Expand root immediately (priors available for PUCT).
-        self.expand_node(root_id, &root_state, infer);
+        let (raw_priors, _v_root) = self.expand_node(root_id, &root_state, infer);
+
+        let mut root_priors_raw: Option<[f32; A]> = None;
+        let mut root_priors_noisy: Option<[f32; A]> = None;
+
+        // Root Dirichlet noise is self-play only (RNG mode).
+        if let ChanceMode::Rng { seed } = mode {
+            // Use a deterministic PRNG derived from the episode seed for noise itself.
+            let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xD1E7_C437_9E37_79B9u64);
+            let legal = legal_action_mask(
+                root_state.players[root_state.player_to_move as usize].avail_mask,
+                root_state.rerolls_left,
+            );
+            if self.cfg.dirichlet_epsilon > 0.0 {
+                let noisy = apply_root_dirichlet_noise(
+                    &raw_priors,
+                    &legal,
+                    self.cfg.dirichlet_alpha,
+                    self.cfg.dirichlet_epsilon,
+                    &mut rng,
+                );
+                root_priors_raw = Some(raw_priors);
+                root_priors_noisy = Some(noisy);
+                self.arena.get_mut(root_id).p = noisy;
+            } else {
+                root_priors_raw = Some(raw_priors);
+                root_priors_noisy = Some(raw_priors);
+            }
+        }
 
         for sim in 0..self.cfg.simulations {
             let mut ctx = match mode {
@@ -112,6 +151,8 @@ impl Mcts {
         SearchResult {
             pi,
             root_value,
+            root_priors_raw,
+            root_priors_noisy,
             stats: self.stats.clone(),
         }
     }
@@ -145,7 +186,7 @@ impl Mcts {
 
             // Expand if needed.
             if !self.arena.get(node_id).is_expanded {
-                let v = self.expand_node(node_id, &state, infer);
+                let (_priors, v) = self.expand_node(node_id, &state, infer);
                 self.backup(&path, v);
                 return;
             }
@@ -193,7 +234,12 @@ impl Mcts {
         }
     }
 
-    fn expand_node(&mut self, node_id: NodeId, state: &GameState, infer: &impl Inference) -> f32 {
+    fn expand_node(
+        &mut self,
+        node_id: NodeId,
+        state: &GameState,
+        infer: &impl Inference,
+    ) -> ([f32; A], f32) {
         let legal = legal_action_mask(
             state.players[state.player_to_move as usize].avail_mask,
             state.rerolls_left,
@@ -209,7 +255,7 @@ impl Mcts {
         n.p = priors;
 
         self.stats.expansions += 1;
-        v.clamp(-1.0, 1.0)
+        (priors, v.clamp(-1.0, 1.0))
     }
 
     fn select_action(&self, node_id: NodeId, legal: &[bool; A], mode: ChanceMode) -> u8 {
@@ -360,6 +406,95 @@ fn uniform_over_legal(legal: &[bool; A]) -> [f32; A] {
         if ok {
             out[i] = u;
         }
+    }
+    out
+}
+
+fn apply_root_dirichlet_noise(
+    p_raw: &[f32; A],
+    legal: &[bool; A],
+    alpha: f32,
+    eps: f32,
+    rng: &mut impl Rng,
+) -> [f32; A] {
+    if !(alpha.is_finite() && alpha > 0.0 && eps.is_finite() && (0.0..=1.0).contains(&eps)) {
+        return *p_raw;
+    }
+
+    // Sample gamma(alpha, 1) for each legal action, then normalize -> Dirichlet.
+    let gamma = Gamma::new(alpha as f64, 1.0).expect("alpha>0");
+    let mut eta = [0.0f32; A];
+    let mut sum = 0.0f64;
+    for (i, &ok) in legal.iter().enumerate() {
+        if ok {
+            let x = gamma.sample(rng);
+            eta[i] = x as f32;
+            sum += x;
+        }
+    }
+    if !(sum.is_finite() && sum > 0.0) {
+        return *p_raw;
+    }
+    for v in &mut eta {
+        *v = (*v as f64 / sum) as f32;
+    }
+
+    // Mix.
+    let mut out = [0.0f32; A];
+    for (i, &ok) in legal.iter().enumerate() {
+        if ok {
+            out[i] = (1.0 - eps) * p_raw[i] + eps * eta[i];
+        } else {
+            out[i] = 0.0;
+        }
+    }
+    out
+}
+
+pub fn apply_temperature(pi_target: &[f32; A], legal: &[bool; A], t: f32) -> [f32; A] {
+    // Executed-move distribution only. Caller chooses how/when to sample.
+    if !t.is_finite() || t < 0.0 {
+        return uniform_over_legal(legal);
+    }
+    if t == 0.0 {
+        // Greedy argmax with deterministic tie-break (lowest idx).
+        let mut best = None::<(usize, f32)>;
+        for (i, &ok) in legal.iter().enumerate() {
+            if !ok {
+                continue;
+            }
+            let v = pi_target[i];
+            if let Some((bi, bv)) = best {
+                if v > bv || (v == bv && i < bi) {
+                    best = Some((i, v));
+                }
+            } else {
+                best = Some((i, v));
+            }
+        }
+        let mut out = [0.0f32; A];
+        if let Some((i, _)) = best {
+            out[i] = 1.0;
+        }
+        return out;
+    }
+
+    let inv_t = 1.0 / t;
+    let mut out = [0.0f32; A];
+    let mut sum = 0.0f32;
+    for (i, &ok) in legal.iter().enumerate() {
+        if ok {
+            let v = pi_target[i].max(0.0);
+            let w = v.powf(inv_t);
+            out[i] = w;
+            sum += w;
+        }
+    }
+    if !(sum.is_finite() && sum > 0.0) {
+        return uniform_over_legal(legal);
+    }
+    for v in &mut out {
+        *v /= sum;
     }
     out
 }

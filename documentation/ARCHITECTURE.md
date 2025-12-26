@@ -178,7 +178,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E4S1 complete** (yz-mcts arena + PUCT core with stochastic transitions)
+Current status: **E4S2 complete** (root Dirichlet noise + executed-move temperature semantics)
 
 ---
 
