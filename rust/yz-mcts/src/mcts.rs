@@ -9,6 +9,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
 use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 use thiserror::Error;
 use yz_core::{index_to_action, legal_action_mask, GameState, A};
 
@@ -69,6 +70,32 @@ pub struct SearchResult {
     pub root_priors_noisy: Option<[f32; A]>,
     pub fallbacks: u32,
     pub stats: SearchStats,
+}
+
+#[derive(Debug)]
+struct PendingEvalClient {
+    ticket: yz_infer::Ticket,
+    leaf_node: NodeId,
+    leaf_state: GameState,
+    path: Vec<(NodeId, usize, u8, u8)>,
+}
+
+/// Incremental, non-blocking driver for one MCTS search (PRD E7S1).
+///
+/// Use `tick()` with a small budget to multiplex multiple games without blocking on inference.
+pub struct SearchDriver {
+    root_state: GameState,
+    mode: ChanceMode,
+    root_id: NodeId,
+
+    // Root evaluation is async.
+    root_ticket: Option<yz_infer::Ticket>,
+    root_priors_raw: Option<[f32; A]>,
+    root_priors_noisy: Option<[f32; A]>,
+
+    completed: u32,
+    sel_counter: u64,
+    pending: VecDeque<PendingEvalClient>,
 }
 
 struct PendingEval {
@@ -132,6 +159,7 @@ impl Mcts {
         mode: ChanceMode,
         infer: &impl Inference,
     ) -> SearchResult {
+        self.reset_tree();
         self.stats = SearchStats::default();
         self.force_uniform_root_pi = false;
 
@@ -246,158 +274,50 @@ impl Mcts {
         mode: ChanceMode,
         backend: &InferBackend,
     ) -> SearchResult {
+        let mut driver = self.begin_search_with_backend(root_state, mode, backend);
+        loop {
+            if let Some(res) = driver.tick(self, backend, 1024) {
+                return res;
+            }
+        }
+    }
+
+    /// Begin a non-blocking search driven by `SearchDriver::tick()`.
+    pub fn begin_search_with_backend(
+        &mut self,
+        root_state: GameState,
+        mode: ChanceMode,
+        backend: &InferBackend,
+    ) -> SearchDriver {
+        self.reset_tree();
         self.stats = SearchStats::default();
         self.force_uniform_root_pi = false;
 
         let root_id = self.arena.push(Node::new(root_state.player_to_move));
         self.stats.node_count = self.arena.len();
 
-        // Expand root immediately (priors available for PUCT).
-        let (raw_priors, used_fallback_priors) =
-            self.expand_node_with_backend(root_id, &root_state, backend);
-        if used_fallback_priors {
-            self.force_uniform_root_pi = true;
+        let legal = legal_action_mask(
+            root_state.players[root_state.player_to_move as usize].avail_mask,
+            root_state.rerolls_left,
+        );
+        let root_ticket = backend.submit(&root_state, &legal).ok(); // if submit fails, we'll fallback in tick()
+
+        SearchDriver {
+            root_state,
+            mode,
+            root_id,
+            root_ticket,
+            root_priors_raw: None,
+            root_priors_noisy: None,
+            completed: 0,
+            sel_counter: 0,
+            pending: VecDeque::new(),
         }
+    }
 
-        let mut root_priors_raw: Option<[f32; A]> = None;
-        let mut root_priors_noisy: Option<[f32; A]> = None;
-
-        // Root Dirichlet noise is self-play only (RNG mode).
-        if let ChanceMode::Rng { seed } = mode {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xD1E7_C437_9E37_79B9u64);
-            let legal = legal_action_mask(
-                root_state.players[root_state.player_to_move as usize].avail_mask,
-                root_state.rerolls_left,
-            );
-            if self.cfg.dirichlet_epsilon > 0.0 {
-                let noisy = apply_root_dirichlet_noise(
-                    &raw_priors,
-                    &legal,
-                    self.cfg.dirichlet_alpha,
-                    self.cfg.dirichlet_epsilon,
-                    &mut rng,
-                );
-                root_priors_raw = Some(raw_priors);
-                root_priors_noisy = Some(noisy);
-                self.arena.get_mut(root_id).p = noisy;
-            } else {
-                root_priors_raw = Some(raw_priors);
-                root_priors_noisy = Some(raw_priors);
-            }
-        }
-
-        struct PendingEvalClient {
-            ticket: yz_infer::Ticket,
-            leaf_node: NodeId,
-            leaf_state: GameState,
-            path: Vec<(NodeId, usize, u8, u8)>,
-        }
-
-        let mut completed: u32 = 0;
-        let mut sel_counter: u64 = 0;
-        let mut pending: std::collections::VecDeque<PendingEvalClient> =
-            std::collections::VecDeque::new();
-
-        while completed < self.cfg.simulations {
-            while pending.len() < self.cfg.max_inflight
-                && (completed as usize + pending.len()) < (self.cfg.simulations as usize)
-            {
-                sel_counter += 1;
-                let mut ctx = match mode {
-                    ChanceMode::Deterministic { episode_seed } => {
-                        yz_core::TurnContext::new_deterministic(episode_seed)
-                    }
-                    ChanceMode::Rng { seed } => {
-                        let sel_seed = seed ^ sel_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        yz_core::TurnContext::new_rng(sel_seed)
-                    }
-                };
-
-                match self.select_leaf_and_reserve(root_id, root_state, &mut ctx, mode) {
-                    LeafSelection::Terminal { path, z } => {
-                        self.backup_with_virtual_loss(&path, z);
-                        completed += 1;
-                    }
-                    LeafSelection::Pending(pe) => {
-                        let legal = legal_action_mask(
-                            pe.leaf_state.players[pe.leaf_state.player_to_move as usize].avail_mask,
-                            pe.leaf_state.rerolls_left,
-                        );
-                        let ticket = match backend.submit(&pe.leaf_state, &legal) {
-                            Ok(t) => t,
-                            Err(_) => {
-                                self.backup_with_virtual_loss(&pe.path, 0.0);
-                                completed += 1;
-                                continue;
-                            }
-                        };
-                        pending.push_back(PendingEvalClient {
-                            ticket,
-                            leaf_node: pe.leaf_node,
-                            leaf_state: pe.leaf_state,
-                            path: pe.path,
-                        });
-                        self.stats.pending_count_max =
-                            self.stats.pending_count_max.max(pending.len());
-                    }
-                }
-            }
-
-            if pending.is_empty() {
-                continue;
-            }
-
-            // Drain one completed inference. Prefer a non-blocking scan; if none ready, block briefly.
-            let mut processed = false;
-            for _ in 0..pending.len() {
-                let pe = pending.pop_front().expect("pending non-empty");
-                match pe.ticket.try_recv() {
-                    Ok(Some(resp)) => {
-                        self.apply_infer_response(pe.leaf_node, &pe.leaf_state, &pe.path, resp);
-                        completed += 1;
-                        processed = true;
-                        break;
-                    }
-                    Ok(None) => pending.push_back(pe),
-                    Err(_) => {
-                        self.backup_with_virtual_loss(&pe.path, 0.0);
-                        completed += 1;
-                        processed = true;
-                        break;
-                    }
-                }
-            }
-
-            if !processed {
-                // No response ready; block briefly on the front request to avoid spinning.
-                if let Some(pe) = pending.pop_front() {
-                    match pe.ticket.recv_timeout(std::time::Duration::from_millis(1)) {
-                        Ok(resp) => {
-                            self.apply_infer_response(pe.leaf_node, &pe.leaf_state, &pe.path, resp);
-                            completed += 1;
-                        }
-                        Err(yz_infer::ClientError::Timeout) => {
-                            pending.push_front(pe);
-                        }
-                        Err(_) => {
-                            self.backup_with_virtual_loss(&pe.path, 0.0);
-                            completed += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        let (pi, root_value) = self.root_pi_value(root_id, &root_state);
-
-        SearchResult {
-            pi,
-            root_value,
-            root_priors_raw,
-            root_priors_noisy,
-            fallbacks: self.stats.fallbacks,
-            stats: self.stats.clone(),
-        }
+    fn reset_tree(&mut self) {
+        self.arena = Arena::new();
+        self.children.clear();
     }
 
     fn select_leaf_and_reserve(
@@ -512,55 +432,6 @@ impl Mcts {
 
         self.stats.expansions += 1;
         (priors, v.clamp(-1.0, 1.0), used_fallback)
-    }
-
-    fn expand_node_with_backend(
-        &mut self,
-        node_id: NodeId,
-        state: &GameState,
-        backend: &InferBackend,
-    ) -> ([f32; A], bool) {
-        let legal = legal_action_mask(
-            state.players[state.player_to_move as usize].avail_mask,
-            state.rerolls_left,
-        );
-        let ticket = match backend.submit(state, &legal) {
-            Ok(t) => t,
-            Err(_) => {
-                self.stats.fallbacks += 1;
-                let priors = uniform_over_legal(&legal);
-                let n = self.arena.get_mut(node_id);
-                n.is_expanded = true;
-                n.to_play = state.player_to_move;
-                n.p = priors;
-                self.stats.expansions += 1;
-                return (priors, true);
-            }
-        };
-        let resp = match ticket.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(r) => r,
-            Err(_) => {
-                self.stats.fallbacks += 1;
-                let priors = uniform_over_legal(&legal);
-                let n = self.arena.get_mut(node_id);
-                n.is_expanded = true;
-                n.to_play = state.player_to_move;
-                n.p = priors;
-                self.stats.expansions += 1;
-                return (priors, true);
-            }
-        };
-
-        let logits = vec_logits_to_array(&resp.policy_logits);
-        let (priors, used_fallback) = masked_softmax(&logits, &legal, &mut self.stats);
-
-        let n = self.arena.get_mut(node_id);
-        n.is_expanded = true;
-        n.to_play = state.player_to_move;
-        n.p = priors;
-
-        self.stats.expansions += 1;
-        (priors, used_fallback)
     }
 
     fn apply_infer_response(
@@ -705,6 +576,200 @@ impl Mcts {
         }
 
         (pi, v.clamp(-1.0, 1.0))
+    }
+}
+
+impl SearchDriver {
+    /// Advance the search by up to `max_work` small operations.
+    ///
+    /// Returns `Some(SearchResult)` when the search is complete; otherwise `None`.
+    pub fn tick(
+        &mut self,
+        mcts: &mut Mcts,
+        backend: &InferBackend,
+        max_work: u32,
+    ) -> Option<SearchResult> {
+        for _ in 0..max_work {
+            // Ensure root is expanded before doing any selections.
+            if !mcts.arena.get(self.root_id).is_expanded {
+                if !self.poll_root(mcts) {
+                    // Root not ready yet; non-blocking.
+                    return None;
+                }
+                continue;
+            }
+
+            if self.completed >= mcts.cfg.simulations {
+                return Some(self.finish(mcts));
+            }
+
+            // Enqueue one leaf selection if we are under inflight cap and budget.
+            if self.pending.len() < mcts.cfg.max_inflight
+                && (self.completed as usize + self.pending.len()) < (mcts.cfg.simulations as usize)
+            {
+                self.sel_counter += 1;
+                let mut ctx = match self.mode {
+                    ChanceMode::Deterministic { episode_seed } => {
+                        yz_core::TurnContext::new_deterministic(episode_seed)
+                    }
+                    ChanceMode::Rng { seed } => {
+                        let sel_seed = seed ^ self.sel_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        yz_core::TurnContext::new_rng(sel_seed)
+                    }
+                };
+
+                match mcts.select_leaf_and_reserve(
+                    self.root_id,
+                    self.root_state,
+                    &mut ctx,
+                    self.mode,
+                ) {
+                    LeafSelection::Terminal { path, z } => {
+                        mcts.backup_with_virtual_loss(&path, z);
+                        self.completed += 1;
+                    }
+                    LeafSelection::Pending(pe) => {
+                        let legal = legal_action_mask(
+                            pe.leaf_state.players[pe.leaf_state.player_to_move as usize].avail_mask,
+                            pe.leaf_state.rerolls_left,
+                        );
+                        let ticket = match backend.submit(&pe.leaf_state, &legal) {
+                            Ok(t) => t,
+                            Err(_) => {
+                                mcts.backup_with_virtual_loss(&pe.path, 0.0);
+                                self.completed += 1;
+                                continue;
+                            }
+                        };
+                        self.pending.push_back(PendingEvalClient {
+                            ticket,
+                            leaf_node: pe.leaf_node,
+                            leaf_state: pe.leaf_state,
+                            path: pe.path,
+                        });
+                        mcts.stats.pending_count_max =
+                            mcts.stats.pending_count_max.max(self.pending.len());
+                    }
+                }
+                continue;
+            }
+
+            // Otherwise, try to drain a completed inference response without blocking.
+            if self.pending.is_empty() {
+                // Nothing to do (should be rare); yield to scheduler.
+                return None;
+            }
+
+            let mut processed = false;
+            for _ in 0..self.pending.len() {
+                let pe = self.pending.pop_front().expect("pending non-empty");
+                match pe.ticket.try_recv() {
+                    Ok(Some(resp)) => {
+                        mcts.apply_infer_response(pe.leaf_node, &pe.leaf_state, &pe.path, resp);
+                        self.completed += 1;
+                        processed = true;
+                        break;
+                    }
+                    Ok(None) => self.pending.push_back(pe),
+                    Err(_) => {
+                        mcts.backup_with_virtual_loss(&pe.path, 0.0);
+                        self.completed += 1;
+                        processed = true;
+                        break;
+                    }
+                }
+            }
+            if !processed {
+                // No response ready; non-blocking.
+                return None;
+            }
+        }
+        None
+    }
+
+    fn poll_root(&mut self, mcts: &mut Mcts) -> bool {
+        // If root submit failed, fallback to uniform priors and proceed.
+        let legal = legal_action_mask(
+            self.root_state.players[self.root_state.player_to_move as usize].avail_mask,
+            self.root_state.rerolls_left,
+        );
+
+        let Some(ticket) = &self.root_ticket else {
+            mcts.stats.fallbacks += 1;
+            let priors = uniform_over_legal(&legal);
+            let n = mcts.arena.get_mut(self.root_id);
+            n.is_expanded = true;
+            n.to_play = self.root_state.player_to_move;
+            n.p = priors;
+            mcts.stats.expansions += 1;
+            mcts.force_uniform_root_pi = true;
+            self.root_priors_raw = Some(priors);
+            self.root_priors_noisy = Some(priors);
+            return true;
+        };
+
+        match ticket.try_recv() {
+            Ok(Some(resp)) => {
+                let logits = vec_logits_to_array(&resp.policy_logits);
+                let (mut priors, used_fallback) = masked_softmax(&logits, &legal, &mut mcts.stats);
+                if used_fallback {
+                    mcts.force_uniform_root_pi = true;
+                }
+
+                self.root_priors_raw = Some(priors);
+                self.root_priors_noisy = Some(priors);
+
+                // Apply root Dirichlet noise only in RNG mode.
+                if let ChanceMode::Rng { seed } = self.mode {
+                    if mcts.cfg.dirichlet_epsilon > 0.0 {
+                        let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xD1E7_C437_9E37_79B9u64);
+                        let noisy = apply_root_dirichlet_noise(
+                            &priors,
+                            &legal,
+                            mcts.cfg.dirichlet_alpha,
+                            mcts.cfg.dirichlet_epsilon,
+                            &mut rng,
+                        );
+                        self.root_priors_noisy = Some(noisy);
+                        priors = noisy;
+                    }
+                }
+
+                let n = mcts.arena.get_mut(self.root_id);
+                n.is_expanded = true;
+                n.to_play = self.root_state.player_to_move;
+                n.p = priors;
+                mcts.stats.expansions += 1;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => {
+                // Treat as fallback.
+                mcts.stats.fallbacks += 1;
+                let priors = uniform_over_legal(&legal);
+                let n = mcts.arena.get_mut(self.root_id);
+                n.is_expanded = true;
+                n.to_play = self.root_state.player_to_move;
+                n.p = priors;
+                mcts.stats.expansions += 1;
+                mcts.force_uniform_root_pi = true;
+                self.root_priors_raw = Some(priors);
+                self.root_priors_noisy = Some(priors);
+                true
+            }
+        }
+    }
+
+    fn finish(&self, mcts: &Mcts) -> SearchResult {
+        let (pi, root_value) = mcts.root_pi_value(self.root_id, &self.root_state);
+        SearchResult {
+            pi,
+            root_value,
+            root_priors_raw: self.root_priors_raw,
+            root_priors_noisy: self.root_priors_noisy,
+            fallbacks: mcts.stats.fallbacks,
+            stats: mcts.stats.clone(),
+        }
     }
 }
 

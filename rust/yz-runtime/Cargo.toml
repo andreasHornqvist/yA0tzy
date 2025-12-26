@@ -7,4 +7,10 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+yz-core = { path = "../yz-core" }
+yz-mcts = { path = "../yz-mcts" }
+yz-infer = { path = "../yz-infer" }
+thiserror = "1"
+
 
