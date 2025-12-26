@@ -42,6 +42,8 @@ yA0tzy/
 │
 ├── configs/                  # YAML configuration files
 │   └── local_cpu.yaml        # Example config for local CPU runs
+│   └── seed_sets/            # Fixed dev seed sets for reproducible gating (E9.2)
+│       └── dev_small_v1.txt
 │
 ├── documentation/            # Project documentation
 │   ├── prd.md                # Product Requirements Document

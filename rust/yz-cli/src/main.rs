@@ -111,7 +111,7 @@ COMMANDS:
     oracle expected     Print oracle expected score (~248.44)
     oracle sim          Run oracle solitaire simulation
     selfplay            Run self-play with MCTS + inference
-    gate                Gate candidate vs best model
+    gate                Gate candidate vs best model (paired seed + side swap)
     oracle-eval         Evaluate models against oracle baseline
     bench               Run micro-benchmarks
     profile             Run with profiler hooks enabled
@@ -416,6 +416,155 @@ OPTIONS:
     println!("Self-play complete. Games={games} out={out}");
 }
 
+fn cmd_gate(args: &[String]) {
+    let mut config_path: Option<String> = None;
+    let mut infer: Option<String> = None;
+    let mut best_id: u32 = 0;
+    let mut cand_id: u32 = 1;
+    let mut run_dir: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz gate
+
+USAGE:
+    yz gate --config cfg.yaml [--infer unix:///tmp/yatzy_infer.sock] [--best-id 0] [--cand-id 1] [--run runs/<id>/]
+
+NOTES:
+    - Candidate vs best are selected by model_id routing on the inference server.
+    - If gating.paired_seed_swap=true, gating.games must be even (two games per seed, side-swapped).
+
+OPTIONS:
+    --config PATH       Config YAML path
+    --infer ENDPOINT    Override inference endpoint (unix:///... or tcp://host:port). Defaults to config.inference.bind
+    --best-id N         model_id for best (default 0)
+    --cand-id N         model_id for candidate (default 1)
+    --run DIR           Optional run dir to update runs/<id>/run.json with gate stats
+"#
+                );
+                return;
+            }
+            "--config" => {
+                config_path = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--infer" => {
+                infer = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--best-id" => {
+                best_id = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(best_id);
+                i += 2;
+            }
+            "--cand-id" => {
+                cand_id = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cand_id);
+                i += 2;
+            }
+            "--run" => {
+                run_dir = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz gate`: {other}");
+                eprintln!("Run `yz gate --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let config_path = config_path.unwrap_or_else(|| {
+        eprintln!("Missing --config");
+        process::exit(1);
+    });
+
+    let cfg = yz_core::Config::load(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {e}");
+        process::exit(1);
+    });
+
+    let infer_ep = infer.unwrap_or_else(|| cfg.inference.bind.clone());
+
+    let client_opts = yz_infer::ClientOptions {
+        max_inflight_total: 8192,
+        max_outbound_queue: 8192,
+        request_id_start: 1,
+    };
+
+    let mcts_cfg = yz_mcts::MctsConfig {
+        c_puct: cfg.mcts.c_puct,
+        simulations: cfg.mcts.budget_mark.max(1),
+        dirichlet_alpha: cfg.mcts.dirichlet_alpha,
+        dirichlet_epsilon: 0.0, // gating: no root noise
+        max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
+        virtual_loss: 1.0,
+    };
+
+    let report = yz_eval::gate(
+        &cfg,
+        yz_eval::GateOptions {
+            infer_endpoint: infer_ep.clone(),
+            best_model_id: best_id,
+            cand_model_id: cand_id,
+            client_opts,
+            mcts_cfg,
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Gating failed: {e}");
+        process::exit(1);
+    });
+
+    let wr = report.win_rate();
+    if let Some(id) = cfg.gating.seed_set_id.as_deref() {
+        println!("Seed source: seed_set_id={id} requested_games={}", cfg.gating.games);
+    } else {
+        println!("Seed source: seed={} requested_games={}", cfg.gating.seed, cfg.gating.games);
+    }
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!(
+        "Gating complete. games={} wins={} losses={} draws={} win_rate={:.4} mean_score_diff={:.2}",
+        report.games,
+        report.cand_wins,
+        report.cand_losses,
+        report.draws,
+        wr,
+        report.mean_score_diff()
+    );
+
+    if let Some(run) = run_dir {
+        let run_json = PathBuf::from(run).join("run.json");
+        match yz_logging::read_manifest(&run_json) {
+            Ok(mut m) => {
+                m.gate_games = Some(report.games as u64);
+                m.gate_win_rate = Some(wr);
+                let _ = yz_logging::write_manifest_atomic(&run_json, &m);
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to update run manifest: {e:?}");
+            }
+        }
+    }
+
+    if wr + 1e-12 < cfg.gating.win_rate_threshold {
+        eprintln!(
+            "Candidate rejected: win_rate {:.4} < threshold {:.4}",
+            wr, cfg.gating.win_rate_threshold
+        );
+        process::exit(2);
+    }
+}
+
 fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
     let opts = yz_infer::ClientOptions {
         max_inflight_total: 8192,
@@ -624,8 +773,7 @@ fn main() {
             }
         }
         "gate" => {
-            println!("Gating (not yet implemented)");
-            println!("Usage: yz gate --config cfg.yaml --best best.pt --cand cand.pt");
+            cmd_gate(&args[2..]);
         }
         "oracle-eval" => {
             println!("Oracle evaluation (not yet implemented)");

@@ -120,7 +120,21 @@ pub struct TrainingConfig {
 pub struct GatingConfig {
     /// Number of games to play for gating evaluation.
     pub games: u32,
+    /// Base seed for deterministic paired-seed scheduling in gating (E9.1).
+    ///
+    /// When `paired_seed_swap=true`, the evaluator will deterministically derive per-pair
+    /// episode seeds from this base value.
+    #[serde(default)]
+    pub seed: u64,
+    /// Optional fixed dev seed set id (E9.2).
+    ///
+    /// If set, gating will load `configs/seed_sets/<id>.txt` and schedule games from that list.
+    /// This is useful for reproducible evaluation sets. When present, `seed` is ignored for
+    /// seed selection.
+    #[serde(default = "default_gating_seed_set_id")]
+    pub seed_set_id: Option<String>,
     /// Win rate threshold for promotion (e.g., 0.55 = 55%).
+    #[serde(default = "default_gating_win_rate_threshold")]
     pub win_rate_threshold: f64,
     /// Whether to use paired seed + side swap for reduced variance.
     pub paired_seed_swap: bool,
@@ -131,6 +145,14 @@ pub struct GatingConfig {
 
 fn default_gating_deterministic_chance() -> bool {
     true
+}
+
+fn default_gating_win_rate_threshold() -> f64 {
+    0.55
+}
+
+fn default_gating_seed_set_id() -> Option<String> {
+    Some("dev_v1".to_string())
 }
 
 impl Config {
@@ -165,6 +187,8 @@ mod tests {
         assert_eq!(config.selfplay.workers, 4);
         assert_eq!(config.training.batch_size, 256);
         assert_eq!(config.gating.games, 100);
+        assert_eq!(config.gating.seed, 0);
+        assert_eq!(config.gating.seed_set_id.as_deref(), Some("dev_v1"));
         assert!(config.gating.paired_seed_swap);
         assert!(config.gating.deterministic_chance);
     }

@@ -70,7 +70,19 @@ class GatingConfig(BaseModel):
     """Gating (candidate vs best evaluation) configuration."""
 
     games: int = Field(description="Number of games to play for evaluation")
-    win_rate_threshold: float = Field(description="Win rate threshold for promotion (0.55 = 55%)")
+    seed: int = Field(
+        default=0, description="Base seed for deterministic paired-seed scheduling in gating"
+    )
+    seed_set_id: str | None = Field(
+        default="dev_v1",
+        description=(
+            "Optional fixed dev seed set id. If set, gating loads "
+            "`configs/seed_sets/<id>.txt` and uses those seeds instead of deriving from `seed`."
+        ),
+    )
+    win_rate_threshold: float = Field(
+        default=0.55, description="Win rate threshold for promotion (0.55 = 55%)"
+    )
     paired_seed_swap: bool = Field(
         description="Use paired seeds with side swap for reduced variance"
     )
