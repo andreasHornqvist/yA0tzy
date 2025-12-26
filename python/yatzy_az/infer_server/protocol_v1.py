@@ -1,0 +1,218 @@
+"""Protocol v1 framing + codec compatible with `rust/yz-infer`."""
+
+from __future__ import annotations
+
+import asyncio
+import struct
+from dataclasses import dataclass
+from typing import Final
+
+PROTOCOL_VERSION: Final[int] = 1
+ACTION_SPACE_A: Final[int] = 47
+FEATURE_SCHEMA_ID_V1: Final[int] = 1
+FEATURE_LEN_V1: Final[int] = 45
+MAX_FRAME_LEN: Final[int] = 64 * 1024 * 1024  # 64 MiB (matches rust/yz-infer)
+
+
+class ProtocolError(Exception):
+    pass
+
+
+class FrameTooLargeError(ProtocolError):
+    pass
+
+
+class UnexpectedEofError(ProtocolError):
+    pass
+
+
+class DecodeError(ProtocolError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class InferRequestV1:
+    request_id: int
+    model_id: int
+    feature_schema_id: int
+    features: list[float]  # len=F
+    legal_mask: bytes  # len=A, each byte 0/1
+
+
+@dataclass(frozen=True, slots=True)
+class InferResponseV1:
+    request_id: int
+    policy_logits: list[float]  # len=A
+    value: float
+    margin: float | None
+
+
+def encode_frame(payload: bytes) -> bytes:
+    n = len(payload)
+    if n > MAX_FRAME_LEN:
+        raise FrameTooLargeError(f"frame too large: {n} > {MAX_FRAME_LEN}")
+    return struct.pack("<I", n) + payload
+
+
+async def read_frame(reader: asyncio.StreamReader) -> bytes:
+    """Read one length-delimited frame payload from an asyncio StreamReader."""
+    try:
+        hdr = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as e:
+        raise UnexpectedEofError("unexpected EOF while reading frame length") from e
+    (n,) = struct.unpack("<I", hdr)
+    if n > MAX_FRAME_LEN:
+        raise FrameTooLargeError(f"frame too large: {n} > {MAX_FRAME_LEN}")
+    try:
+        return await reader.readexactly(n)
+    except asyncio.IncompleteReadError as e:
+        raise UnexpectedEofError("unexpected EOF while reading frame payload") from e
+
+
+async def write_frame(writer: asyncio.StreamWriter, payload: bytes) -> None:
+    """Write one length-delimited frame to an asyncio StreamWriter."""
+    writer.write(encode_frame(payload))
+    await writer.drain()
+
+
+def decode_frame_from_buffer(buf: bytes) -> bytes:
+    if len(buf) < 4:
+        raise UnexpectedEofError("need 4 bytes for frame length")
+    (n,) = struct.unpack_from("<I", buf, 0)
+    if n > MAX_FRAME_LEN:
+        raise FrameTooLargeError(f"frame too large: {n} > {MAX_FRAME_LEN}")
+    if len(buf) < 4 + n:
+        raise UnexpectedEofError("buffer ended early while reading frame")
+    return buf[4 : 4 + n]
+
+
+def encode_request_v1(req: InferRequestV1) -> bytes:
+    # Header: u32 version, u8 kind, u8 flags, u16 reserved
+    out = bytearray()
+    out += struct.pack("<I", PROTOCOL_VERSION)
+    out += struct.pack("<B", 1)  # MsgKind::Request
+    out += struct.pack("<B", 0)  # flags
+    out += b"\x00\x00"  # reserved
+
+    out += struct.pack("<Q", req.request_id)
+    out += struct.pack("<I", req.model_id)
+    out += struct.pack("<I", req.feature_schema_id)
+
+    out += struct.pack("<I", len(req.features))
+    for f in req.features:
+        out += struct.pack("<f", float(f))
+
+    out += struct.pack("<I", len(req.legal_mask))
+    out += req.legal_mask
+    return bytes(out)
+
+
+def decode_request_v1(payload: bytes) -> InferRequestV1:
+    off = 0
+
+    def take(n: int) -> bytes:
+        nonlocal off
+        if off + n > len(payload):
+            raise DecodeError("payload too short")
+        b = payload[off : off + n]
+        off += n
+        return b
+
+    version = struct.unpack("<I", take(4))[0]
+    if version != PROTOCOL_VERSION:
+        raise DecodeError(f"bad version: {version}")
+    kind = struct.unpack("<B", take(1))[0]
+    if kind != 1:
+        raise DecodeError(f"bad kind: {kind}")
+    _flags = struct.unpack("<B", take(1))[0]
+    take(2)  # reserved
+
+    request_id = struct.unpack("<Q", take(8))[0]
+    model_id = struct.unpack("<I", take(4))[0]
+    feature_schema_id = struct.unpack("<I", take(4))[0]
+    if feature_schema_id != FEATURE_SCHEMA_ID_V1:
+        raise DecodeError(f"bad schema: {feature_schema_id}")
+
+    features_len = struct.unpack("<I", take(4))[0]
+    if features_len != FEATURE_LEN_V1:
+        raise DecodeError(f"bad features len: got {features_len}, expected {FEATURE_LEN_V1}")
+    features: list[float] = []
+    for _ in range(features_len):
+        features.append(struct.unpack("<f", take(4))[0])
+
+    legal_len = struct.unpack("<I", take(4))[0]
+    if legal_len != ACTION_SPACE_A:
+        raise DecodeError(f"bad legal len: got {legal_len}, expected {ACTION_SPACE_A}")
+    legal_mask = take(legal_len)
+    for b in legal_mask:
+        if b not in (0, 1):
+            raise DecodeError(f"bad legal byte: {b}")
+
+    return InferRequestV1(
+        request_id=request_id,
+        model_id=model_id,
+        feature_schema_id=feature_schema_id,
+        features=features,
+        legal_mask=bytes(legal_mask),
+    )
+
+
+def encode_response_v1(resp: InferResponseV1) -> bytes:
+    out = bytearray()
+    out += struct.pack("<I", PROTOCOL_VERSION)
+    out += struct.pack("<B", 2)  # MsgKind::Response
+    out += struct.pack("<B", 0)  # flags
+    out += b"\x00\x00"  # reserved
+
+    out += struct.pack("<Q", resp.request_id)
+
+    out += struct.pack("<I", len(resp.policy_logits))
+    for f in resp.policy_logits:
+        out += struct.pack("<f", float(f))
+
+    out += struct.pack("<f", float(resp.value))
+    if resp.margin is None:
+        out += struct.pack("<B", 0)
+    else:
+        out += struct.pack("<B", 1)
+        out += struct.pack("<f", float(resp.margin))
+
+    return bytes(out)
+
+
+def decode_response_v1(payload: bytes) -> InferResponseV1:
+    off = 0
+
+    def take(n: int) -> bytes:
+        nonlocal off
+        if off + n > len(payload):
+            raise DecodeError("payload too short")
+        b = payload[off : off + n]
+        off += n
+        return b
+
+    version = struct.unpack("<I", take(4))[0]
+    if version != PROTOCOL_VERSION:
+        raise DecodeError(f"bad version: {version}")
+    kind = struct.unpack("<B", take(1))[0]
+    if kind != 2:
+        raise DecodeError(f"bad kind: {kind}")
+    _flags = struct.unpack("<B", take(1))[0]
+    take(2)  # reserved
+
+    request_id = struct.unpack("<Q", take(8))[0]
+
+    policy_len = struct.unpack("<I", take(4))[0]
+    if policy_len != ACTION_SPACE_A:
+        raise DecodeError(f"bad policy len: got {policy_len}, expected {ACTION_SPACE_A}")
+    policy_logits: list[float] = []
+    for _ in range(policy_len):
+        policy_logits.append(struct.unpack("<f", take(4))[0])
+
+    value = struct.unpack("<f", take(4))[0]
+    has_margin = struct.unpack("<B", take(1))[0]
+    margin = struct.unpack("<f", take(4))[0] if has_margin == 1 else None
+
+    return InferResponseV1(
+        request_id=request_id, policy_logits=policy_logits, value=value, margin=margin
+    )

@@ -10,15 +10,13 @@ import argparse
 import sys
 
 from . import __version__
+from .infer_server import server as infer_server
 
 
 def cmd_infer_server(args: argparse.Namespace) -> int:
     """Run the batched inference server."""
-    print("Inference server (not yet implemented)")
-    print(f"  --model {args.model}")
-    print(f"  --bind {args.bind}")
-    print(f"  --device {args.device}")
-    return 0
+    # Model/device args are placeholders for later (PyTorch integration).
+    return infer_server.run_from_args(args)
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -58,6 +56,7 @@ def main() -> int:
     p_infer.add_argument("--model", default="best.pt", help="Model checkpoint path")
     p_infer.add_argument("--bind", default="unix:///tmp/yatzy_infer.sock", help="Bind address")
     p_infer.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
+    infer_server.add_args(p_infer)
     p_infer.set_defaults(func=cmd_infer_server)
 
     # train
