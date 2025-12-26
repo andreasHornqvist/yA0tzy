@@ -36,9 +36,9 @@ yA0tzy/
 │   └── yatzy_az/             # Main package
 │       ├── __init__.py
 │       ├── __main__.py       # CLI entrypoint (python -m yatzy_az)
-│       ├── model/            # Neural network architecture (future)
-│       ├── trainer/          # Training loop (future)
-│       └── server/           # Inference server (future)
+│       ├── model/            # Neural network architecture
+│       ├── trainer/          # Training loop
+│       └── server/           # Inference server (asyncio + batching + metrics)
 │
 ├── configs/                  # YAML configuration files
 │   └── local_cpu.yaml        # Example config for local CPU runs
@@ -150,9 +150,9 @@ See `.github/workflows/ci.yml` for details.
 | Run manifest (E8.5.x) | `runs/<id>/run.json` (written by `yz selfplay`, updated by `python -m yatzy_az train`, and finalized by `yz iter finalize`) |
 | Replay snapshot (E8.5.4) | `runs/<id>/replay_snapshot.json` (created by training; freezes shard list for resumes) |
 | Python replay dataset loader (E8S1) | `python/yatzy_az/replay_dataset.py` |
-| Neural network model | `python/yatzy_az/model/` (future) |
-| Training loop | `python/yatzy_az/trainer/` (future) |
-| Python inference server (asyncio + batching + metrics) | `python/yatzy_az/infer_server/` |
+| Neural network model | `python/yatzy_az/model/` |
+| Training loop | `python/yatzy_az/trainer/` |
+| Python inference server (asyncio + batching + metrics) | `python/yatzy_az/server/` |
 | Runtime scheduler + GameTask | `rust/yz-runtime/` (`src/game_task.rs`, `src/scheduler.rs`) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
 | CLI commands (Python) | `python/yatzy_az/__main__.py` |

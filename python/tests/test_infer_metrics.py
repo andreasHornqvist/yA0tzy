@@ -1,9 +1,9 @@
 import asyncio
 import time
 
-from yatzy_az.infer_server.batcher import BatcherStats, ModelStats
-from yatzy_az.infer_server.metrics import MetricsSnapshot, format_prometheus
-from yatzy_az.infer_server.metrics_server import start_metrics_server
+from yatzy_az.server.batcher import BatcherStats, ModelStats
+from yatzy_az.server.metrics import MetricsSnapshot, format_prometheus
+from yatzy_az.server.metrics_server import start_metrics_server
 
 
 def test_format_prometheus_contains_expected_names() -> None:

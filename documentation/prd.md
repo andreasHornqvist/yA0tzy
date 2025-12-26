@@ -479,13 +479,13 @@ Core commands (v1):
 1. `yz oracle expected`
 2. Start inference server with a tiny dummy model:
 
-   * `python -m yatzy_az.infer_server --model dummy --bind unix:///tmp/y.sock --device cpu`
+   * `python -m yatzy_az infer-server --best dummy --cand dummy --bind unix:///tmp/y.sock`
 3. Generate a small replay:
 
    * `yz selfplay --config configs/local_cpu.yaml --infer unix:///tmp/y.sock --out runs/smoke/ --games 50`
 4. Train candidate for a few steps:
 
-   * `python -m yatzy_az.train --replay runs/smoke/replay --best runs/smoke/models/best.pt --out runs/smoke/models`
+   * `python -m yatzy_az train --replay runs/smoke/replay --best runs/smoke/models/best.pt --out runs/smoke/models`
 5. Gate candidate vs best:
 
    * `yz gate --config configs/local_cpu.yaml --best ... --cand ...`
@@ -513,9 +513,9 @@ Include the oracle crate as a workspace member (or submodule):
 
 ### Python package
 
-* `yatzy_az/infer_server/`
-* `yatzy_az/model.py`
-* `yatzy_az/train.py`
+* `yatzy_az/server/`
+* `yatzy_az/model/`
+* `yatzy_az/trainer/`
 * `yatzy_az/replay_dataset.py`
 * `yatzy_az/config.py`
 

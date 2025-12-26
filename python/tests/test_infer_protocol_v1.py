@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from yatzy_az.infer_server.protocol_v1 import (
+from yatzy_az.server.protocol_v1 import (
     ACTION_SPACE_A,
     FEATURE_LEN_V1,
     FEATURE_SCHEMA_ID_V1,
@@ -15,7 +15,7 @@ from yatzy_az.infer_server.protocol_v1 import (
     encode_request_v1,
     encode_response_v1,
 )
-from yatzy_az.infer_server.server import ServerConfig, serve
+from yatzy_az.server.server import ServerConfig, serve
 
 
 def test_request_roundtrip_codec() -> None:
@@ -75,7 +75,7 @@ async def _uds_server_smoke_batches() -> None:
             features=[0.0] * FEATURE_LEN_V1,
             legal_mask=bytes([1] * ACTION_SPACE_A),
         )
-        from yatzy_az.infer_server.protocol_v1 import encode_frame, read_frame
+        from yatzy_az.server.protocol_v1 import encode_frame, read_frame
 
         w.write(encode_frame(encode_request_v1(req)))
         await w.drain()
@@ -124,7 +124,7 @@ async def _uds_server_routes_by_model_id() -> None:
             features=[0.0] * FEATURE_LEN_V1,
             legal_mask=bytes([1] * ACTION_SPACE_A),
         )
-        from yatzy_az.infer_server.protocol_v1 import encode_frame, read_frame
+        from yatzy_az.server.protocol_v1 import encode_frame, read_frame
 
         w.write(encode_frame(encode_request_v1(req)))
         await w.drain()

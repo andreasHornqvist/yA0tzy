@@ -10,8 +10,8 @@ import argparse
 import sys
 
 from . import __version__
-from . import train as train_mod
-from .infer_server import server as infer_server
+from .server import server as infer_server
+from .trainer import train as train_mod
 
 
 def cmd_infer_server(args: argparse.Namespace) -> int:

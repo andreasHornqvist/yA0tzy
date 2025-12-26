@@ -56,7 +56,7 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 def _init_model_and_opt(*, hidden: int, blocks: int, lr: float, device):
     import torch
 
-    from .model import YatzyNet, YatzyNetConfig
+    from ..model import YatzyNet, YatzyNetConfig
 
     model = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks)).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -102,10 +102,10 @@ def run_from_args(args: argparse.Namespace) -> int:
         from torch.utils.data import DataLoader
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
-            "torch is required for `yatzy_az train` (E8S1). Install with the `train` extra."
+            "torch is required for `yatzy_az train` (E8). Install with the `train` extra."
         ) from e
 
-    from .replay_dataset import (
+    from ..replay_dataset import (
         ACTION_SPACE_A,
         FEATURE_LEN,
         FEATURE_SCHEMA_ID,
@@ -124,7 +124,7 @@ def run_from_args(args: argparse.Namespace) -> int:
         snapshot_path = (
             Path(args.snapshot) if args.snapshot is not None else run_root / "replay_snapshot.json"
         )
-        from .replay_snapshot import create_snapshot, load_snapshot, shard_filenames
+        from ..replay_snapshot import create_snapshot, load_snapshot, shard_filenames
 
         if snapshot_path.exists():
             snap = load_snapshot(snapshot_path)
@@ -135,7 +135,7 @@ def run_from_args(args: argparse.Namespace) -> int:
 
         # Best-effort: record snapshot reference in run.json if present.
         try:
-            from .run_manifest import load_manifest, save_manifest_atomic
+            from ..run_manifest import load_manifest, save_manifest_atomic
 
             m = load_manifest(run_root)
             m["replay_snapshot"] = snapshot_path.name
@@ -258,7 +258,7 @@ def run_from_args(args: argparse.Namespace) -> int:
     # E8.5.1: if this is a standard run layout (runs/<id>/models), update runs/<id>/run.json.
     run_root = out_dir.parent
     try:
-        from .run_manifest import load_manifest, save_manifest_atomic
+        from ..run_manifest import load_manifest, save_manifest_atomic
 
         m = load_manifest(run_root)
         m["train_step"] = int(step)

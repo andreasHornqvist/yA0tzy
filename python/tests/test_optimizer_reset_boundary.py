@@ -12,7 +12,7 @@ def _save_best_checkpoint(path, model, opt_state=None):
 
 def test_optimizer_state_is_reset_on_best_to_candidate_init(tmp_path):
     from yatzy_az.model import YatzyNet, YatzyNetConfig
-    from yatzy_az.train import init_from_best
+    from yatzy_az.trainer.train import init_from_best
 
     device = torch.device("cpu")
 
@@ -46,7 +46,7 @@ def test_optimizer_state_is_reset_on_best_to_candidate_init(tmp_path):
 
 def test_resume_loads_optimizer_state(tmp_path):
     from yatzy_az.model import YatzyNet, YatzyNetConfig
-    from yatzy_az.train import resume_candidate
+    from yatzy_az.trainer.train import resume_candidate
 
     device = torch.device("cpu")
 
