@@ -11,6 +11,8 @@ path = "src/lib.rs"
 yz-core = { path = "../yz-core" }
 yz-mcts = { path = "../yz-mcts" }
 yz-infer = { path = "../yz-infer" }
+yz-features = { path = "../yz-features" }
+yz-replay = { path = "../yz-replay" }
 thiserror = "1"
 
 

@@ -1,6 +1,8 @@
 use thiserror::Error;
-use yz_core::{apply_action, index_to_action, is_terminal, GameState};
+use yz_core::{apply_action, index_to_action, is_terminal, legal_action_mask, GameState};
+use yz_features::schema::F;
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchDriver};
+use yz_replay::ReplaySample;
 
 #[derive(Debug, Error)]
 pub enum GameTaskError {
@@ -19,6 +21,15 @@ pub enum StepStatus {
 pub struct StepResult {
     pub status: StepStatus,
     pub work_done: u32,
+    /// If a full episode finished this step, the collected replay samples.
+    pub completed_episode: Option<Vec<ReplaySample>>,
+}
+
+struct PendingSample {
+    features: [f32; F],
+    legal_mask: [u8; yz_core::A],
+    pi: [f32; yz_core::A],
+    pov_player: u8,
 }
 
 pub struct GameTask {
@@ -29,6 +40,7 @@ pub struct GameTask {
 
     mcts: Mcts,
     search: Option<SearchDriver>,
+    traj: Vec<PendingSample>,
 }
 
 impl GameTask {
@@ -41,6 +53,7 @@ impl GameTask {
             mode,
             mcts,
             search: None,
+            traj: Vec::new(),
         }
     }
 
@@ -61,6 +74,7 @@ impl GameTask {
             return Ok(StepResult {
                 status: StepStatus::Terminal,
                 work_done: 0,
+                completed_episode: None,
             });
         }
 
@@ -96,14 +110,55 @@ impl GameTask {
                     }
                 };
 
+                // Emit replay sample (features/legal/pi) before state transition, z assigned at terminal.
+                let feats = yz_features::encode_state_v1(&self.state);
+                let legal_b = legal_action_mask(
+                    self.state.players[self.state.player_to_move as usize].avail_mask,
+                    self.state.rerolls_left,
+                );
+                let mut legal = [0u8; yz_core::A];
+                for (i, &ok) in legal_b.iter().enumerate() {
+                    legal[i] = if ok { 1 } else { 0 };
+                }
+                self.traj.push(PendingSample {
+                    features: feats,
+                    legal_mask: legal,
+                    pi: sr.pi,
+                    pov_player: self.state.player_to_move,
+                });
+
                 let next = apply_action(self.state, action, &mut ctx)
                     .map_err(|_| GameTaskError::IllegalTransition)?;
                 self.state = next;
                 self.ply += 1;
                 self.search = None;
+                let mut out_episode = None;
+                if is_terminal(&self.state) {
+                    // Terminal z for each POV.
+                    let z0 = yz_core::terminal_z_from_pov(&self.state, 0).unwrap_or(0.0);
+                    let z1 = yz_core::terminal_z_from_pov(&self.state, 1).unwrap_or(0.0);
+                    let mut samples = Vec::with_capacity(self.traj.len());
+                    for ps in self.traj.drain(..) {
+                        let z = if ps.pov_player == 0 { z0 } else { z1 };
+                        samples.push(ReplaySample {
+                            features: ps.features,
+                            legal_mask: ps.legal_mask,
+                            pi: ps.pi,
+                            z,
+                            z_margin: None,
+                        });
+                    }
+                    out_episode = Some(samples);
+                }
+
                 return Ok(StepResult {
-                    status: StepStatus::Progress,
+                    status: if out_episode.is_some() {
+                        StepStatus::Terminal
+                    } else {
+                        StepStatus::Progress
+                    },
                     work_done,
+                    completed_episode: out_episode,
                 });
             }
         }
@@ -111,6 +166,7 @@ impl GameTask {
         Ok(StepResult {
             status: StepStatus::WouldBlock,
             work_done,
+            completed_episode: None,
         })
     }
 }

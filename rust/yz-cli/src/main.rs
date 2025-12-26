@@ -10,6 +10,7 @@
 //! - profile
 
 use std::env;
+use std::path::PathBuf;
 use std::process;
 
 /// Print the oracle's optimal expected score for a fresh game.
@@ -128,6 +129,193 @@ fn print_version() {
     println!("yz {}", env!("CARGO_PKG_VERSION"));
 }
 
+fn cmd_selfplay(args: &[String]) {
+    let mut config_path: Option<String> = None;
+    let mut infer: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut games: u32 = 10;
+    let mut max_samples_per_shard: usize = 8192;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz selfplay
+
+USAGE:
+    yz selfplay --config cfg.yaml --infer unix:///tmp/yatzy_infer.sock --out runs/<id>/ [--games N] [--max-samples-per-shard N]
+
+OPTIONS:
+    --config PATH               Path to YAML config (required)
+    --infer ENDPOINT            Inference endpoint (unix:///... or tcp://host:port) (required)
+    --out DIR                   Output directory (required)
+    --games N                   Number of games to play (default: 10)
+    --max-samples-per-shard N   Samples per replay shard (default: 8192)
+"#
+                );
+                return;
+            }
+            "--config" => {
+                config_path = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--infer" => {
+                infer = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--out" => {
+                out = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--games" => {
+                games = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --games value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--max-samples-per-shard" => {
+                max_samples_per_shard = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --max-samples-per-shard value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz selfplay`: {}", other);
+                eprintln!("Run `yz selfplay --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let config_path = config_path.unwrap_or_else(|| {
+        eprintln!("Missing --config");
+        process::exit(1);
+    });
+    let infer = infer.unwrap_or_else(|| {
+        eprintln!("Missing --infer");
+        process::exit(1);
+    });
+    let out = out.unwrap_or_else(|| {
+        eprintln!("Missing --out");
+        process::exit(1);
+    });
+
+    let cfg = yz_core::Config::load(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {e}");
+        process::exit(1);
+    });
+
+    let replay_dir = PathBuf::from(&out).join("replay");
+    let _ = yz_replay::cleanup_tmp_files(&replay_dir);
+
+    let backend = connect_infer_backend(&infer);
+    let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
+        out_dir: replay_dir,
+        max_samples_per_shard,
+        git_hash: None,
+        config_hash: None,
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to create shard writer: {e}");
+        process::exit(1);
+    });
+
+    let parallel = cfg.selfplay.threads_per_worker.max(1) as usize;
+    let mcts_cfg = yz_mcts::MctsConfig {
+        c_puct: cfg.mcts.c_puct,
+        simulations: cfg.mcts.budget_mark.max(1),
+        dirichlet_alpha: cfg.mcts.dirichlet_alpha,
+        dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
+        max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
+        virtual_loss: 1.0,
+    };
+
+    let mut tasks = Vec::new();
+    for gid in 0..parallel as u64 {
+        let mut ctx = yz_core::TurnContext::new_rng(0xC0FFEE ^ gid);
+        let s = yz_core::initial_state(&mut ctx);
+        tasks.push(yz_runtime::GameTask::new(
+            gid,
+            s,
+            yz_mcts::ChanceMode::Rng {
+                seed: 0xBADC0DE ^ gid,
+            },
+            mcts_cfg,
+        ));
+    }
+    let mut sched = yz_runtime::Scheduler::new(tasks, 64);
+
+    let mut completed_games: u32 = 0;
+    let mut next_game_id: u64 = parallel as u64;
+    while completed_games < games {
+        sched
+            .tick_and_write(&backend, &mut writer)
+            .unwrap_or_else(|e| {
+                eprintln!("Replay write error: {e}");
+                process::exit(1);
+            });
+
+        for t in sched.tasks_mut() {
+            if yz_core::is_terminal(&t.state) {
+                completed_games += 1;
+                if completed_games >= games {
+                    break;
+                }
+                // Reset task for next game.
+                let mut ctx = yz_core::TurnContext::new_rng(0xC0FFEE ^ next_game_id);
+                let s = yz_core::initial_state(&mut ctx);
+                *t = yz_runtime::GameTask::new(
+                    next_game_id,
+                    s,
+                    yz_mcts::ChanceMode::Rng {
+                        seed: 0xBADC0DE ^ next_game_id,
+                    },
+                    mcts_cfg,
+                );
+                next_game_id += 1;
+            }
+        }
+    }
+
+    writer.finish().unwrap_or_else(|e| {
+        eprintln!("Failed to flush writer: {e}");
+        process::exit(1);
+    });
+
+    println!("Self-play complete. Games={games} out={out}");
+}
+
+fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
+    let opts = yz_infer::ClientOptions {
+        max_inflight_total: 8192,
+        max_outbound_queue: 8192,
+        request_id_start: 1,
+    };
+    if let Some(rest) = endpoint.strip_prefix("unix://") {
+        #[cfg(unix)]
+        {
+            return yz_mcts::InferBackend::connect_uds(rest, 0, opts).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            panic!("unix:// endpoints are only supported on unix");
+        }
+    }
+    if let Some(rest) = endpoint.strip_prefix("tcp://") {
+        return yz_mcts::InferBackend::connect_tcp(rest, 0, opts).unwrap();
+    }
+    panic!("Unsupported infer endpoint: {endpoint}");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -162,8 +350,7 @@ fn main() {
             }
         }
         "selfplay" => {
-            println!("Self-play (not yet implemented)");
-            println!("Usage: yz selfplay --config cfg.yaml --infer unix:///... --out runs/<id>/");
+            cmd_selfplay(&args[2..]);
         }
         "gate" => {
             println!("Gating (not yet implemented)");

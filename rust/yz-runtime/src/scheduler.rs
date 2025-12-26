@@ -1,5 +1,6 @@
 use crate::game_task::{GameTask, StepStatus};
 use yz_mcts::InferBackend;
+use yz_replay::{ReplayError, ShardWriter};
 
 #[derive(Debug, Default, Clone)]
 pub struct SchedulerStats {
@@ -55,5 +56,35 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// Like `tick`, but also writes any completed episodes to the shard writer.
+    pub fn tick_and_write(
+        &mut self,
+        backend: &InferBackend,
+        writer: &mut ShardWriter,
+    ) -> Result<(), ReplayError> {
+        self.stats.ticks += 1;
+        for t in &mut self.tasks {
+            let r = t.step(backend, self.steps_per_tick);
+            match r {
+                Ok(sr) => {
+                    if let Some(ep) = sr.completed_episode {
+                        writer.extend(ep)?;
+                        self.stats.terminal += 1;
+                        continue;
+                    }
+                    match sr.status {
+                        StepStatus::Progress => self.stats.steps += 1,
+                        StepStatus::WouldBlock => self.stats.would_block += 1,
+                        StepStatus::Terminal => self.stats.terminal += 1,
+                    }
+                }
+                Err(_) => {
+                    self.stats.terminal += 1;
+                }
+            }
+        }
+        Ok(())
     }
 }
