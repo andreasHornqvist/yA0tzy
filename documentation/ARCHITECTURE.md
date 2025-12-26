@@ -142,6 +142,7 @@ See `.github/workflows/ci.yml` for details.
 | Oracle (optimal play solver) | `rust/swedish_yatzy_dp/` |
 | Oracle adapter | `rust/yz-oracle/` |
 | MCTS implementation (PUCT) | `rust/yz-mcts/` (`src/mcts.rs`) |
+| MCTS inference integration (uses `yz-infer`) | `rust/yz-mcts/` (`src/infer_client.rs`) |
 | Inference protocol (Rust↔Python) | `rust/yz-infer/` (`src/protocol.rs`, `src/codec.rs`, `src/frame.rs`) |
 | Inference client (background IO, tickets, routing) | `rust/yz-infer/` (`src/client.rs`) |
 | Neural network model | `python/yatzy_az/model/` (future) |
@@ -180,7 +181,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E5S2 complete** (`yz-infer` `InferenceClient` with background IO + routing + backpressure + latency stats)
+Current status: **E5S3 complete** (`yz-mcts` integrates `yz-infer::InferenceClient` for async leaf eval; dummy server tests)
 
 ---
 

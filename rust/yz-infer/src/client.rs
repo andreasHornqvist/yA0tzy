@@ -98,18 +98,26 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    pub fn recv(self) -> Result<InferResponseV1, ClientError> {
+    pub fn recv(&self) -> Result<InferResponseV1, ClientError> {
         match self.rx.recv() {
             Ok(r) => r,
             Err(_) => Err(ClientError::Disconnected),
         }
     }
 
-    pub fn recv_timeout(self, timeout: Duration) -> Result<InferResponseV1, ClientError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<InferResponseV1, ClientError> {
         match self.rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Disconnected),
+        }
+    }
+
+    pub fn try_recv(&self) -> Result<Option<InferResponseV1>, ClientError> {
+        match self.rx.try_recv() {
+            Ok(r) => Ok(Some(r?)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(ClientError::Disconnected),
         }
     }
 }

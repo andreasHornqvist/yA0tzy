@@ -8,11 +8,13 @@
 
 pub mod arena;
 pub mod infer;
+pub mod infer_client;
 pub mod mcts;
 pub mod node;
 pub mod state_key;
 
 pub use infer::{Inference, UniformInference};
+pub use infer_client::{InferBackend, InferBackendError};
 pub use mcts::{apply_temperature, ChanceMode, Mcts, MctsConfig, SearchResult, SearchStats};
 
 /// Crate version.

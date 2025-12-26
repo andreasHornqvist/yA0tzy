@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 yz-core = { path = "../yz-core" }
 yz-features = { path = "../yz-features" }
+yz-infer = { path = "../yz-infer" }
 thiserror = "1"
 rustc-hash = "2"
 rand = "0.8"
