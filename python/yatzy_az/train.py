@@ -32,6 +32,16 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--hidden", type=int, default=256, help="Hidden size")
     p.add_argument("--blocks", type=int, default=2, help="Number of residual blocks")
     p.add_argument("--log-every", type=int, default=25, help="Log scalars every N steps")
+    p.add_argument(
+        "--snapshot",
+        default=None,
+        help="Replay snapshot path (default: runs/<id>/replay_snapshot.json when run layout detected)",
+    )
+    p.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Disable replay snapshot semantics (ad-hoc training only)",
+    )
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
@@ -104,8 +114,38 @@ def run_from_args(args: argparse.Namespace) -> int:
         ReplayIterableDataset,
     )
 
+    replay_dir = Path(args.replay)
+
+    # E8.5.4: snapshot semantics (fixed shard list for the iteration).
+    out_dir = Path(args.out)
+    run_root = out_dir.parent
+    shard_files = None
+    if not bool(args.no_snapshot):
+        snapshot_path = (
+            Path(args.snapshot) if args.snapshot is not None else run_root / "replay_snapshot.json"
+        )
+        from .replay_snapshot import create_snapshot, load_snapshot, shard_filenames
+
+        if snapshot_path.exists():
+            snap = load_snapshot(snapshot_path)
+        else:
+            snap = create_snapshot(replay_dir=replay_dir, out_path=snapshot_path)
+
+        shard_files = shard_filenames(snap)
+
+        # Best-effort: record snapshot reference in run.json if present.
+        try:
+            from .run_manifest import load_manifest, save_manifest_atomic
+
+            m = load_manifest(run_root)
+            m["replay_snapshot"] = snapshot_path.name
+            save_manifest_atomic(run_root, m)
+        except Exception:
+            pass
+
     ds = ReplayIterableDataset(
-        Path(args.replay),
+        replay_dir,
+        shard_files=shard_files,
         shuffle_shards=bool(args.shuffle_shards),
         seed=int(args.seed),
         repeat=not bool(args.no_repeat),
@@ -137,7 +177,6 @@ def run_from_args(args: argparse.Namespace) -> int:
             device=device,
         )
 
-    out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     it = iter(dl)

@@ -217,12 +217,14 @@ class ReplayIterableDataset(_TorchIterableDataset):  # type: ignore[misc]
         self,
         replay_dir: Path,
         *,
+        shard_files: list[str] | None = None,
         shuffle_shards: bool = False,
         seed: int = 0,
         repeat: bool = True,
     ) -> None:
         _require_torch()
         self.replay_dir = Path(replay_dir)
+        self.shard_files = shard_files
         self.shuffle_shards = shuffle_shards
         self.seed = seed
         self.repeat = repeat
@@ -230,7 +232,16 @@ class ReplayIterableDataset(_TorchIterableDataset):  # type: ignore[misc]
     def __iter__(self):
         import torch
 
-        shards = discover_replay_shards(self.replay_dir)
+        if self.shard_files is None:
+            shards = discover_replay_shards(self.replay_dir)
+        else:
+            # Validate meta for only the snapshot-listed shards.
+            wanted = set(self.shard_files)
+            shards_all = discover_replay_shards(self.replay_dir)
+            shards = [s for s in shards_all if s.safetensors_path.name in wanted]
+            missing = wanted.difference({s.safetensors_path.name for s in shards})
+            if missing:
+                raise ReplayDatasetError(f"snapshot missing shards on disk: {sorted(missing)}")
         shards = _split_shards_for_worker(shards)
         it = iter_samples_numpy(
             shards,

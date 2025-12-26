@@ -148,6 +148,7 @@ See `.github/workflows/ci.yml` for details.
 | Replay shards (safetensors) | `rust/yz-replay/` (`src/writer.rs`) |
 | NDJSON run logs (iteration + sampled roots) | `rust/yz-logging/` (`src/lib.rs`), outputs to `runs/<id>/logs/` |
 | Run manifest (E8.5.x) | `runs/<id>/run.json` (written by `yz selfplay`, updated by `python -m yatzy_az train`, and finalized by `yz iter finalize`) |
+| Replay snapshot (E8.5.4) | `runs/<id>/replay_snapshot.json` (created by training; freezes shard list for resumes) |
 | Python replay dataset loader (E8S1) | `python/yatzy_az/replay_dataset.py` |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
