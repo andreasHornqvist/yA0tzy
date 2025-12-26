@@ -13,6 +13,10 @@ from typing import Any
 
 def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--replay", required=True, help="Path to replay shards directory")
+    p.add_argument(
+        "--best", default=None, help="Path to best checkpoint (required unless --resume)"
+    )
+    p.add_argument("--resume", default=None, help="Path to candidate checkpoint to resume from")
     p.add_argument("--out", required=True, help="Output directory for checkpoints")
     p.add_argument("--batch-size", type=int, default=256, help="Batch size")
     p.add_argument("--num-workers", type=int, default=0, help="Torch DataLoader workers")
@@ -30,6 +34,57 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--log-every", type=int, default=25, help="Log scalars every N steps")
 
 
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    import torch
+
+    d = torch.load(path, map_location="cpu")
+    if not isinstance(d, dict):
+        raise RuntimeError(f"invalid checkpoint (expected dict): {path}")
+    return d
+
+
+def _init_model_and_opt(*, hidden: int, blocks: int, lr: float, device):
+    import torch
+
+    from .model import YatzyNet, YatzyNetConfig
+
+    model = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks)).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    return model, opt
+
+
+def init_from_best(*, best_path: Path, hidden: int, blocks: int, lr: float, device):
+    """Initialize candidate from best weights with a fresh optimizer (no state)."""
+    d = _load_checkpoint(best_path)
+    if "model" not in d:
+        raise RuntimeError(f"best checkpoint missing 'model' key: {best_path}")
+
+    model, opt = _init_model_and_opt(hidden=hidden, blocks=blocks, lr=lr, device=device)
+    model.load_state_dict(d["model"])
+
+    # Boundary requirement: starting from best must not reuse optimizer state.
+    if len(opt.state) != 0:
+        raise RuntimeError("optimizer state is not empty after creation (expected reset)")
+
+    return model, opt, 0
+
+
+def resume_candidate(*, candidate_path: Path, hidden: int, blocks: int, lr: float, device):
+    """Resume candidate training by loading model + optimizer state."""
+    d = _load_checkpoint(candidate_path)
+    if "model" not in d:
+        raise RuntimeError(f"candidate checkpoint missing 'model' key: {candidate_path}")
+
+    model, opt = _init_model_and_opt(hidden=hidden, blocks=blocks, lr=lr, device=device)
+    model.load_state_dict(d["model"])
+    if "optimizer" in d and d["optimizer"] is not None:
+        opt.load_state_dict(d["optimizer"])
+
+    meta = d.get("meta", {})
+    train_step = int(meta.get("train_step", 0)) if isinstance(meta, dict) else 0
+    return model, opt, train_step
+
+
 def run_from_args(args: argparse.Namespace) -> int:
     try:
         import torch
@@ -40,7 +95,6 @@ def run_from_args(args: argparse.Namespace) -> int:
             "torch is required for `yatzy_az train` (E8S1). Install with the `train` extra."
         ) from e
 
-    from .model import YatzyNet, YatzyNetConfig
     from .replay_dataset import (
         ACTION_SPACE_A,
         FEATURE_LEN,
@@ -61,14 +115,33 @@ def run_from_args(args: argparse.Namespace) -> int:
     device = torch.device(str(args.device))
     torch.manual_seed(int(args.seed))
 
-    model = YatzyNet(YatzyNetConfig(hidden=int(args.hidden), blocks=int(args.blocks))).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
+    if args.resume is not None and args.best is not None:
+        raise RuntimeError("use either --resume or --best, not both")
+
+    if args.resume is not None:
+        model, opt, start_step = resume_candidate(
+            candidate_path=Path(args.resume),
+            hidden=int(args.hidden),
+            blocks=int(args.blocks),
+            lr=float(args.lr),
+            device=device,
+        )
+    else:
+        if args.best is None:
+            raise RuntimeError("--best is required when starting a new iteration (unless --resume)")
+        model, opt, start_step = init_from_best(
+            best_path=Path(args.best),
+            hidden=int(args.hidden),
+            blocks=int(args.blocks),
+            lr=float(args.lr),
+            device=device,
+        )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     it = iter(dl)
-    for step in range(1, int(args.steps) + 1):
+    for step in range(start_step + 1, start_step + int(args.steps) + 1):
         try:
             x, legal, pi, z, _z_margin = next(it)
         except StopIteration:
@@ -113,11 +186,20 @@ def run_from_args(args: argparse.Namespace) -> int:
     torch.save(
         {
             "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
             "config": {
                 "hidden": int(args.hidden),
                 "blocks": int(args.blocks),
                 "feature_len": FEATURE_LEN,
                 "action_space_a": ACTION_SPACE_A,
+            },
+            "meta": {
+                "protocol_version": PROTOCOL_VERSION,
+                "feature_schema_id": FEATURE_SCHEMA_ID,
+                "feature_len": FEATURE_LEN,
+                "ruleset_id": RULESET_ID,
+                "action_space_a": ACTION_SPACE_A,
+                "train_step": step,
             },
         },
         ckpt_path,
@@ -130,6 +212,7 @@ def run_from_args(args: argparse.Namespace) -> int:
         "ruleset_id": RULESET_ID,
         "action_space_a": ACTION_SPACE_A,
         "checkpoint": str(ckpt_path.name),
+        "train_step": step,
     }
     (out_dir / "candidate.meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
