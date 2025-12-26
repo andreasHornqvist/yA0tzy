@@ -59,6 +59,8 @@ async def _uds_server_smoke_batches() -> None:
         cand_id=1,
         best_spec="dummy",
         cand_spec="dummy",
+        metrics_bind="127.0.0.1:0",
+        metrics_disable=True,
     )
     task = asyncio.create_task(serve(cfg))
     await asyncio.sleep(0.05)
@@ -107,6 +109,8 @@ async def _uds_server_routes_by_model_id() -> None:
         cand_id=1,
         best_spec="dummy:0.1",
         cand_spec="dummy:-0.1",
+        metrics_bind="127.0.0.1:0",
+        metrics_disable=True,
     )
     task = asyncio.create_task(serve(cfg))
     await asyncio.sleep(0.05)

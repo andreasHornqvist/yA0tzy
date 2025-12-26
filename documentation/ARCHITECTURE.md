@@ -147,7 +147,7 @@ See `.github/workflows/ci.yml` for details.
 | Inference client (background IO, tickets, routing) | `rust/yz-infer/` (`src/client.rs`) |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
-| Python inference server (asyncio + batching) | `python/yatzy_az/infer_server/` |
+| Python inference server (asyncio + batching + metrics) | `python/yatzy_az/infer_server/` |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
 | CLI commands (Python) | `python/yatzy_az/__main__.py` |
 | Config examples | `configs/` |
@@ -182,7 +182,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E6S2 complete** (Python infer-server supports multi-model routing via `model_id` + per-model stats)
+Current status: **E6S3 complete** (Python infer-server exposes Prometheus `/metrics` endpoint)
 
 ---
 

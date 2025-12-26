@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass
 
 from .batcher import Batcher
+from .metrics import MetricsSnapshot, now_s
+from .metrics_server import start_metrics_server
 from .model import build_model
 from .protocol_v1 import (
     DecodeError,
@@ -41,6 +43,8 @@ class ServerConfig:
     cand_id: int
     best_spec: str
     cand_spec: str
+    metrics_bind: str
+    metrics_disable: bool
 
 
 async def _handle_conn(
@@ -72,12 +76,21 @@ async def _handle_conn(
 async def serve(config: ServerConfig) -> None:
     scheme, addr = _parse_bind(config.bind)
 
+    start_s = now_s()
     model_by_id = {
         int(config.best_id): build_model(config.best_spec),
         int(config.cand_id): build_model(config.cand_spec),
     }
     batcher = Batcher(model_by_id, max_batch=config.max_batch, max_wait_us=config.max_wait_us)
     batcher_task = asyncio.create_task(batcher.run())
+
+    def snapshot() -> MetricsSnapshot:
+        return MetricsSnapshot(
+            now_s=now_s(),
+            start_s=start_s,
+            queue_depth=batcher.queue_depth,
+            batcher=batcher.stats,
+        )
 
     stop_ev = asyncio.Event()
 
@@ -109,6 +122,9 @@ async def serve(config: ServerConfig) -> None:
 
     try:
         async with server:
+            metrics_srv = None
+            if not config.metrics_disable:
+                metrics_srv = await start_metrics_server(config.metrics_bind, snapshot)
             stats_task = asyncio.create_task(_print_stats_loop(batcher, config.print_stats_every_s))
             try:
                 await stop_ev.wait()
@@ -116,6 +132,10 @@ async def serve(config: ServerConfig) -> None:
                 stats_task.cancel()
                 with contextlib.suppress(Exception):
                     await stats_task
+                if metrics_srv is not None:
+                    metrics_srv.close()
+                    with contextlib.suppress(Exception):
+                        await metrics_srv.wait_closed()
     finally:
         if sock_path is not None:
             with contextlib.suppress(FileNotFoundError):
@@ -162,6 +182,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--best-id", type=int, default=0, help="model_id for best")
     p.add_argument("--cand-id", type=int, default=1, help="model_id for candidate")
+    p.add_argument("--metrics-bind", default="127.0.0.1:8000", help="Metrics HTTP bind host:port")
+    p.add_argument("--metrics-disable", action="store_true", help="Disable metrics endpoint")
     p.add_argument(
         "--print-stats-every-s",
         type=float,
@@ -180,6 +202,8 @@ def run_from_args(args: argparse.Namespace) -> int:
         cand_id=args.cand_id,
         best_spec=args.best,
         cand_spec=args.cand,
+        metrics_bind=args.metrics_bind,
+        metrics_disable=args.metrics_disable,
     )
     asyncio.run(serve(cfg))
     return 0

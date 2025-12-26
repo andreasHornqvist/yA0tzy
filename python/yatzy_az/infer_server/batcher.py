@@ -62,6 +62,10 @@ class Batcher:
     def stats(self) -> BatcherStats:
         return self._stats
 
+    @property
+    def queue_depth(self) -> int:
+        return self._q.qsize()
+
     async def enqueue(self, req: InferRequestV1) -> InferResponseV1:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[InferResponseV1] = loop.create_future()
