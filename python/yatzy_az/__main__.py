@@ -10,6 +10,7 @@ import argparse
 import sys
 
 from . import __version__
+from . import train as train_mod
 from .infer_server import server as infer_server
 
 
@@ -21,11 +22,7 @@ def cmd_infer_server(args: argparse.Namespace) -> int:
 
 def cmd_train(args: argparse.Namespace) -> int:
     """Run training from replay shards."""
-    print("Training (not yet implemented)")
-    print(f"  --replay {args.replay}")
-    print(f"  --best {args.best}")
-    print(f"  --out {args.out}")
-    return 0
+    return train_mod.run_from_args(args)
 
 
 def cmd_controller(args: argparse.Namespace) -> int:
@@ -65,8 +62,8 @@ def main() -> int:
         help="Train candidate model from replay shards",
     )
     p_train.add_argument("--replay", required=True, help="Path to replay shards directory")
-    p_train.add_argument("--best", required=True, help="Path to best model checkpoint")
-    p_train.add_argument("--out", required=True, help="Output directory for candidate model")
+    # E8S1 scope: dataset loader + batch iteration only. Best/out used in later stories.
+    train_mod.add_args(p_train)
     p_train.set_defaults(func=cmd_train)
 
     # controller (optional)

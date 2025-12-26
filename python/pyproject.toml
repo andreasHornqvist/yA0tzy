@@ -11,12 +11,19 @@ authors = [
 dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
+    "numpy>=1.26",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.8.0",
     "pytest>=8.0",
+]
+
+# Training stack (E8+). Kept optional to avoid heavyweight installs for inference-only users.
+train = [
+    "torch>=2.2",
 ]
 
 [project.scripts]

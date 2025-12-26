@@ -21,8 +21,32 @@ pub enum StepStatus {
 pub struct StepResult {
     pub status: StepStatus,
     pub work_done: u32,
+    /// Present only when a move was executed (i.e. a search finished and we applied one action).
+    pub executed: Option<ExecutedMove>,
     /// If a full episode finished this step, the collected replay samples.
     pub completed_episode: Option<Vec<ReplaySample>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchSummary {
+    pub pi: [f32; yz_core::A],
+    pub root_value: f32,
+    pub root_priors_raw: Option<[f32; yz_core::A]>,
+    pub root_priors_noisy: Option<[f32; yz_core::A]>,
+    pub fallbacks: u32,
+    pub pending_count_max: usize,
+    pub pending_collisions: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutedMove {
+    pub game_id: u64,
+    pub game_ply: u32,
+    pub chosen_action: u8,
+    pub player_to_move: u8,
+    pub rerolls_left: u8,
+    pub dice: [u8; 5],
+    pub search: SearchSummary,
 }
 
 struct PendingSample {
@@ -74,6 +98,7 @@ impl GameTask {
             return Ok(StepResult {
                 status: StepStatus::Terminal,
                 work_done: 0,
+                executed: None,
                 completed_episode: None,
             });
         }
@@ -97,7 +122,18 @@ impl GameTask {
                     .enumerate()
                     .max_by(|a, b| a.1.total_cmp(b.1))
                     .unwrap();
-                let action = index_to_action(best_a as u8);
+                let chosen_action = best_a as u8;
+                let action = index_to_action(chosen_action);
+                let pi = sr.pi;
+                let search = SearchSummary {
+                    pi,
+                    root_value: sr.root_value,
+                    root_priors_raw: sr.root_priors_raw,
+                    root_priors_noisy: sr.root_priors_noisy,
+                    fallbacks: sr.fallbacks,
+                    pending_count_max: sr.stats.pending_count_max,
+                    pending_collisions: sr.stats.pending_collisions,
+                };
 
                 let mut ctx = match self.mode {
                     ChanceMode::Deterministic { episode_seed } => {
@@ -123,9 +159,19 @@ impl GameTask {
                 self.traj.push(PendingSample {
                     features: feats,
                     legal_mask: legal,
-                    pi: sr.pi,
+                    pi,
                     pov_player: self.state.player_to_move,
                 });
+
+                let executed = ExecutedMove {
+                    game_id: self.game_id,
+                    game_ply: self.ply,
+                    chosen_action,
+                    player_to_move: self.state.player_to_move,
+                    rerolls_left: self.state.rerolls_left,
+                    dice: self.state.dice_sorted,
+                    search,
+                };
 
                 let next = apply_action(self.state, action, &mut ctx)
                     .map_err(|_| GameTaskError::IllegalTransition)?;
@@ -158,6 +204,7 @@ impl GameTask {
                         StepStatus::Progress
                     },
                     work_done,
+                    executed: Some(executed),
                     completed_episode: out_episode,
                 });
             }
@@ -166,6 +213,7 @@ impl GameTask {
         Ok(StepResult {
             status: StepStatus::WouldBlock,
             work_done,
+            executed: None,
             completed_episode: None,
         })
     }

@@ -4,7 +4,7 @@ pub mod game_task;
 pub mod scheduler;
 
 pub use game_task::{GameTask, GameTaskError, StepResult, StepStatus};
-pub use scheduler::{Scheduler, SchedulerStats};
+pub use scheduler::{RunLoggers, Scheduler, SchedulerStats};
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

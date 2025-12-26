@@ -135,6 +135,8 @@ fn cmd_selfplay(args: &[String]) {
     let mut out: Option<String> = None;
     let mut games: u32 = 10;
     let mut max_samples_per_shard: usize = 8192;
+    let mut root_log_every: u64 = 50;
+    let mut log_flush_every: u64 = 100;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -152,6 +154,8 @@ OPTIONS:
     --out DIR                   Output directory (required)
     --games N                   Number of games to play (default: 10)
     --max-samples-per-shard N   Samples per replay shard (default: 8192)
+    --root-log-every N          Log one MCTS root every N executed moves (default: 50)
+    --log-flush-every N         Flush NDJSON logs every N lines (0 disables) (default: 100)
 "#
                 );
                 return;
@@ -188,6 +192,26 @@ OPTIONS:
                     });
                 i += 2;
             }
+            "--root-log-every" => {
+                root_log_every = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --root-log-every value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--log-flush-every" => {
+                log_flush_every = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --log-flush-every value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
             other => {
                 eprintln!("Unknown option for `yz selfplay`: {}", other);
                 eprintln!("Run `yz selfplay --help` for usage.");
@@ -216,6 +240,12 @@ OPTIONS:
 
     let replay_dir = PathBuf::from(&out).join("replay");
     let _ = yz_replay::cleanup_tmp_files(&replay_dir);
+
+    let logs_dir = PathBuf::from(&out).join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create logs dir: {e}");
+        process::exit(1);
+    });
 
     let backend = connect_infer_backend(&infer);
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
@@ -254,11 +284,36 @@ OPTIONS:
     }
     let mut sched = yz_runtime::Scheduler::new(tasks, 64);
 
+    let run_id = out.clone();
+    let v = yz_logging::VersionInfoV1 {
+        protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+        feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+        action_space_id: "oracle_keepmask_v1",
+        ruleset_id: "swedish_scandinavian_v1",
+    };
+    let iter_log_path = logs_dir.join("iteration_stats.ndjson");
+    let roots_log_path = logs_dir.join("mcts_roots.ndjson");
+    let mut loggers = yz_runtime::RunLoggers {
+        run_id,
+        v,
+        root_log_every_n: root_log_every,
+        iter: yz_logging::NdjsonWriter::open_append_with_flush(iter_log_path, log_flush_every)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to create iteration log: {e:?}");
+                process::exit(1);
+            }),
+        roots: yz_logging::NdjsonWriter::open_append_with_flush(roots_log_path, log_flush_every)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to create root log: {e:?}");
+                process::exit(1);
+            }),
+    };
+
     let mut completed_games: u32 = 0;
     let mut next_game_id: u64 = parallel as u64;
     while completed_games < games {
         sched
-            .tick_and_write(&backend, &mut writer)
+            .tick_and_write(&backend, &mut writer, Some(&mut loggers))
             .unwrap_or_else(|e| {
                 eprintln!("Replay write error: {e}");
                 process::exit(1);
@@ -290,6 +345,8 @@ OPTIONS:
         eprintln!("Failed to flush writer: {e}");
         process::exit(1);
     });
+    let _ = loggers.iter.flush();
+    let _ = loggers.roots.flush();
 
     println!("Self-play complete. Games={games} out={out}");
 }

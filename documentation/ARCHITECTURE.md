@@ -146,6 +146,8 @@ See `.github/workflows/ci.yml` for details.
 | Inference protocol (Rust↔Python) | `rust/yz-infer/` (`src/protocol.rs`, `src/codec.rs`, `src/frame.rs`) |
 | Inference client (background IO, tickets, routing) | `rust/yz-infer/` (`src/client.rs`) |
 | Replay shards (safetensors) | `rust/yz-replay/` (`src/writer.rs`) |
+| NDJSON run logs (iteration + sampled roots) | `rust/yz-logging/` (`src/lib.rs`), outputs to `runs/<id>/logs/` |
+| Python replay dataset loader (E8S1) | `python/yatzy_az/replay_dataset.py` |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
 | Python inference server (asyncio + batching + metrics) | `python/yatzy_az/infer_server/` |
@@ -184,7 +186,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E7S2 complete** (`yz-replay` shard writer + runtime sample emission; `yz selfplay` writes replay shards incrementally)
+Current status: **E7S3 complete** (`yz-logging` NDJSON logs + `yz selfplay` writes `runs/<id>/logs/{iteration_stats.ndjson,mcts_roots.ndjson}`; replay shards still written incrementally)
 
 ---
 

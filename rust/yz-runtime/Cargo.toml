@@ -13,6 +13,10 @@ yz-mcts = { path = "../yz-mcts" }
 yz-infer = { path = "../yz-infer" }
 yz-features = { path = "../yz-features" }
 yz-replay = { path = "../yz-replay" }
+yz-logging = { path = "../yz-logging" }
 thiserror = "1"
 
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
 
