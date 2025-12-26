@@ -141,7 +141,7 @@ See `.github/workflows/ci.yml` for details.
 | Feature schema + encoder | `rust/yz-features/` |
 | Oracle (optimal play solver) | `rust/swedish_yatzy_dp/` |
 | Oracle adapter | `rust/yz-oracle/` |
-| MCTS implementation | `rust/yz-mcts/` |
+| MCTS implementation (PUCT) | `rust/yz-mcts/` (`src/mcts.rs`) |
 | Neural network model | `python/yatzy_az/model/` (future) |
 | Training loop | `python/yatzy_az/trainer/` (future) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
@@ -178,7 +178,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E3.5.3 complete** (golden transition tests for engine semantics)
+Current status: **E4S1 complete** (yz-mcts arena + PUCT core with stochastic transitions)
 
 ---
 

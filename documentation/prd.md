@@ -263,6 +263,20 @@ Per-game tree:
 * no heap allocations in select/backup loops
 * store NodeId indices, not references
 
+### 7.7 Stochastic dice transitions inside MCTS (no explicit chance nodes)
+
+Yatzy transitions are stochastic because dice outcomes are part of state.
+In v1, we keep the **fixed action space `A=47`** and do **not** introduce explicit chance nodes in the tree.
+
+Instead:
+
+* MCTS stores **decision nodes only** (states with `player_to_move`, `dice`, `rerolls_left`, per-player boards/totals).
+* When traversing an edge for action `a`, the environment performs a stochastic transition:
+  * self-play: sample dice outcomes using RNG
+  * eval/gating (option): use the event-keyed deterministic chance stream
+* The realized next state `s'` (including the new dice) is the child. Over many simulations, a single action edge may lead to **multiple distinct realized children**.
+* PUCT selection is still performed over actions `a ∈ {0..A-1}`; stochasticity is in `step(s, a) -> s'`.
+
 ---
 
 ## 8) Parallelism and throughput strategy (explicit optimization points)

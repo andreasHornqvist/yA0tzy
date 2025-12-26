@@ -1,6 +1,22 @@
-//! MCTS implementation lives here (placeholder for E0S1).
+//! MCTS implementation (PUCT) for AlphaZero-style search.
+//!
+//! Epic E4 starts here. The design uses:
+//! - Fixed action space `A=47` (yz-core)
+//! - Stochastic transitions via `yz_core::apply_action` (dice sampled in self-play RNG mode;
+//!   deterministic event-keyed chance in eval mode as configured)
+//! - Arena-backed node storage
 
-pub const VERSION: &str = "0.1.0";
+pub mod arena;
+pub mod infer;
+pub mod mcts;
+pub mod node;
+pub mod state_key;
+
+pub use infer::{Inference, UniformInference};
+pub use mcts::{ChanceMode, Mcts, MctsConfig, SearchResult, SearchStats};
+
+/// Crate version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
@@ -11,3 +27,6 @@ mod tests {
         assert!(!VERSION.is_empty());
     }
 }
+
+#[cfg(test)]
+mod mcts_tests;
