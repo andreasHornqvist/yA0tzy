@@ -287,6 +287,10 @@ OPTIONS:
         gate_games: None,
         gate_win_rate: None,
         gate_seeds_hash: None,
+        gate_oracle_match_rate_overall: None,
+        gate_oracle_match_rate_mark: None,
+        gate_oracle_match_rate_reroll: None,
+        gate_oracle_keepall_ignored: None,
     };
     // If a manifest already exists (resume), keep its created_ts_ms/run_id.
     if let Ok(existing) = yz_logging::read_manifest(&run_json) {
@@ -300,6 +304,10 @@ OPTIONS:
         manifest.gate_games = existing.gate_games;
         manifest.gate_win_rate = existing.gate_win_rate;
         manifest.gate_seeds_hash = existing.gate_seeds_hash;
+        manifest.gate_oracle_match_rate_overall = existing.gate_oracle_match_rate_overall;
+        manifest.gate_oracle_match_rate_mark = existing.gate_oracle_match_rate_mark;
+        manifest.gate_oracle_match_rate_reroll = existing.gate_oracle_match_rate_reroll;
+        manifest.gate_oracle_keepall_ignored = existing.gate_oracle_keepall_ignored;
     }
     yz_logging::write_manifest_atomic(&run_json, &manifest).unwrap_or_else(|e| {
         eprintln!("Failed to write run manifest: {e:?}");
@@ -567,6 +575,10 @@ OPTIONS:
                 m.gate_games = Some(report.games as u64);
                 m.gate_win_rate = Some(wr);
                 m.gate_seeds_hash = Some(report.seeds_hash.clone());
+                m.gate_oracle_match_rate_overall = Some(report.oracle_match_rate_overall);
+                m.gate_oracle_match_rate_mark = Some(report.oracle_match_rate_mark);
+                m.gate_oracle_match_rate_reroll = Some(report.oracle_match_rate_reroll);
+                m.gate_oracle_keepall_ignored = Some(report.oracle_keepall_ignored);
                 let _ = yz_logging::write_manifest_atomic(&run_json, &m);
             }
             Err(e) => {
@@ -597,6 +609,10 @@ OPTIONS:
                 seed: cfg.gating.seed,
                 seed_set_id: cfg.gating.seed_set_id.clone(),
                 warnings: report.warnings.clone(),
+                oracle_match_rate_overall: report.oracle_match_rate_overall,
+                oracle_match_rate_mark: report.oracle_match_rate_mark,
+                oracle_match_rate_reroll: report.oracle_match_rate_reroll,
+                oracle_keepall_ignored: report.oracle_keepall_ignored,
             },
         );
     }
@@ -627,6 +643,10 @@ struct GateReportJson {
     seed: u64,
     seed_set_id: Option<String>,
     warnings: Vec<String>,
+    oracle_match_rate_overall: f64,
+    oracle_match_rate_mark: f64,
+    oracle_match_rate_reroll: f64,
+    oracle_keepall_ignored: u64,
 }
 
 fn write_gate_report_atomic(path: &PathBuf, report: &GateReportJson) -> std::io::Result<()> {

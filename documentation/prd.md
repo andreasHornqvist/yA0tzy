@@ -913,7 +913,7 @@ This epic exists because a “resumable trainer” requires more than just model
 
 2. **Oracle diagnostics in gating**
 
-   * sample roots and compare agent action vs oracle best action
+   * Compare agent action vs oracle best action
    * **AC:** logs include “oracle_match_rate” (and later regret).
 
 3. **(Optional) Regret API**

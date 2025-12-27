@@ -51,6 +51,10 @@ pub struct RunManifestV1 {
     pub gate_games: Option<u64>,
     pub gate_win_rate: Option<f64>,
     pub gate_seeds_hash: Option<String>,
+    pub gate_oracle_match_rate_overall: Option<f64>,
+    pub gate_oracle_match_rate_mark: Option<f64>,
+    pub gate_oracle_match_rate_reroll: Option<f64>,
+    pub gate_oracle_keepall_ignored: Option<u64>,
 }
 
 pub fn now_ms() -> u64 {
@@ -334,6 +338,10 @@ mod tests {
             gate_games: None,
             gate_win_rate: None,
             gate_seeds_hash: None,
+            gate_oracle_match_rate_overall: None,
+            gate_oracle_match_rate_mark: None,
+            gate_oracle_match_rate_reroll: None,
+            gate_oracle_keepall_ignored: None,
         };
         write_manifest_atomic(&run_json, &m).unwrap();
 

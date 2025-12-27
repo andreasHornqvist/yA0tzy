@@ -39,6 +39,10 @@ fn iter_finalize_promote_creates_best_and_updates_manifest() {
         gate_games: None,
         gate_win_rate: None,
         gate_seeds_hash: None,
+        gate_oracle_match_rate_overall: None,
+        gate_oracle_match_rate_mark: None,
+        gate_oracle_match_rate_reroll: None,
+        gate_oracle_keepall_ignored: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 
@@ -104,6 +108,10 @@ fn iter_finalize_reject_does_not_create_best_but_updates_manifest() {
         gate_games: None,
         gate_win_rate: None,
         gate_seeds_hash: None,
+        gate_oracle_match_rate_overall: None,
+        gate_oracle_match_rate_mark: None,
+        gate_oracle_match_rate_reroll: None,
+        gate_oracle_keepall_ignored: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 

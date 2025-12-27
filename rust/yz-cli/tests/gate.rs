@@ -1,6 +1,8 @@
 use std::fs;
 use std::process::Command;
 
+use serde_json::Value;
+
 fn yz_bin() -> String {
     env!("CARGO_BIN_EXE_yz").to_string()
 }
@@ -83,6 +85,10 @@ fn gate_runs_and_updates_manifest() {
         gate_games: None,
         gate_win_rate: None,
         gate_seeds_hash: None,
+        gate_oracle_match_rate_overall: None,
+        gate_oracle_match_rate_mark: None,
+        gate_oracle_match_rate_reroll: None,
+        gate_oracle_keepall_ignored: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 
@@ -148,9 +154,20 @@ gating:
     assert_eq!(got.gate_games, Some(2));
     assert!((got.gate_win_rate.unwrap_or(0.0) - 0.5).abs() < 1e-9);
     assert!(got.gate_seeds_hash.as_deref().unwrap_or("").len() >= 32);
+    assert!(
+        (0.0..=1.0).contains(&got.gate_oracle_match_rate_overall.unwrap_or(0.0)),
+        "gate_oracle_match_rate_overall missing or out of range"
+    );
 
     let gate_report = run_dir.join("gate_report.json");
     assert!(gate_report.exists());
+
+    let bytes = fs::read(&gate_report).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v.get("oracle_match_rate_overall").is_some());
+    assert!(v.get("oracle_match_rate_mark").is_some());
+    assert!(v.get("oracle_match_rate_reroll").is_some());
+    assert!(v.get("oracle_keepall_ignored").is_some());
 }
 
 

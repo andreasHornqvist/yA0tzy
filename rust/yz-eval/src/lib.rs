@@ -10,6 +10,98 @@ use thiserror::Error;
 use yz_core::{apply_action, initial_state, is_terminal, terminal_winner, TurnContext};
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchResult};
 use yz_infer::ClientOptions;
+use yz_oracle as oracle_mod;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OracleDiagStep {
+    // Oracle-slice state for the current player (solitaire view).
+    avail_mask: u16,
+    upper_total_cap: u8,
+    dice_sorted: [u8; 5],
+    rerolls_left: u8,
+    chosen_action: yz_core::Action,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OracleDiagReport {
+    match_rate_overall: f64,
+    match_rate_mark: f64,
+    match_rate_reroll: f64,
+    oracle_keepall_ignored: u64,
+}
+
+fn should_ignore_oracle_action(a: oracle_mod::Action, rerolls_left: u8) -> bool {
+    match a {
+        oracle_mod::Action::KeepMask { mask } => mask == 31 && rerolls_left > 0,
+        oracle_mod::Action::Mark { .. } => false,
+    }
+}
+
+fn compute_oracle_diag(steps: &[OracleDiagStep]) -> OracleDiagReport {
+    // Hot loop avoidance: do one pass after all games complete.
+    let oracle = oracle_mod::oracle();
+
+    let mut total: u64 = 0;
+    let mut matched: u64 = 0;
+
+    let mut total_mark: u64 = 0;
+    let mut matched_mark: u64 = 0;
+
+    let mut total_reroll: u64 = 0;
+    let mut matched_reroll: u64 = 0;
+
+    let mut keepall_ignored: u64 = 0;
+
+    for s in steps {
+        let (oa, _ev) = oracle.best_action(s.avail_mask, s.upper_total_cap, s.dice_sorted, s.rerolls_left);
+        if should_ignore_oracle_action(oa, s.rerolls_left) {
+            keepall_ignored += 1;
+            continue;
+        }
+
+        let expected: yz_core::Action = match oa {
+            oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
+            oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
+        };
+
+        let is_match = expected == s.chosen_action;
+
+        total += 1;
+        if is_match {
+            matched += 1;
+        }
+
+        match s.chosen_action {
+            yz_core::Action::Mark(_) => {
+                total_mark += 1;
+                if is_match {
+                    matched_mark += 1;
+                }
+            }
+            yz_core::Action::KeepMask(_) => {
+                total_reroll += 1;
+                if is_match {
+                    matched_reroll += 1;
+                }
+            }
+        }
+    }
+
+    OracleDiagReport {
+        match_rate_overall: if total == 0 { 0.0 } else { matched as f64 / total as f64 },
+        match_rate_mark: if total_mark == 0 {
+            0.0
+        } else {
+            matched_mark as f64 / total_mark as f64
+        },
+        match_rate_reroll: if total_reroll == 0 {
+            0.0
+        } else {
+            matched_reroll as f64 / total_reroll as f64
+        },
+        oracle_keepall_ignored: keepall_ignored,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum GateError {
@@ -203,6 +295,10 @@ pub struct GateReport {
     pub score_diff_ci95_high: f64,
     pub draw_rate: f64,
     pub warnings: Vec<String>,
+    pub oracle_match_rate_overall: f64,
+    pub oracle_match_rate_mark: f64,
+    pub oracle_match_rate_reroll: f64,
+    pub oracle_keepall_ignored: u64,
 }
 
 impl GateReport {
@@ -257,8 +353,10 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
     let mut mcts = Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
 
     let mut diffs: Vec<i32> = Vec::with_capacity(schedule.len());
+    let mut oracle_steps: Vec<OracleDiagStep> = Vec::new();
     for gs in schedule {
-        let (cand_score, best_score, cand_outcome) = run_one_game(cfg, &mut mcts, &best_backend, &cand_backend, gs)?;
+        let (cand_score, best_score, cand_outcome) =
+            run_one_game(cfg, &mut mcts, &best_backend, &cand_backend, gs, &mut oracle_steps)?;
         match cand_outcome {
             Outcome::Win => report.cand_wins += 1,
             Outcome::Loss => report.cand_losses += 1,
@@ -270,6 +368,11 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
     }
 
     compute_score_diff_stats(&diffs, &mut report);
+    let od = compute_oracle_diag(&oracle_steps);
+    report.oracle_match_rate_overall = od.match_rate_overall;
+    report.oracle_match_rate_mark = od.match_rate_mark;
+    report.oracle_match_rate_reroll = od.match_rate_reroll;
+    report.oracle_keepall_ignored = od.oracle_keepall_ignored;
     Ok(report)
 }
 
@@ -369,6 +472,7 @@ fn run_one_game(
     best_backend: &InferBackend,
     cand_backend: &InferBackend,
     gs: GameSpec,
+    oracle_steps_out: &mut Vec<OracleDiagStep>,
 ) -> Result<(i32, i32, Outcome), GateError> {
     // Initialize state using the same chance mode policy as the game loop.
     let mut ctx = if cfg.gating.deterministic_chance {
@@ -388,18 +492,34 @@ fn run_one_game(
         }
     };
 
+    let cand_seat = if gs.swap { 1u8 } else { 0u8 };
+
     // Deterministic executed-move rule for gating: greedy argmax(pi) with lowest-index tie-break.
     while !is_terminal(&state) {
+        // Oracle diagnostics: record only candidate moves (agent under test).
+        let is_cand_turn = state.player_to_move == cand_seat;
+
         let backend = select_backend(best_backend, cand_backend, state.player_to_move, gs.swap);
         let sr: SearchResult = mcts.run_search_with_backend(state.clone(), chance_mode, backend);
         let a = argmax_tie_lowest(&sr.pi);
         let action = yz_core::index_to_action(a);
+
+        if is_cand_turn {
+            let ps = &state.players[state.player_to_move as usize];
+            oracle_steps_out.push(OracleDiagStep {
+                avail_mask: ps.avail_mask,
+                upper_total_cap: ps.upper_total_cap,
+                dice_sorted: state.dice_sorted,
+                rerolls_left: state.rerolls_left,
+                chosen_action: action,
+            });
+        }
+
         let next = apply_action(state, action, &mut ctx).map_err(|_| GateError::IllegalTransition)?;
         state = next;
     }
 
     let winner = terminal_winner(&state).map_err(|_| GateError::IllegalTransition)?;
-    let cand_seat = if gs.swap { 1u8 } else { 0u8 };
     let best_seat = 1u8 ^ cand_seat;
     let cand_score = state.players[cand_seat as usize].total_score as i32;
     let best_score = state.players[best_seat as usize].total_score as i32;
@@ -652,5 +772,35 @@ gating:
         assert_eq!(report.games, 2);
         assert_eq!(report.cand_score_diff_sum, 0);
         assert!((report.win_rate() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn oracle_ignore_rule_keepall_is_enabled_only_when_rerolls_left_is_positive() {
+        assert!(should_ignore_oracle_action(
+            oracle_mod::Action::KeepMask { mask: 31 },
+            2
+        ));
+        assert!(!should_ignore_oracle_action(
+            oracle_mod::Action::KeepMask { mask: 31 },
+            0
+        ));
+    }
+
+    #[test]
+    fn oracle_diag_is_deterministic_for_identical_steps() {
+        // This builds the oracle DP table once; acceptable for a unit test.
+        let steps = vec![OracleDiagStep {
+            avail_mask: oracle_mod::FULL_MASK,
+            upper_total_cap: 0,
+            dice_sorted: [1, 2, 3, 4, 5],
+            rerolls_left: 2,
+            chosen_action: yz_core::Action::KeepMask(0),
+        }];
+        let a = compute_oracle_diag(&steps);
+        let b = compute_oracle_diag(&steps);
+        assert_eq!(a.oracle_keepall_ignored, b.oracle_keepall_ignored);
+        assert!((a.match_rate_overall - b.match_rate_overall).abs() < 1e-12);
+        assert!((a.match_rate_mark - b.match_rate_mark).abs() < 1e-12);
+        assert!((a.match_rate_reroll - b.match_rate_reroll).abs() < 1e-12);
     }
 }
