@@ -927,21 +927,57 @@ This epic exists because a “resumable trainer” requires more than just model
 
 **Goal:** make learning progress **understandable**, **comparable**, and **reproducible** across runs by emitting a W&B-friendly event stream and storing the exact config used for a run.
 
-**Motivation:** We already emit NDJSON + a run manifest, but without a standardized “metrics stream” and a full config snapshot it’s too easy to:\n+- lose the context of *which knobs produced which curves*\n+- compare apples-to-oranges across runs (different seed sets, budgets, temperature schedules)\n+- miss regressions (policy collapse, illegal action mass, throughput drops)\n+
+**Motivation:** We already emit NDJSON + a run manifest, but without a standardized “metrics stream” and a full config snapshot it’s too easy to:
+
+* lose the context of *which knobs produced which curves*
+* compare apples-to-oranges across runs (different seed sets, budgets, temperature schedules)
+* miss regressions (policy collapse, illegal action mass, throughput drops)
 **Stories**
 
 1. **Full training config snapshot (run-local, crash-safe)**
 
-   * On `yz selfplay` start, write `runs/<id>/config.yaml` as an exact copy of the YAML config used.\n+     - write via temp + atomic rename\n+   * Include a reference in `runs/<id>/run.json` (e.g. `config_snapshot: "config.yaml"`).\n+   * **AC:** given only `runs/<id>/`, you can recover the exact config bytes that produced the run.\n+
+   * On `yz selfplay` start, write `runs/<id>/config.yaml` as an exact copy of the YAML config used.
+     * write via temp + atomic rename
+   * Include a reference in `runs/<id>/run.json` (e.g. `config_snapshot: "config.yaml"`).
+   * **AC:** given only `runs/<id>/`, you can recover the exact config bytes that produced the run.
 2. **Standardized metrics stream (NDJSON → W&B)**
 
-   * Define a stable NDJSON “metrics event” schema for:\n+     - self-play iteration stats\n+     - sampled MCTS root stats\n+     - training step stats\n+     - gating/eval summaries\n+   * Provide a small Python utility `yatzy_az wandb-sync --run runs/<id>/` that:\n+     - tails NDJSON + run.json\n+     - emits W&B scalars/histograms consistently (or prints JSON for other tools)\n+   * **AC:** you can point W&B at a run directory and see live-updating curves.\n+
+   * Define a stable NDJSON “metrics event” schema for:
+     * self-play iteration stats
+     * sampled MCTS root stats
+     * training step stats
+     * gating/eval summaries
+     * oracle suite metrics (solitaire baseline + best/candidate vs oracle)
+     * oracle diagnostics metrics (e.g. gating `oracle_match_rate_*`)
+   * Provide a small Python utility `yatzy_az wandb-sync --run runs/<id>/` that:
+     * tails NDJSON + run.json
+     * emits W&B scalars/histograms consistently (or prints JSON for other tools)
+   * **AC:** you can point W&B at a run directory and see live-updating curves.
+
+   * **Schema guidance (v1, minimal but sufficient):** every metrics event includes:
+     * `event`: string (e.g. `selfplay_iter`, `train_step`, `gate_summary`, `oracle_eval`)
+     * `ts_ms`: u64
+     * `run_id`: string
+     * `v`: `{protocol_version, feature_schema_id, action_space_id, ruleset_id}`
+     * `git_hash` (optional) and `config_hash` or `config_snapshot` reference
+     * `step`: monotonic counter per stream (e.g. `train_step`, `global_ply`, `gate_game_idx`, `oracle_eval_idx`)
+
+   * **Schema guidance (oracle fields):**
+     * For oracle solitaire evaluation: `mean`, `std`, `median`, `min`, `max`, `bonus_rate`, `games`, `policy_id` in `{oracle,best,candidate}`
+     * For oracle diagnostics in gating: `oracle_match_rate_overall`, `oracle_match_rate_mark`, `oracle_match_rate_reroll`, `oracle_keepall_ignored`
 3. **Gating reproducibility fields**
 
-   * Record `gating.seeds_hash` (hash of the exact ordered seed list used for gating; derived schedule or seed_set contents).\n+   * Persist a compact gating report JSON in the run dir:\n+     - wins/losses/draws\n+     - mean score diff\n+     - per-seed results (optional)\n+   * **AC:** gating results are comparable across runs and auditable from artifacts.\n+
+   * Record `gating.seeds_hash` (hash of the exact ordered seed list used for gating; derived schedule or seed_set contents).
+   * Persist a compact gating report JSON in the run dir:
+     * wins/losses/draws
+     * mean score diff
+     * oracle diagnostics summary (oracle_match_rate + ignored-count)
+     * per-seed results (optional)
+   * **AC:** gating results are comparable across runs and auditable from artifacts.
 4. **Training stats: minimal but sufficient**
 
-   * Log (at least): `loss_total`, `loss_policy`, `loss_value`, `entropy`, `lr`, `throughput_steps_s`.\n+   * **AC:** training can be diagnosed from logs alone (no console scraping).\n+
+   * Log (at least): `loss_total`, `loss_policy`, `loss_value`, `entropy`, `lr`, `throughput_steps_s`.
+   * **AC:** training can be diagnosed from logs alone (no console scraping).
 ---
 
 ## Epic E11 — Profiling & perf regression harness

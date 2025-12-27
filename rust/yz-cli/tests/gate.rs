@@ -73,6 +73,8 @@ fn gate_runs_and_updates_manifest() {
         ruleset_id: "swedish_scandinavian_v1".to_string(),
         git_hash: None,
         config_hash: None,
+        config_snapshot: None,
+        config_snapshot_hash: None,
         replay_dir: "replay".to_string(),
         logs_dir: "logs".to_string(),
         models_dir: "models".to_string(),
@@ -158,6 +160,9 @@ gating:
         (0.0..=1.0).contains(&got.gate_oracle_match_rate_overall.unwrap_or(0.0)),
         "gate_oracle_match_rate_overall missing or out of range"
     );
+    assert_eq!(got.config_snapshot.as_deref(), Some("config.yaml"));
+    assert!(got.config_snapshot_hash.as_deref().unwrap_or("").len() >= 32);
+    assert!(run_dir.join("config.yaml").exists());
 
     let gate_report = run_dir.join("gate_report.json");
     assert!(gate_report.exists());

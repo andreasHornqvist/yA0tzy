@@ -275,6 +275,8 @@ OPTIONS:
         ruleset_id: "swedish_scandinavian_v1".to_string(),
         git_hash: yz_logging::try_git_hash(),
         config_hash: Some(config_hash),
+        config_snapshot: None,
+        config_snapshot_hash: None,
         replay_dir: "replay".to_string(),
         logs_dir: "logs".to_string(),
         models_dir: "models".to_string(),
@@ -308,6 +310,16 @@ OPTIONS:
         manifest.gate_oracle_match_rate_mark = existing.gate_oracle_match_rate_mark;
         manifest.gate_oracle_match_rate_reroll = existing.gate_oracle_match_rate_reroll;
         manifest.gate_oracle_keepall_ignored = existing.gate_oracle_keepall_ignored;
+        manifest.config_snapshot = existing.config_snapshot;
+        manifest.config_snapshot_hash = existing.config_snapshot_hash;
+    }
+
+    // E10.5S1: run-local config snapshot (normalized).
+    if manifest.config_snapshot.is_none() || !PathBuf::from(&out).join("config.yaml").exists() {
+        if let Ok((rel, h)) = yz_logging::write_config_snapshot_atomic(&out, &cfg) {
+            manifest.config_snapshot = Some(rel);
+            manifest.config_snapshot_hash = Some(h);
+        }
     }
     yz_logging::write_manifest_atomic(&run_json, &manifest).unwrap_or_else(|e| {
         eprintln!("Failed to write run manifest: {e:?}");
@@ -579,6 +591,15 @@ OPTIONS:
                 m.gate_oracle_match_rate_mark = Some(report.oracle_match_rate_mark);
                 m.gate_oracle_match_rate_reroll = Some(report.oracle_match_rate_reroll);
                 m.gate_oracle_keepall_ignored = Some(report.oracle_keepall_ignored);
+
+                // E10.5S1: ensure run-local config snapshot exists (normalized).
+                if m.config_snapshot.is_none() || !run_dir.join("config.yaml").exists() {
+                    if let Ok((rel, h)) = yz_logging::write_config_snapshot_atomic(&run_dir, &cfg) {
+                        m.config_snapshot = Some(rel);
+                        m.config_snapshot_hash = Some(h);
+                    }
+                }
+
                 let _ = yz_logging::write_manifest_atomic(&run_json, &m);
             }
             Err(e) => {

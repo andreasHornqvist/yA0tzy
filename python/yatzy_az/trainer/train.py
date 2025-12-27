@@ -14,6 +14,11 @@ from typing import Any
 def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--replay", required=True, help="Path to replay shards directory")
     p.add_argument(
+        "--config",
+        default=None,
+        help="Path to YAML config to snapshot into runs/<id>/config.yaml if missing (run layout only)",
+    )
+    p.add_argument(
         "--best", default=None, help="Path to best checkpoint (required unless --resume)"
     )
     p.add_argument("--resume", default=None, help="Path to candidate checkpoint to resume from")
@@ -95,6 +100,39 @@ def resume_candidate(*, candidate_path: Path, hidden: int, blocks: int, lr: floa
     return model, opt, train_step
 
 
+def _ensure_run_config_snapshot(*, run_root: Path, config_path: Path | None) -> None:
+    """Ensure `run_root/config.yaml` exists for run-layout training."""
+    if not (run_root / "run.json").exists():
+        return
+
+    snap = run_root / "config.yaml"
+    if snap.exists():
+        return
+
+    if config_path is None:
+        raise RuntimeError(f"missing run config snapshot: {snap}. Provide --config to write it.")
+
+    import yaml
+
+    from ..config import load_config
+
+    cfg = load_config(Path(config_path))
+    tmp = run_root / "config.yaml.tmp"
+    # normalized YAML (not preserving comments)
+    tmp.write_text(yaml.safe_dump(cfg.model_dump(), sort_keys=False))
+    tmp.replace(snap)
+
+    # Best-effort: record snapshot reference in run.json if present.
+    try:
+        from ..run_manifest import load_manifest, save_manifest_atomic
+
+        m = load_manifest(run_root)
+        m["config_snapshot"] = snap.name
+        save_manifest_atomic(run_root, m)
+    except Exception:
+        pass
+
+
 def run_from_args(args: argparse.Namespace) -> int:
     try:
         import torch
@@ -119,6 +157,9 @@ def run_from_args(args: argparse.Namespace) -> int:
     # E8.5.4: snapshot semantics (fixed shard list for the iteration).
     out_dir = Path(args.out)
     run_root = out_dir.parent
+
+    # E10.5S1: ensure run-local config snapshot exists.
+    _ensure_run_config_snapshot(run_root=run_root, config_path=args.config)
     shard_files = None
     if not bool(args.no_snapshot):
         snapshot_path = (

@@ -31,6 +31,8 @@ pub struct RunManifestV1 {
     // Hashes for reproducibility.
     pub git_hash: Option<String>,
     pub config_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+    pub config_snapshot_hash: Option<String>,
 
     // Layout.
     pub replay_dir: String,
@@ -96,6 +98,33 @@ pub fn write_manifest_atomic(path: impl AsRef<Path>, m: &RunManifestV1) -> Resul
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Write (or ensure) a run-local normalized config snapshot `config.yaml`.
+///
+/// Contract:
+/// - Path is always `run_dir/config.yaml`
+/// - If it already exists, it is not modified
+/// - Writes are crash-safe via temp+rename
+pub fn write_config_snapshot_atomic(
+    run_dir: impl AsRef<Path>,
+    cfg: &yz_core::Config,
+) -> Result<(String, String), NdjsonError> {
+    let run_dir = run_dir.as_ref();
+    let rel = "config.yaml".to_string();
+    let path = run_dir.join(&rel);
+    let tmp = run_dir.join("config.yaml.tmp");
+
+    if path.exists() {
+        let bytes = std::fs::read(&path)?;
+        return Ok((rel, blake3::hash(&bytes).to_hex().to_string()));
+    }
+
+    let s = serde_yaml::to_string(cfg)?;
+    let bytes = s.into_bytes();
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok((rel, blake3::hash(&bytes).to_hex().to_string()))
 }
 
 /// Minimal log schema versioning fields (PRD §10.3).
@@ -173,6 +202,7 @@ pub struct MctsRootEventV1 {
 pub enum NdjsonError {
     Io(io::Error),
     Json(serde_json::Error),
+    Yaml(serde_yaml::Error),
 }
 
 impl From<io::Error> for NdjsonError {
@@ -184,6 +214,12 @@ impl From<io::Error> for NdjsonError {
 impl From<serde_json::Error> for NdjsonError {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e)
+    }
+}
+
+impl From<serde_yaml::Error> for NdjsonError {
+    fn from(e: serde_yaml::Error) -> Self {
+        Self::Yaml(e)
     }
 }
 
@@ -326,6 +362,8 @@ mod tests {
             ruleset_id: "swedish_scandinavian_v1".to_string(),
             git_hash: None,
             config_hash: Some("abc".to_string()),
+            config_snapshot: None,
+            config_snapshot_hash: None,
             replay_dir: "replay".to_string(),
             logs_dir: "logs".to_string(),
             models_dir: "models".to_string(),
@@ -357,5 +395,46 @@ mod tests {
         write_manifest_atomic(&run_json, &m).unwrap();
         let got2 = read_manifest(&run_json).unwrap();
         assert_eq!(got2.selfplay_games_completed, 7);
+    }
+
+    #[test]
+    fn config_snapshot_writer_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = yz_core::Config::from_yaml(
+            r#"
+inference:
+  bind: "unix:///tmp/test.sock"
+  device: "cpu"
+  max_batch: 16
+  max_wait_us: 500
+mcts:
+  c_puct: 1.0
+  budget_reroll: 10
+  budget_mark: 10
+  max_inflight_per_game: 2
+selfplay:
+  games_per_iteration: 1
+  workers: 1
+  threads_per_worker: 1
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 1
+gating:
+  games: 2
+  win_rate_threshold: 0.5
+  paired_seed_swap: false
+"#,
+        )
+        .unwrap();
+
+        let (rel1, h1) = write_config_snapshot_atomic(dir.path(), &cfg).unwrap();
+        let (rel2, h2) = write_config_snapshot_atomic(dir.path(), &cfg).unwrap();
+
+        assert_eq!(rel1, "config.yaml");
+        assert_eq!(rel1, rel2);
+        assert_eq!(h1, h2);
+        assert!(dir.path().join("config.yaml").exists());
     }
 }
