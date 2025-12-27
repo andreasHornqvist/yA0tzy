@@ -937,6 +937,129 @@ EXAMPLES:
     }
 }
 
+fn cargo_flamegraph_available() -> bool {
+    let out = Command::new("cargo")
+        .args(["flamegraph", "--version"])
+        .output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
+fn spawn_current_exe(args: &[String]) -> process::ExitStatus {
+    let exe = env::current_exe().unwrap_or_else(|e| {
+        eprintln!("Failed to locate current executable: {e}");
+        process::exit(1);
+    });
+    Command::new(exe)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to spawn yz: {e}");
+            process::exit(1);
+        })
+}
+
+fn cmd_profile(args: &[String]) {
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            r#"yz profile
+
+USAGE:
+    yz profile <selfplay|gate|bench-e2e> -- <args...>
+
+NOTES:
+    - This command is a thin wrapper around `cargo flamegraph`.
+    - If `cargo flamegraph` is not installed, we fall back to running the underlying command normally.
+
+EXAMPLES:
+    yz profile selfplay -- --help
+    yz profile bench-e2e -- --seconds 10 --parallel 8 --simulations 64 --max-inflight 4 --chance deterministic
+
+INSTALL:
+    cargo install flamegraph
+"#
+        );
+        return;
+    }
+
+    let target = args[0].as_str();
+    let sep = args.iter().position(|s| s == "--");
+    let (before, after) = match sep {
+        Some(i) => (&args[1..i], &args[(i + 1)..]),
+        None => {
+            eprintln!("Missing `--` separator. See `yz profile --help`.");
+            process::exit(2);
+        }
+    };
+    if !before.is_empty() {
+        eprintln!("Unexpected args before `--`: {before:?}");
+        eprintln!("See `yz profile --help`.");
+        process::exit(2);
+    }
+
+    // Underlying command args (when we fall back).
+    let mut underlying: Vec<String> = Vec::new();
+    match target {
+        "selfplay" => {
+            underlying.push("selfplay".to_string());
+            underlying.extend_from_slice(after);
+        }
+        "gate" => {
+            underlying.push("gate".to_string());
+            underlying.extend_from_slice(after);
+        }
+        "bench-e2e" => {
+            underlying.push("bench".to_string());
+            underlying.push("e2e".to_string());
+            underlying.push("--".to_string());
+            underlying.extend_from_slice(after);
+        }
+        other => {
+            eprintln!("Unknown profile target: {other}");
+            eprintln!("See `yz profile --help`.");
+            process::exit(2);
+        }
+    }
+
+    if !cargo_flamegraph_available() {
+        eprintln!("warning: `cargo flamegraph` not found (install with: cargo install flamegraph)");
+        eprintln!("warning: running underlying command without profiling");
+        let status = spawn_current_exe(&underlying);
+        if !status.success() {
+            process::exit(status.code().unwrap_or(1));
+        }
+        return;
+    }
+
+    // Profile path via cargo flamegraph.
+    let mut cmd = Command::new("cargo");
+    cmd.arg("flamegraph");
+    match target {
+        "selfplay" => {
+            cmd.args(["--bin", "yz", "--"]);
+            cmd.arg("selfplay");
+            cmd.args(after);
+        }
+        "gate" => {
+            cmd.args(["--bin", "yz", "--"]);
+            cmd.arg("gate");
+            cmd.args(after);
+        }
+        "bench-e2e" => {
+            cmd.args(["-p", "yz-bench-e2e", "--bin", "yz-bench-e2e", "--"]);
+            cmd.args(after);
+        }
+        _ => unreachable!(),
+    }
+
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("Failed to run cargo flamegraph: {e}");
+        process::exit(1);
+    });
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -1000,8 +1123,7 @@ fn main() {
             cmd_bench(&args[2..]);
         }
         "profile" => {
-            println!("Profiling (not yet implemented)");
-            println!("Usage: yz profile selfplay ...");
+            cmd_profile(&args[2..]);
         }
         cmd => {
             eprintln!("Unknown command: {}", cmd);
