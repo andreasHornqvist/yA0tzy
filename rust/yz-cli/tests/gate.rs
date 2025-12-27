@@ -91,6 +91,10 @@ fn gate_runs_and_updates_manifest() {
         gate_oracle_match_rate_mark: None,
         gate_oracle_match_rate_reroll: None,
         gate_oracle_keepall_ignored: None,
+        controller_phase: None,
+        controller_status: None,
+        controller_last_ts_ms: None,
+        controller_error: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 

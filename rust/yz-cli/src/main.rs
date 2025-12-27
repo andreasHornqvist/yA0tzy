@@ -115,6 +115,7 @@ COMMANDS:
     gate                Gate candidate vs best model (paired seed + side swap)
     oracle-eval         Evaluate models against oracle baseline
     bench               Run Criterion micro-benchmarks (wrapper around cargo bench)
+    tui                 Terminal UI (Ratatui) for configuring + monitoring runs
     profile             Run with profiler hooks enabled
 
 OPTIONS:
@@ -294,6 +295,10 @@ OPTIONS:
         gate_oracle_match_rate_mark: None,
         gate_oracle_match_rate_reroll: None,
         gate_oracle_keepall_ignored: None,
+        controller_phase: None,
+        controller_status: None,
+        controller_last_ts_ms: None,
+        controller_error: None,
     };
     // If a manifest already exists (resume), keep its created_ts_ms/run_id.
     if let Ok(existing) = yz_logging::read_manifest(&run_json) {
@@ -313,6 +318,10 @@ OPTIONS:
         manifest.gate_oracle_keepall_ignored = existing.gate_oracle_keepall_ignored;
         manifest.config_snapshot = existing.config_snapshot;
         manifest.config_snapshot_hash = existing.config_snapshot_hash;
+        manifest.controller_phase = existing.controller_phase;
+        manifest.controller_status = existing.controller_status;
+        manifest.controller_last_ts_ms = existing.controller_last_ts_ms;
+        manifest.controller_error = existing.controller_error;
     }
 
     // E10.5S1: run-local config snapshot (normalized).
@@ -1121,6 +1130,12 @@ fn main() {
         }
         "bench" => {
             cmd_bench(&args[2..]);
+        }
+        "tui" => {
+            if let Err(e) = yz_tui::run() {
+                eprintln!("TUI failed: {e}");
+                process::exit(1);
+            }
         }
         "profile" => {
             cmd_profile(&args[2..]);

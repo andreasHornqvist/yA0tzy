@@ -57,6 +57,12 @@ pub struct RunManifestV1 {
     pub gate_oracle_match_rate_mark: Option<f64>,
     pub gate_oracle_match_rate_reroll: Option<f64>,
     pub gate_oracle_keepall_ignored: Option<u64>,
+
+    // Controller/TUI (optional).
+    pub controller_phase: Option<String>,  // "idle" | "selfplay" | "train" | "gate" | "done" | "error"
+    pub controller_status: Option<String>, // human-readable status
+    pub controller_last_ts_ms: Option<u64>,
+    pub controller_error: Option<String>,
 }
 
 pub fn now_ms() -> u64 {
@@ -283,6 +289,26 @@ pub enum NdjsonError {
     Yaml(serde_yaml::Error),
 }
 
+impl std::fmt::Display for NdjsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NdjsonError::Io(e) => write!(f, "io error: {e}"),
+            NdjsonError::Json(e) => write!(f, "json error: {e}"),
+            NdjsonError::Yaml(e) => write!(f, "yaml error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for NdjsonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NdjsonError::Io(e) => Some(e),
+            NdjsonError::Json(e) => Some(e),
+            NdjsonError::Yaml(e) => Some(e),
+        }
+    }
+}
+
 impl From<io::Error> for NdjsonError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
@@ -503,6 +529,10 @@ mod tests {
             gate_oracle_match_rate_mark: None,
             gate_oracle_match_rate_reroll: None,
             gate_oracle_keepall_ignored: None,
+            controller_phase: None,
+            controller_status: None,
+            controller_last_ts_ms: None,
+            controller_error: None,
         };
         write_manifest_atomic(&run_json, &m).unwrap();
 

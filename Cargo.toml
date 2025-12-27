@@ -13,6 +13,8 @@ members = [
   "rust/yz-cli",
   "rust/yz-bench",
   "rust/yz-bench-e2e",
+  "rust/yz-tui",
+  "rust/yz-controller",
   "rust/swedish_yatzy_dp",
 ]
 

@@ -170,6 +170,46 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            inference: InferenceConfig {
+                bind: "unix:///tmp/yatzy_infer.sock".to_string(),
+                device: "cpu".to_string(),
+                max_batch: 32,
+                max_wait_us: 1000,
+            },
+            mcts: MctsConfig {
+                c_puct: 1.5,
+                budget_reroll: 100,
+                budget_mark: 100,
+                max_inflight_per_game: 4,
+                dirichlet_alpha: default_dirichlet_alpha(),
+                dirichlet_epsilon: default_dirichlet_epsilon(),
+                temperature_schedule: TemperatureSchedule::default(),
+            },
+            selfplay: SelfplayConfig {
+                games_per_iteration: 50,
+                workers: 1,
+                threads_per_worker: 1,
+            },
+            training: TrainingConfig {
+                batch_size: 256,
+                learning_rate: 1e-3,
+                epochs: 1,
+            },
+            gating: GatingConfig {
+                games: 50,
+                seed: 0,
+                seed_set_id: default_gating_seed_set_id(),
+                win_rate_threshold: default_gating_win_rate_threshold(),
+                paired_seed_swap: true,
+                deterministic_chance: default_gating_deterministic_chance(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
