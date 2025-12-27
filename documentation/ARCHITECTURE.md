@@ -82,6 +82,10 @@ uv run python -m yatzy_az --help     # Run Python CLI
 uv run ruff check .                  # Lint
 uv run ruff format --check .         # Check formatting
 uv run pytest                        # Run tests (future)
+
+# Benchmarks
+cargo bench -p yz-bench              # Run Criterion microbenches
+cargo run --bin yz -- bench --bench scoring     # Run via yz wrapper (passes args to cargo bench)
 ```
 
 ### CI
@@ -149,11 +153,13 @@ See `.github/workflows/ci.yml` for details.
 | Inference client (background IO, tickets, routing) | `rust/yz-infer/` (`src/client.rs`) |
 | Replay shards (safetensors) | `rust/yz-replay/` (`src/writer.rs`) |
 | NDJSON run logs (iteration + sampled roots) | `rust/yz-logging/` (`src/lib.rs`), outputs to `runs/<id>/logs/` |
+| Unified metrics stream (E10.5S2+) | `runs/<id>/logs/metrics.ndjson` (written by `yz selfplay`, `yz gate --run`, and `python -m yatzy_az train`) |
 | Run manifest (E8.5.x) | `runs/<id>/run.json` (written by `yz selfplay`, updated by `python -m yatzy_az train`, and finalized by `yz iter finalize`) |
 | Replay snapshot (E8.5.4) | `runs/<id>/replay_snapshot.json` (created by training; freezes shard list for resumes) |
 | Python replay dataset loader (E8S1) | `python/yatzy_az/replay_dataset.py` |
 | Neural network model | `python/yatzy_az/model/` |
 | Training loop | `python/yatzy_az/trainer/` |
+| Metrics consumer (JSON-only, W&B-friendly) | `python/yatzy_az/wandb_sync.py` (`python -m yatzy_az wandb-sync --run runs/<id>/`) |
 | Python inference server (asyncio + batching + metrics) | `python/yatzy_az/server/` |
 | Runtime scheduler + GameTask | `rust/yz-runtime/` (`src/game_task.rs`, `src/scheduler.rs`) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
@@ -190,7 +196,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E9.2 complete** (gating is implemented: `yz gate` runs candidate vs best with paired seed + side swap (E9.1) and fixed dev seed sets via `configs/seed_sets` + `gating.seed_set_id` (E9.2))
+Current status: **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
 ---
 

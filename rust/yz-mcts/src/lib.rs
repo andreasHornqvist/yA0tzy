@@ -19,6 +19,9 @@ pub use mcts::{
     apply_temperature, ChanceMode, Mcts, MctsConfig, SearchDriver, SearchResult, SearchStats,
 };
 
+#[cfg(feature = "bench")]
+pub use mcts::bench_select_action_v1;
+
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

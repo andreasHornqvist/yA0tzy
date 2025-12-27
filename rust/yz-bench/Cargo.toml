@@ -1,0 +1,31 @@
+[package]
+name = "yz-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+yz-core = { path = "../yz-core" }
+yz-infer = { path = "../yz-infer" }
+yz-mcts = { path = "../yz-mcts", features = ["bench"] }
+
+[[bench]]
+name = "scoring"
+harness = false
+
+[[bench]]
+name = "legal"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "puct"
+harness = false
+
+

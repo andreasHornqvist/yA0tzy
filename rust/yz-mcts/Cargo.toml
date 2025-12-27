@@ -17,3 +17,7 @@ rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
 
+[features]
+# Expose small helpers used only by Criterion benches (no API stability guarantee).
+bench = []
+

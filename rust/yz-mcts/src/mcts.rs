@@ -579,6 +579,48 @@ impl Mcts {
     }
 }
 
+/// Benchmark-only helper to measure the PUCT selection loop cost without running full searches.
+///
+/// This API is behind the `bench` feature and has **no stability guarantees**.
+#[cfg(feature = "bench")]
+pub fn bench_select_action_v1(cfg: &MctsConfig, node: &Node, legal: &[bool; A], mode: ChanceMode) -> u8 {
+    let use_vl = cfg.virtual_loss > 0.0;
+    let n_sum_eff = if use_vl {
+        node.n_sum.saturating_add(node.vl_sum)
+    } else {
+        node.n_sum
+    };
+    let sqrt_sum = (n_sum_eff as f32).sqrt();
+
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_a: u8 = 0;
+
+    for (a, &ok) in legal.iter().enumerate() {
+        if !ok {
+            continue;
+        }
+        let q = node.q_eff(a, use_vl);
+        let n_eff = if use_vl {
+            node.n[a].saturating_add(node.vl_n[a]) as f32
+        } else {
+            node.n[a] as f32
+        };
+        let u = cfg.c_puct * node.p[a] * sqrt_sum / (1.0 + n_eff);
+        let score = q + u;
+
+        if score > best_score {
+            best_score = score;
+            best_a = a as u8;
+        } else if score == best_score {
+            if matches!(mode, ChanceMode::Deterministic { .. }) && (a as u8) < best_a {
+                best_a = a as u8;
+            }
+        }
+    }
+
+    best_a
+}
+
 impl SearchDriver {
     /// Advance the search by up to `max_work` small operations.
     ///

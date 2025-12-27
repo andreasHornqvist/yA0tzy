@@ -12,6 +12,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process;
+use std::process::Command;
 
 /// Print the oracle's optimal expected score for a fresh game.
 fn cmd_oracle_expected() {
@@ -113,7 +114,7 @@ COMMANDS:
     selfplay            Run self-play with MCTS + inference
     gate                Gate candidate vs best model (paired seed + side swap)
     oracle-eval         Evaluate models against oracle baseline
-    bench               Run micro-benchmarks
+    bench               Run Criterion micro-benchmarks (wrapper around cargo bench)
     profile             Run with profiler hooks enabled
 
 OPTIONS:
@@ -881,6 +882,41 @@ OPTIONS:
     println!("Finalize complete. decision={decision} run={}", run_dir.display());
 }
 
+fn cmd_bench(args: &[String]) {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            r#"yz bench
+
+USAGE:
+    yz bench [<cargo args>...]
+
+NOTES:
+    - This is a thin wrapper around:
+        cargo bench -p yz-bench <cargo args...>
+
+EXAMPLES:
+    yz bench
+    yz bench --bench scoring
+    yz bench --bench scoring -- --warm-up-time 0.5 --measurement-time 1.0
+"#
+        );
+        return;
+    }
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("bench").arg("-p").arg("yz-bench");
+    cmd.args(args);
+
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("Failed to run cargo bench: {e}");
+        eprintln!("Hint: ensure Rust tooling is installed and `cargo` is on PATH.");
+        process::exit(1);
+    });
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -941,7 +977,7 @@ fn main() {
             println!("Usage: yz oracle-eval --config cfg.yaml --best ... --cand ...");
         }
         "bench" => {
-            println!("Benchmarks (not yet implemented)");
+            cmd_bench(&args[2..]);
         }
         "profile" => {
             println!("Profiling (not yet implemented)");

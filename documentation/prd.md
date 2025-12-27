@@ -934,6 +934,8 @@ This epic exists because a “resumable trainer” requires more than just model
 * miss regressions (policy collapse, illegal action mass, throughput drops)
 **Stories**
 
+**Status (implementation note):** E10.5S1–E10.5S4 are implemented. The only item still not implemented is the **optional** “per-seed results” payload in `gate_report.json` (E10.5S3).
+
 1. **Full training config snapshot (run-local, crash-safe)**
 
    * On `yz selfplay` start, write `runs/<id>/config.yaml` as an exact copy of the YAML config used.
