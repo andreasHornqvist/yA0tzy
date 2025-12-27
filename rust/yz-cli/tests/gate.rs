@@ -82,6 +82,7 @@ fn gate_runs_and_updates_manifest() {
         promotion_ts_ms: None,
         gate_games: None,
         gate_win_rate: None,
+        gate_seeds_hash: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 
@@ -146,6 +147,10 @@ gating:
     let got = yz_logging::read_manifest(&run_json).unwrap();
     assert_eq!(got.gate_games, Some(2));
     assert!((got.gate_win_rate.unwrap_or(0.0) - 0.5).abs() < 1e-9);
+    assert!(got.gate_seeds_hash.as_deref().unwrap_or("").len() >= 32);
+
+    let gate_report = run_dir.join("gate_report.json");
+    assert!(gate_report.exists());
 }
 
 

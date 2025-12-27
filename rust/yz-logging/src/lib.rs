@@ -50,6 +50,7 @@ pub struct RunManifestV1 {
     pub promotion_ts_ms: Option<u64>,
     pub gate_games: Option<u64>,
     pub gate_win_rate: Option<f64>,
+    pub gate_seeds_hash: Option<String>,
 }
 
 pub fn now_ms() -> u64 {
@@ -332,6 +333,7 @@ mod tests {
             promotion_ts_ms: None,
             gate_games: None,
             gate_win_rate: None,
+            gate_seeds_hash: None,
         };
         write_manifest_atomic(&run_json, &m).unwrap();
 

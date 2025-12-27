@@ -38,6 +38,7 @@ fn iter_finalize_promote_creates_best_and_updates_manifest() {
         promotion_ts_ms: None,
         gate_games: None,
         gate_win_rate: None,
+        gate_seeds_hash: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 
@@ -102,6 +103,7 @@ fn iter_finalize_reject_does_not_create_best_but_updates_manifest() {
         promotion_ts_ms: None,
         gate_games: None,
         gate_win_rate: None,
+        gate_seeds_hash: None,
     };
     yz_logging::write_manifest_atomic(&run_json, &m).unwrap();
 

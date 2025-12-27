@@ -8,4 +8,5 @@ yz-core = { path = "../yz-core" }
 yz-mcts = { path = "../yz-mcts" }
 yz-infer = { path = "../yz-infer" }
 thiserror = "1.0"
+blake3 = "1"
 

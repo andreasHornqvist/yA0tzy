@@ -923,6 +923,27 @@ This epic exists because a “resumable trainer” requires more than just model
 
 ---
 
+## Epic E10.5 — Experiment tracking: W&B-compatible logging + full config snapshots
+
+**Goal:** make learning progress **understandable**, **comparable**, and **reproducible** across runs by emitting a W&B-friendly event stream and storing the exact config used for a run.
+
+**Motivation:** We already emit NDJSON + a run manifest, but without a standardized “metrics stream” and a full config snapshot it’s too easy to:\n+- lose the context of *which knobs produced which curves*\n+- compare apples-to-oranges across runs (different seed sets, budgets, temperature schedules)\n+- miss regressions (policy collapse, illegal action mass, throughput drops)\n+
+**Stories**
+
+1. **Full training config snapshot (run-local, crash-safe)**
+
+   * On `yz selfplay` start, write `runs/<id>/config.yaml` as an exact copy of the YAML config used.\n+     - write via temp + atomic rename\n+   * Include a reference in `runs/<id>/run.json` (e.g. `config_snapshot: "config.yaml"`).\n+   * **AC:** given only `runs/<id>/`, you can recover the exact config bytes that produced the run.\n+
+2. **Standardized metrics stream (NDJSON → W&B)**
+
+   * Define a stable NDJSON “metrics event” schema for:\n+     - self-play iteration stats\n+     - sampled MCTS root stats\n+     - training step stats\n+     - gating/eval summaries\n+   * Provide a small Python utility `yatzy_az wandb-sync --run runs/<id>/` that:\n+     - tails NDJSON + run.json\n+     - emits W&B scalars/histograms consistently (or prints JSON for other tools)\n+   * **AC:** you can point W&B at a run directory and see live-updating curves.\n+
+3. **Gating reproducibility fields**
+
+   * Record `gating.seeds_hash` (hash of the exact ordered seed list used for gating; derived schedule or seed_set contents).\n+   * Persist a compact gating report JSON in the run dir:\n+     - wins/losses/draws\n+     - mean score diff\n+     - per-seed results (optional)\n+   * **AC:** gating results are comparable across runs and auditable from artifacts.\n+
+4. **Training stats: minimal but sufficient**
+
+   * Log (at least): `loss_total`, `loss_policy`, `loss_value`, `entropy`, `lr`, `throughput_steps_s`.\n+   * **AC:** training can be diagnosed from logs alone (no console scraping).\n+
+---
+
 ## Epic E11 — Profiling & perf regression harness
 
 **Goal:** performance is a feature, not luck.
@@ -989,6 +1010,7 @@ This epic exists because a “resumable trainer” requires more than just model
 * **Batching drift / collisions**: virtual loss + inflight caps + collision metrics.
 * **Over-threading**: control PyTorch thread counts; avoid mixing rayon-heavy oracle DP build with worker threads in the same process; consider separate process for oracle suite.
 * **Artifact incompatibility**: schema ids + strict versioning embedded everywhere.
+* **Unobservable learning / non-reproducible runs**: mitigated by a full config snapshot (`runs/<id>/config.yaml`), seed-set hashing for gating, and W&B-compatible structured metrics (Epic E10.5).
 
 ---
 

@@ -75,11 +75,15 @@ fn gating_schedule_from_seed_set(
     seeds: &[u64],
     requested_games: u32,
     paired_swap: bool,
-) -> (Vec<GameSpec>, Vec<String>) {
+) -> (Vec<GameSpec>, Vec<u64>, Vec<String>) {
     let mut warnings = Vec::new();
 
     if seeds.is_empty() {
-        return (Vec::new(), vec!["seed set is empty; running 0 games".to_string()]);
+        return (
+            Vec::new(),
+            Vec::new(),
+            vec!["seed set is empty; running 0 games".to_string()],
+        );
     }
 
     if paired_swap {
@@ -102,18 +106,9 @@ fn gating_schedule_from_seed_set(
             ));
         }
 
-        let mut out = Vec::with_capacity(2 * used_seeds);
-        for &s in &seeds[..used_seeds] {
-            out.push(GameSpec {
-                episode_seed: s,
-                swap: false,
-            });
-            out.push(GameSpec {
-                episode_seed: s,
-                swap: true,
-            });
-        }
-        return (out, warnings);
+        let used = seeds[..used_seeds].to_vec();
+        let out = schedule_from_seed_list(&used, true);
+        return (out, used, warnings);
     }
 
     // Non-paired mode: one game per seed. Clamp to requested_games and warn on truncation.
@@ -135,14 +130,9 @@ fn gating_schedule_from_seed_set(
         ));
     }
 
-    let mut out = Vec::with_capacity(used);
-    for &s in &seeds[..used] {
-        out.push(GameSpec {
-            episode_seed: s,
-            swap: false,
-        });
-    }
-    (out, warnings)
+    let used = seeds[..used].to_vec();
+    let out = schedule_from_seed_list(&used, false);
+    (out, used, warnings)
 }
 
 fn seed_set_path(id: &str) -> PathBuf {
@@ -205,6 +195,13 @@ pub struct GateReport {
     pub cand_losses: u32,
     pub draws: u32,
     pub cand_score_diff_sum: i64,
+    pub seeds: Vec<u64>,
+    pub seeds_hash: String,
+    pub score_diff_std: f64,
+    pub score_diff_se: f64,
+    pub score_diff_ci95_low: f64,
+    pub score_diff_ci95_high: f64,
+    pub draw_rate: f64,
     pub warnings: Vec<String>,
 }
 
@@ -227,7 +224,7 @@ impl GateReport {
 }
 
 pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, GateError> {
-    let (schedule, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
+    let (schedule, seeds, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
         if cfg.gating.paired_seed_swap && (cfg.gating.games % 2 != 0) {
             return Err(GateError::InvalidConfig(
                 "gating.games must be even when gating.paired_seed_swap=true",
@@ -236,7 +233,9 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
         let seeds = load_seed_set(id)?;
         gating_schedule_from_seed_set(&seeds, cfg.gating.games, cfg.gating.paired_seed_swap)
     } else {
-        (gating_schedule(cfg.gating.seed, cfg.gating.games, cfg.gating.paired_seed_swap)?, Vec::new())
+        let seeds = derived_seed_list(cfg.gating.seed, cfg.gating.games, cfg.gating.paired_seed_swap)?;
+        let schedule = schedule_from_seed_list(&seeds, cfg.gating.paired_seed_swap);
+        (schedule, seeds, Vec::new())
     };
 
     let (best_backend, cand_backend) = connect_two_backends(
@@ -249,12 +248,15 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
     let mut report = GateReport::default();
     report.games = schedule.len() as u32;
     report.warnings = warnings;
+    report.seeds = seeds;
+    report.seeds_hash = hash_seeds(&report.seeds);
 
     // Always disable root Dirichlet noise in gating/eval.
     let mut mcts_cfg = opts.mcts_cfg;
     mcts_cfg.dirichlet_epsilon = 0.0;
     let mut mcts = Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
 
+    let mut diffs: Vec<i32> = Vec::with_capacity(schedule.len());
     for gs in schedule {
         let (cand_score, best_score, cand_outcome) = run_one_game(cfg, &mut mcts, &best_backend, &cand_backend, gs)?;
         match cand_outcome {
@@ -262,10 +264,96 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
             Outcome::Loss => report.cand_losses += 1,
             Outcome::Draw => report.draws += 1,
         }
-        report.cand_score_diff_sum += (cand_score as i64) - (best_score as i64);
+        let d = cand_score - best_score;
+        diffs.push(d);
+        report.cand_score_diff_sum += d as i64;
     }
 
+    compute_score_diff_stats(&diffs, &mut report);
     Ok(report)
+}
+
+fn derived_seed_list(
+    seed0: u64,
+    games: u32,
+    paired_swap: bool,
+) -> Result<Vec<u64>, GateError> {
+    if games == 0 {
+        return Err(GateError::InvalidConfig("gating.games must be > 0"));
+    }
+    if paired_swap && (games % 2 != 0) {
+        return Err(GateError::InvalidConfig(
+            "gating.games must be even when gating.paired_seed_swap=true",
+        ));
+    }
+    let n = if paired_swap { games / 2 } else { games };
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        out.push(splitmix64(seed0 ^ (i as u64)));
+    }
+    Ok(out)
+}
+
+fn schedule_from_seed_list(seeds: &[u64], paired_swap: bool) -> Vec<GameSpec> {
+    if paired_swap {
+        let mut out = Vec::with_capacity(seeds.len() * 2);
+        for &s in seeds {
+            out.push(GameSpec {
+                episode_seed: s,
+                swap: false,
+            });
+            out.push(GameSpec {
+                episode_seed: s,
+                swap: true,
+            });
+        }
+        out
+    } else {
+        seeds
+            .iter()
+            .copied()
+            .map(|s| GameSpec {
+                episode_seed: s,
+                swap: false,
+            })
+            .collect()
+    }
+}
+
+fn hash_seeds(seeds: &[u64]) -> String {
+    let mut buf = Vec::with_capacity(seeds.len() * 8);
+    for &s in seeds {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    blake3::hash(&buf).to_hex().to_string()
+}
+
+fn compute_score_diff_stats(diffs: &[i32], report: &mut GateReport) {
+    let n = diffs.len();
+    if n == 0 {
+        report.score_diff_std = 0.0;
+        report.score_diff_se = 0.0;
+        report.score_diff_ci95_low = 0.0;
+        report.score_diff_ci95_high = 0.0;
+        report.draw_rate = 0.0;
+        return;
+    }
+    let n_f = n as f64;
+    let mean = (report.cand_score_diff_sum as f64) / n_f;
+    let mut sumsq = 0.0f64;
+    for &d in diffs {
+        let x = d as f64;
+        sumsq += (x - mean) * (x - mean);
+    }
+    let var = if n > 1 { sumsq / (n_f - 1.0) } else { 0.0 };
+    let std = var.max(0.0).sqrt();
+    let se = if n > 0 { std / n_f.sqrt() } else { 0.0 };
+    let ci = 1.96 * se;
+    report.score_diff_std = std;
+    report.score_diff_se = se;
+    report.score_diff_ci95_low = mean - ci;
+    report.score_diff_ci95_high = mean + ci;
+    report.draw_rate = (report.draws as f64) / n_f;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,7 +544,7 @@ mod tests {
     #[test]
     fn seed_set_sizing_truncates_and_warns_when_longer() {
         let seeds = vec![1u64, 2, 3, 4, 5];
-        let (sched, warn) = gating_schedule_from_seed_set(&seeds, 4, true); // wanted_seeds=2
+        let (sched, _used, warn) = gating_schedule_from_seed_set(&seeds, 4, true); // wanted_seeds=2
         assert_eq!(sched.len(), 4);
         assert!(!warn.is_empty());
     }
@@ -464,9 +552,25 @@ mod tests {
     #[test]
     fn seed_set_sizing_runs_fewer_games_when_shorter() {
         let seeds = vec![1u64];
-        let (sched, warn) = gating_schedule_from_seed_set(&seeds, 10, true); // wanted_seeds=5
+        let (sched, _used, warn) = gating_schedule_from_seed_set(&seeds, 10, true); // wanted_seeds=5
         assert_eq!(sched.len(), 2);
         assert!(!warn.is_empty());
+    }
+
+    #[test]
+    fn seeds_hash_is_stable_for_same_seed_list() {
+        let seeds = vec![1u64, 2, 3, 4, 5];
+        let h1 = hash_seeds(&seeds);
+        let h2 = hash_seeds(&seeds);
+        assert_eq!(h1, h2);
+        assert!(h1.len() >= 32);
+    }
+
+    #[test]
+    fn seeds_hash_changes_if_seed_list_changes() {
+        let h1 = hash_seeds(&[1u64, 2, 3]);
+        let h2 = hash_seeds(&[1u64, 2, 4]);
+        assert_ne!(h1, h2);
     }
 
     #[test]

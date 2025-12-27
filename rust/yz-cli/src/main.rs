@@ -286,6 +286,7 @@ OPTIONS:
         promotion_ts_ms: None,
         gate_games: None,
         gate_win_rate: None,
+        gate_seeds_hash: None,
     };
     // If a manifest already exists (resume), keep its created_ts_ms/run_id.
     if let Ok(existing) = yz_logging::read_manifest(&run_json) {
@@ -298,6 +299,7 @@ OPTIONS:
         manifest.promotion_ts_ms = existing.promotion_ts_ms;
         manifest.gate_games = existing.gate_games;
         manifest.gate_win_rate = existing.gate_win_rate;
+        manifest.gate_seeds_hash = existing.gate_seeds_hash;
     }
     yz_logging::write_manifest_atomic(&run_json, &manifest).unwrap_or_else(|e| {
         eprintln!("Failed to write run manifest: {e:?}");
@@ -422,6 +424,7 @@ fn cmd_gate(args: &[String]) {
     let mut best_id: u32 = 0;
     let mut cand_id: u32 = 1;
     let mut run_dir: Option<String> = None;
+    let mut out_path: Option<String> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -471,6 +474,10 @@ OPTIONS:
             }
             "--run" => {
                 run_dir = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(args.get(i + 1).cloned().unwrap_or_default());
                 i += 2;
             }
             other => {
@@ -524,6 +531,11 @@ OPTIONS:
     });
 
     let wr = report.win_rate();
+    let decision = if wr + 1e-12 < cfg.gating.win_rate_threshold {
+        "reject"
+    } else {
+        "promote"
+    };
     if let Some(id) = cfg.gating.seed_set_id.as_deref() {
         println!("Seed source: seed_set_id={id} requested_games={}", cfg.gating.games);
     } else {
@@ -533,36 +545,96 @@ OPTIONS:
         eprintln!("warning: {w}");
     }
     println!(
-        "Gating complete. games={} wins={} losses={} draws={} win_rate={:.4} mean_score_diff={:.2}",
+        "Gating complete. decision={} games={} wins={} losses={} draws={} win_rate={:.4} mean_score_diff={:.2} se={:.3} ci95=[{:.3},{:.3}] seeds_hash={}",
+        decision,
         report.games,
         report.cand_wins,
         report.cand_losses,
         report.draws,
         wr,
-        report.mean_score_diff()
+        report.mean_score_diff(),
+        report.score_diff_se,
+        report.score_diff_ci95_low,
+        report.score_diff_ci95_high,
+        report.seeds_hash
     );
 
     if let Some(run) = run_dir {
-        let run_json = PathBuf::from(run).join("run.json");
+        let run_dir = PathBuf::from(run);
+        let run_json = run_dir.join("run.json");
         match yz_logging::read_manifest(&run_json) {
             Ok(mut m) => {
                 m.gate_games = Some(report.games as u64);
                 m.gate_win_rate = Some(wr);
+                m.gate_seeds_hash = Some(report.seeds_hash.clone());
                 let _ = yz_logging::write_manifest_atomic(&run_json, &m);
             }
             Err(e) => {
                 eprintln!("Warning: failed to update run manifest: {e:?}");
             }
         }
+
+        // Write gate_report.json (default under runs/<id>/ unless --out provided).
+        let out = out_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| run_dir.join("gate_report.json"));
+        let _ = write_gate_report_atomic(
+            &out,
+            &GateReportJson {
+                decision: decision.to_string(),
+                games: report.games,
+                wins: report.cand_wins,
+                losses: report.cand_losses,
+                draws: report.draws,
+                win_rate: wr,
+                win_rate_threshold: cfg.gating.win_rate_threshold,
+                mean_score_diff: report.mean_score_diff(),
+                score_diff_se: report.score_diff_se,
+                score_diff_ci95_low: report.score_diff_ci95_low,
+                score_diff_ci95_high: report.score_diff_ci95_high,
+                seeds_hash: report.seeds_hash.clone(),
+                seed: cfg.gating.seed,
+                seed_set_id: cfg.gating.seed_set_id.clone(),
+                warnings: report.warnings.clone(),
+            },
+        );
     }
 
-    if wr + 1e-12 < cfg.gating.win_rate_threshold {
+    if decision == "reject" {
         eprintln!(
             "Candidate rejected: win_rate {:.4} < threshold {:.4}",
             wr, cfg.gating.win_rate_threshold
         );
         process::exit(2);
     }
+}
+
+#[derive(serde::Serialize)]
+struct GateReportJson {
+    decision: String,
+    games: u32,
+    wins: u32,
+    losses: u32,
+    draws: u32,
+    win_rate: f64,
+    win_rate_threshold: f64,
+    mean_score_diff: f64,
+    score_diff_se: f64,
+    score_diff_ci95_low: f64,
+    score_diff_ci95_high: f64,
+    seeds_hash: String,
+    seed: u64,
+    seed_set_id: Option<String>,
+    warnings: Vec<String>,
+}
+
+fn write_gate_report_atomic(path: &PathBuf, report: &GateReportJson) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(report).expect("serialize gate_report");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {

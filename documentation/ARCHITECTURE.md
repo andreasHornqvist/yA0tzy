@@ -190,7 +190,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E7S3 complete** (`yz-logging` NDJSON logs + `yz selfplay` writes `runs/<id>/logs/{iteration_stats.ndjson,mcts_roots.ndjson}`; replay shards still written incrementally)
+Current status: **E9.2 complete** (gating is implemented: `yz gate` runs candidate vs best with paired seed + side swap (E9.1) and fixed dev seed sets via `configs/seed_sets` + `gating.seed_set_id` (E9.2))
 
 ---
 
