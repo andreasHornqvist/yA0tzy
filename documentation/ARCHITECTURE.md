@@ -27,6 +27,10 @@ yA0tzy/
 │   ├── yz-eval/              # Model gating (candidate vs best evaluation)
 │   ├── yz-oracle/            # Adapter to swedish_yatzy_dp perfect-play oracle
 │   ├── yz-logging/           # NDJSON event logging, metrics
+│   ├── yz-controller/        # In-process iteration controller (phase/status in run.json)
+│   ├── yz-tui/               # Ratatui terminal UI (run picker + config + dashboard)
+│   ├── yz-bench/             # Criterion microbenches
+│   ├── yz-bench-e2e/         # End-to-end perf benchmark harness
 │   ├── yz-cli/               # `yz` binary (CLI entrypoint)
 │   └── swedish_yatzy_dp/     # Vendored oracle (optimal-play DP solver)
 │
@@ -47,7 +51,8 @@ yA0tzy/
 │
 ├── documentation/            # Project documentation
 │   ├── prd.md                # Product Requirements Document
-│   └── ARCHITECTURE.md       # This file
+│   ├── ARCHITECTURE.md       # This file
+│   └── PROFILING.md          # Profiling workflows and tips
 │
 ├── runs/                     # Training run outputs (gitignored)
 ├── Cargo.toml                # Rust workspace definition
@@ -82,6 +87,9 @@ uv run python -m yatzy_az --help     # Run Python CLI
 uv run ruff check .                  # Lint
 uv run ruff format --check .         # Check formatting
 uv run pytest                        # Run tests (future)
+
+# Terminal UI
+cargo run -p yz-cli --bin yz -- tui
 
 # Benchmarks
 cargo bench -p yz-bench              # Run Criterion microbenches
@@ -168,6 +176,8 @@ See `.github/workflows/ci.yml` for details.
 | Python inference server (asyncio + batching + metrics) | `python/yatzy_az/server/` |
 | Runtime scheduler + GameTask | `rust/yz-runtime/` (`src/game_task.rs`, `src/scheduler.rs`) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
+| Terminal UI (ratatui) | `rust/yz-tui/` |
+| Iteration controller (phase/status + runners) | `rust/yz-controller/` |
 | CLI commands (Python) | `python/yatzy_az/__main__.py` |
 | Config examples | `configs/` |
 | Full requirements | `documentation/prd.md` |
@@ -201,7 +211,9 @@ See `documentation/prd.md` Section 14 for full roadmap.
 | **E3** | Training loop, gating, iteration orchestration |
 | **E4** | Logging, profiling, polish |
 
-Current status: **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
+Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
+
+Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + metrics tail dashboard). Remaining work is tracked in PRD Epic E13 (start/stop controller + richer dashboard + training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
 
 ---
 

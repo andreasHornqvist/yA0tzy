@@ -16,9 +16,9 @@ def test_optimizer_state_is_reset_on_best_to_candidate_init(tmp_path):
 
     device = torch.device("cpu")
 
-    # Create a best model and run a step to populate Adam moments.
+    # Create a best model and run a step to populate optimizer moments.
     m = YatzyNet(YatzyNetConfig(hidden=32, blocks=1))
-    opt = torch.optim.Adam(m.parameters(), lr=1e-2)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-2, weight_decay=0.0)
     x = torch.randn(4, 45)
     logits, v = m(x)
     loss = (logits.square().mean()) + (v.square().mean())
@@ -32,7 +32,7 @@ def test_optimizer_state_is_reset_on_best_to_candidate_init(tmp_path):
     _save_best_checkpoint(best_path, m, opt.state_dict())
 
     cand_model, cand_opt, start_step = init_from_best(
-        best_path=best_path, hidden=32, blocks=1, lr=1e-3, device=device
+        best_path=best_path, hidden=32, blocks=1, lr=1e-3, weight_decay=0.0, device=device
     )
 
     assert start_step == 0
@@ -51,7 +51,7 @@ def test_resume_loads_optimizer_state(tmp_path):
     device = torch.device("cpu")
 
     m = YatzyNet(YatzyNetConfig(hidden=32, blocks=1))
-    opt = torch.optim.Adam(m.parameters(), lr=1e-2)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-2, weight_decay=0.0)
     x = torch.randn(4, 45)
     logits, v = m(x)
     loss = (logits.square().mean()) + (v.square().mean())
@@ -67,7 +67,7 @@ def test_resume_loads_optimizer_state(tmp_path):
     )
 
     m2, opt2, step = resume_candidate(
-        candidate_path=cand_path, hidden=32, blocks=1, lr=1e-2, device=device
+        candidate_path=cand_path, hidden=32, blocks=1, lr=1e-2, weight_decay=0.0, device=device
     )
     assert step == 7
     assert len(opt2.state) > 0

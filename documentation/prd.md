@@ -218,7 +218,13 @@ with `U = c_puct * P[a] * sqrt(N_sum) / (1 + N[a])`.
 * `c_puct`
 * root Dirichlet `(alpha, epsilon)` **self-play only**
 * `max_inflight_per_game` (async leaf evals)
-* `budget_reroll`, `budget_mark` and optional progressive rules
+  * Definition: maximum number of concurrent leaf-eval inference requests **per game**.
+  * Note: this is **not** the inference batch size; batch size is controlled by server-side `inference.max_batch` and `inference.max_wait_us`.
+* `budget_reroll`, `budget_mark`
+  * Definition: MCTS **simulations per move**, split by decision type:
+    * `budget_reroll`: sims used when `rerolls_left > 0` (keepmask vs mark decisions)
+    * `budget_mark`: sims used when `rerolls_left == 0` (must choose a mark)
+  * These are the primary per-move compute budget knobs in v1.
 
 ### 7.3 Temperature rule (from your learnings)
 
@@ -389,6 +395,16 @@ Every shard/checkpoint/log includes:
 * `action_space_id = oracle_keepmask_v1`
 * `ruleset_id = swedish_scandinavian_v1`
 
+### 10.4 Replay retention / capacity knobs (status)
+
+We currently store replay as append-only shards under `runs/<id>/replay/`. To avoid unbounded disk growth and to support stable “replay buffer” semantics, we define the following knobs:
+
+* **Replay buffer capacity**: `replay.capacity_shards` (or `replay.capacity_samples`)
+  * Definition: keep at most N shards (or M samples) worth of replay for training; prune older shards beyond capacity.
+  * Pruning policy should be deterministic and recorded (e.g. keep newest by shard sequence/mtime).
+  * **Status:** `replay.capacity_shards` is **implemented in the shared config schema** (Rust + Python) and editable in the TUI; **pruning behavior is not implemented yet**.
+  * **AC (later):** running multiple iterations does not grow replay storage unbounded; pruning is logged and reproducible.
+
 ---
 
 ## 11) Training (Python)
@@ -419,6 +435,25 @@ Artifacts:
 
 * `best.pt`, `candidate.pt`
 * `.meta.json` with config hash, schema ids, git hash, train step counters
+
+### 11.4 Training knobs (status)
+
+This section enumerates training-related config knobs and their implementation status.
+
+* **epochs**: `training.epochs` (supported in config schema)
+* **Weight decay (L2)**: `training.weight_decay` (**implemented**)
+  * Standard L2 regularization term applied by AdamW/SGD.
+  * **Status:** implemented end-to-end (schema + trainer uses AdamW).
+* **Training steps per iteration**: `training.steps_per_iteration` (optional alternative to epochs)
+  * Definition: number of optimizer updates per iteration (one “step” = one optimizer update on one batch).
+  * Relationship to epochs: `steps ≈ epochs * ceil(num_samples / batch_size)`; steps is dataset-size independent.
+  * Policy: if `steps_per_iteration` is set, it takes precedence over `epochs`.
+  * **Status:** `steps_per_iteration` is implemented end-to-end (schema + trainer reads it when present).
+* **Total iterations**: `controller.total_iterations` (or `run.total_iterations`)
+  * Definition: how many full iteration cycles to run (self-play → train → gate).
+  * This is orchestration/controller config (not a per-step training knob).
+  * **Status:** `controller.total_iterations` is implemented in the shared config schema, but the controller loop is not implemented yet.
+  * **AC (later):** controller stops after N iterations and records progress in `run.json`.
 
 ---
 
@@ -1027,6 +1062,95 @@ This epic exists because a “resumable trainer” requires more than just model
    * **AC:** you can see batch sizes, eval/sec, queue depths live.
 
 ---
+
+## Epic E13 — Terminal UI (ratatui) + in-process iteration controller
+
+**Goal:** provide a practical, fast feedback loop for local development and experimentation by offering a **terminal UI** to (a) configure runs, (b) start an iteration, and (c) monitor progress across self-play, training, and gating.
+
+**Background / motivation**
+
+The CLI pipeline works end-to-end, but it’s still friction-heavy to:
+
+* assemble configs safely without editing YAML by hand
+* keep a single run directory as the source of truth (config snapshot + `run.json` + metrics stream)
+* monitor iteration health (throughput, loss curves, gating summary) without “tailing files” manually
+
+This epic adds a **ratatui-based UI** and a small **Rust controller** that updates the run manifest fields so the UI can present a coherent view of progress.
+
+**What we have implemented so far (v1 scaffolding)**
+
+* `yz tui` command exists and starts a ratatui app (`yz-tui`)
+* Run picker + run directory creation under `runs/`
+* A full config editor screen (hybrid input) for all current fields in `yz_core::Config`
+  * saves overwriteably to `runs/<id>/config.draft.yaml` and reloads it on open
+* A simple dashboard view that tails `runs/<id>/logs/metrics.ndjson`
+* A controller crate (`yz-controller`) that can:
+  * create/ensure `run.json` + `config.yaml`
+  * update `run.json` controller fields (`controller_phase`, `controller_status`, timestamps)
+  * run **selfplay → gate** in-process
+  * run **selfplay → train → gate**, where **training is currently invoked as a Python subprocess**
+
+**Stories**
+
+1. **TUI scaffold + run picker (done)**
+
+   * Create `yz-tui` ratatui application with basic screens (Home/Config/Dashboard).
+   * **AC:** `cargo run --bin yz --features tui -- tui` starts, lists/creates runs in `runs/`, and exits without leaving terminal broken.
+
+2. **Config editor: full `yz_core::Config` form (done)**
+
+   * Full config form with hybrid input (steppers + typed fields) and validation.
+   * Persist overwriteably to `runs/<id>/config.draft.yaml` (TUI-owned) and reload on open.
+   * **AC:** user can configure a run without hand-editing YAML.
+
+3. **TUI starts an iteration (remaining)**
+
+   * Add UI actions to start/cancel an iteration using the controller.
+   * Run controller work on a background thread/task so the UI remains responsive.
+   * Persist progress to `runs/<id>/run.json` (phase/status + timestamps) so the UI can recover after restart.
+   * **AC:** from the TUI, pressing “Start” begins an iteration and `run.json` shows phase transitions (`selfplay → train → gate → done`) with status strings.
+
+4. **Dashboard: structured run status + metrics aggregation (remaining)**
+
+   * Replace “raw metrics tail only” with a structured dashboard:
+     * render controller phase/status from `run.json`
+     * show key counters (selfplay games, train_step, gate games, win_rate)
+     * parse `logs/metrics.ndjson` events and show aggregates (throughput, loss, gating summary)
+   * **AC:** dashboard displays a stable “current iteration view” without requiring manual log inspection.
+
+5. **Training orchestration decision (remaining)**
+
+   * Decide and document how training should be driven by the controller:
+     * **Option A (current):** invoke Python trainer as a subprocess (simple, robust)
+     * **Option B:** embed Python (PyO3) and run training in-process (single-process UX, heavier integration)
+   * Keep the PRD requirement: “UI uses in-process Rust controller (not subprocess spawning)” as the desired end state; the current implementation is a pragmatic stepping stone.
+   * **AC:** PRD and architecture clearly state the chosen approach and the controller implements it end-to-end.
+
+---
+
+## Epic E13.1 — Integrate newly added knobs (finish runtime behavior)
+
+**Goal:** complete recently added config knobs by implementing their runtime behavior (not just schema/UI).
+
+**Stories**
+
+1. **Replay pruning (`replay.capacity_shards`)**
+
+   * Implement deterministic pruning of `runs/<id>/replay/` after shard flush/close.
+   * Emit a metrics event (e.g. `replay_prune`) to `logs/metrics.ndjson` summarizing what was removed.
+   * **AC:** replay directory growth is bounded across iterations and pruning behavior is reproducible/auditable.
+
+2. **Controller iteration loop (`controller.total_iterations`)**
+
+   * Implement a controller loop that runs N full iterations (selfplay → train → gate), updating `run.json` counters/status.
+   * **AC:** controller stops after N iterations and the run is auditable from `run.json` + metrics.
+
+3. **Epochs vs steps semantics**
+
+   * Make trainer behavior explicit and deterministic:
+     * if `training.steps_per_iteration` is set, run exactly that many optimizer steps
+     * else derive steps from `training.epochs` and the replay snapshot size (or document a clear policy)
+   * **AC:** epochs/steps behavior is deterministic and logged.
 
 ## Epic R1 — Refactor: Code quality & tech debt
 

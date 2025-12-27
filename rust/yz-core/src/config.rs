@@ -29,6 +29,14 @@ pub struct Config {
     pub training: TrainingConfig,
     /// Gating evaluation settings.
     pub gating: GatingConfig,
+
+    /// Replay retention settings.
+    #[serde(default)]
+    pub replay: ReplayConfig,
+
+    /// Iteration controller / orchestration settings.
+    #[serde(default)]
+    pub controller: ControllerConfig,
 }
 
 /// Inference server configuration.
@@ -111,8 +119,46 @@ pub struct TrainingConfig {
     pub batch_size: u32,
     /// Learning rate.
     pub learning_rate: f64,
+    /// Weight decay (L2), applied by AdamW/SGD.
+    #[serde(default)]
+    pub weight_decay: f64,
     /// Number of training epochs per iteration.
     pub epochs: u32,
+    /// Optional number of optimizer steps per iteration (takes precedence over epochs).
+    #[serde(default)]
+    pub steps_per_iteration: Option<u32>,
+}
+
+/// Replay retention configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReplayConfig {
+    /// Keep at most N shards under runs/<id>/replay/ (prune older beyond capacity).
+    ///
+    /// If None, do not prune automatically.
+    #[serde(default)]
+    pub capacity_shards: Option<u32>,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self { capacity_shards: None }
+    }
+}
+
+/// Iteration controller configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ControllerConfig {
+    /// Optional number of full iterations to run (selfplay → train → gate).
+    ///
+    /// If None, controller runs until stopped externally.
+    #[serde(default)]
+    pub total_iterations: Option<u32>,
+}
+
+impl Default for ControllerConfig {
+    fn default() -> Self {
+        Self { total_iterations: None }
+    }
 }
 
 /// Gating (model evaluation) configuration.
@@ -196,7 +242,9 @@ impl Default for Config {
             training: TrainingConfig {
                 batch_size: 256,
                 learning_rate: 1e-3,
+                weight_decay: 0.0,
                 epochs: 1,
+                steps_per_iteration: None,
             },
             gating: GatingConfig {
                 games: 50,
@@ -206,6 +254,8 @@ impl Default for Config {
                 paired_seed_swap: true,
                 deterministic_chance: default_gating_deterministic_chance(),
             },
+            replay: ReplayConfig::default(),
+            controller: ControllerConfig::default(),
         }
     }
 }
@@ -226,11 +276,15 @@ mod tests {
         assert_eq!(config.mcts.budget_reroll, 100);
         assert_eq!(config.selfplay.workers, 4);
         assert_eq!(config.training.batch_size, 256);
+        assert_eq!(config.training.weight_decay, 0.0);
+        assert_eq!(config.training.steps_per_iteration, None);
         assert_eq!(config.gating.games, 100);
         assert_eq!(config.gating.seed, 0);
         assert_eq!(config.gating.seed_set_id.as_deref(), Some("dev_v1"));
         assert!(config.gating.paired_seed_swap);
         assert!(config.gating.deterministic_chance);
+        assert_eq!(config.replay.capacity_shards, None);
+        assert_eq!(config.controller.total_iterations, None);
     }
 
     #[test]

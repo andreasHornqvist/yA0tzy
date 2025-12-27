@@ -24,16 +24,29 @@ def add_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--resume", default=None, help="Path to candidate checkpoint to resume from")
     p.add_argument("--out", required=True, help="Output directory for checkpoints")
-    p.add_argument("--batch-size", type=int, default=256, help="Batch size")
+    p.add_argument("--batch-size", type=int, default=None, help="Batch size (overrides config)")
     p.add_argument("--num-workers", type=int, default=0, help="Torch DataLoader workers")
-    p.add_argument("--steps", type=int, default=200, help="Number of optimizer steps")
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Number of optimizer steps (overrides config training.steps_per_iteration)",
+    )
     p.add_argument("--shuffle-shards", action="store_true", help="Shuffle shards per epoch")
     p.add_argument(
         "--no-repeat", action="store_true", help="Iterate one pass over shards then stop"
     )
     p.add_argument("--device", default="cpu", help="Device: cpu/cuda")
     p.add_argument("--seed", type=int, default=0, help="RNG seed")
-    p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
+    p.add_argument(
+        "--lr", type=float, default=None, help="Adam/AdamW learning rate (overrides config)"
+    )
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="Weight decay (L2) for AdamW (overrides config)",
+    )
     p.add_argument("--value-lambda", type=float, default=1.0, help="Weight for value loss")
     p.add_argument("--hidden", type=int, default=256, help="Hidden size")
     p.add_argument("--blocks", type=int, default=2, help="Number of residual blocks")
@@ -59,23 +72,27 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
     return d
 
 
-def _init_model_and_opt(*, hidden: int, blocks: int, lr: float, device):
+def _init_model_and_opt(*, hidden: int, blocks: int, lr: float, weight_decay: float, device):
     import torch
 
     from ..model import YatzyNet, YatzyNetConfig
 
     model = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks)).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(weight_decay))
     return model, opt
 
 
-def init_from_best(*, best_path: Path, hidden: int, blocks: int, lr: float, device):
+def init_from_best(
+    *, best_path: Path, hidden: int, blocks: int, lr: float, weight_decay: float, device
+):
     """Initialize candidate from best weights with a fresh optimizer (no state)."""
     d = _load_checkpoint(best_path)
     if "model" not in d:
         raise RuntimeError(f"best checkpoint missing 'model' key: {best_path}")
 
-    model, opt = _init_model_and_opt(hidden=hidden, blocks=blocks, lr=lr, device=device)
+    model, opt = _init_model_and_opt(
+        hidden=hidden, blocks=blocks, lr=lr, weight_decay=weight_decay, device=device
+    )
     model.load_state_dict(d["model"])
 
     # Boundary requirement: starting from best must not reuse optimizer state.
@@ -85,13 +102,17 @@ def init_from_best(*, best_path: Path, hidden: int, blocks: int, lr: float, devi
     return model, opt, 0
 
 
-def resume_candidate(*, candidate_path: Path, hidden: int, blocks: int, lr: float, device):
+def resume_candidate(
+    *, candidate_path: Path, hidden: int, blocks: int, lr: float, weight_decay: float, device
+):
     """Resume candidate training by loading model + optimizer state."""
     d = _load_checkpoint(candidate_path)
     if "model" not in d:
         raise RuntimeError(f"candidate checkpoint missing 'model' key: {candidate_path}")
 
-    model, opt = _init_model_and_opt(hidden=hidden, blocks=blocks, lr=lr, device=device)
+    model, opt = _init_model_and_opt(
+        hidden=hidden, blocks=blocks, lr=lr, weight_decay=weight_decay, device=device
+    )
     model.load_state_dict(d["model"])
     if "optimizer" in d and d["optimizer"] is not None:
         opt.load_state_dict(d["optimizer"])
@@ -221,6 +242,38 @@ def run_from_args(args: argparse.Namespace) -> int:
 
     # E10.5S1: ensure run-local config snapshot exists.
     _ensure_run_config_snapshot(run_root=run_root, config_path=args.config)
+    # Prefer run-local config snapshot values when present, unless CLI overrides are provided.
+    cfg = None
+    cfg_path = run_root / "config.yaml"
+    if cfg_path.exists():
+        try:
+            from ..config import load_config
+
+            cfg = load_config(cfg_path)
+        except Exception:
+            cfg = None
+
+    if cfg is not None:
+        if args.batch_size is None:
+            args.batch_size = int(cfg.training.batch_size)
+        if args.lr is None:
+            args.lr = float(cfg.training.learning_rate)
+        if args.weight_decay is None:
+            args.weight_decay = float(cfg.training.weight_decay)
+        if args.steps is None:
+            s = cfg.training.steps_per_iteration
+            args.steps = int(s) if s is not None else None
+
+    # Final defaults (backwards compatible when no config is present).
+    if args.batch_size is None:
+        args.batch_size = 256
+    if args.lr is None:
+        args.lr = 1e-3
+    if args.weight_decay is None:
+        args.weight_decay = 0.0
+    if args.steps is None:
+        # If config didn't specify steps_per_iteration, keep existing default behavior.
+        args.steps = 200
     shard_files = None
     if not bool(args.no_snapshot):
         snapshot_path = (
@@ -266,6 +319,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             hidden=int(args.hidden),
             blocks=int(args.blocks),
             lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
             device=device,
         )
     else:
@@ -276,6 +330,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             hidden=int(args.hidden),
             blocks=int(args.blocks),
             lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
             device=device,
         )
 

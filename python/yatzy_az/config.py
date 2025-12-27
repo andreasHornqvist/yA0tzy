@@ -64,6 +64,40 @@ class TrainingConfig(BaseModel):
     batch_size: int = Field(description="Mini-batch size for gradient updates")
     learning_rate: float = Field(description="Learning rate")
     epochs: int = Field(description="Number of epochs per training iteration")
+    weight_decay: float = Field(
+        default=0.0, description="Weight decay (L2) for AdamW/SGD (0 disables)"
+    )
+    steps_per_iteration: int | None = Field(
+        default=None,
+        description=(
+            "Optional number of optimizer steps per iteration. "
+            "If set, takes precedence over epochs."
+        ),
+    )
+
+
+class ReplayConfig(BaseModel):
+    """Replay retention configuration."""
+
+    capacity_shards: int | None = Field(
+        default=None,
+        description=(
+            "Keep at most N replay shards under runs/<id>/replay/ (prune older). "
+            "If None, do not prune automatically."
+        ),
+    )
+
+
+class ControllerConfig(BaseModel):
+    """Iteration controller configuration."""
+
+    total_iterations: int | None = Field(
+        default=None,
+        description=(
+            "Optional number of full iterations to run (selfplay → train → gate). "
+            "If None, controller runs until stopped."
+        ),
+    )
 
 
 class GatingConfig(BaseModel):
@@ -103,6 +137,8 @@ class Config(BaseModel):
     selfplay: SelfplayConfig
     training: TrainingConfig
     gating: GatingConfig
+    replay: ReplayConfig = Field(default_factory=ReplayConfig)
+    controller: ControllerConfig = Field(default_factory=ControllerConfig)
 
 
 def load_config(path: str | Path) -> Config:
