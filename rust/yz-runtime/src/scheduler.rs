@@ -1,7 +1,10 @@
 use crate::game_task::{GameTask, StepStatus};
 use yz_mcts::InferBackend;
 use yz_replay::{ReplayError, ShardWriter};
-use yz_logging::{InferStatsV1, IterationStatsEventV1, MctsRootEventV1, NdjsonWriter, PiSummaryV1};
+use yz_logging::{
+    InferStatsV1, IterationStatsEventV1, MetricsMctsRootSampleV1, MetricsSelfplayIterV1,
+    MctsRootEventV1, NdjsonWriter, PiSummaryV1,
+};
 use yz_logging::VersionInfoV1;
 
 #[derive(Debug, Default, Clone)]
@@ -15,9 +18,12 @@ pub struct SchedulerStats {
 pub struct RunLoggers {
     pub run_id: String,
     pub v: VersionInfoV1,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
     pub root_log_every_n: u64,
     pub iter: NdjsonWriter,
     pub roots: NdjsonWriter,
+    pub metrics: NdjsonWriter,
 }
 
 pub struct Scheduler {
@@ -108,10 +114,32 @@ impl Scheduler {
                                     fallbacks: exec.search.fallbacks,
                                     pending_count_max: exec.search.pending_count_max as u64,
                                     pending_collisions: exec.search.pending_collisions,
-                                    pi,
+                                    pi: pi.clone(),
                                 };
                                 // Logging must not break replay writing; ignore errors in v1.
                                 let _ = lg.roots.write_event(&ev);
+
+                                let mev = MetricsMctsRootSampleV1 {
+                                    event: "mcts_root_sample",
+                                    ts_ms,
+                                    v: lg.v.clone(),
+                                    run_id: lg.run_id.clone(),
+                                    git_hash: lg.git_hash.clone(),
+                                    config_snapshot: lg.config_snapshot.clone(),
+                                    global_ply: self.global_ply,
+                                    game_id: exec.game_id,
+                                    game_ply: exec.game_ply,
+                                    player_to_move: exec.player_to_move,
+                                    rerolls_left: exec.rerolls_left,
+                                    dice: exec.dice,
+                                    chosen_action: exec.chosen_action,
+                                    root_value: exec.search.root_value,
+                                    fallbacks: exec.search.fallbacks,
+                                    pending_count_max: exec.search.pending_count_max as u64,
+                                    pending_collisions: exec.search.pending_collisions,
+                                    pi,
+                                };
+                                let _ = lg.metrics.write_event(&mev);
                             }
                         }
                     }
@@ -158,6 +186,32 @@ impl Scheduler {
                 },
             };
             let _ = lg.iter.write_event(&ev);
+
+            let mev = MetricsSelfplayIterV1 {
+                event: "selfplay_iter",
+                ts_ms,
+                v: lg.v.clone(),
+                run_id: lg.run_id.clone(),
+                git_hash: lg.git_hash.clone(),
+                config_snapshot: lg.config_snapshot.clone(),
+                tick: self.stats.ticks,
+                global_ply: self.global_ply,
+                tasks: self.tasks.len() as u64,
+                completed_games: self.completed_games_total,
+                steps: self.stats.steps,
+                would_block: self.stats.would_block,
+                terminal: self.stats.terminal,
+                infer: InferStatsV1 {
+                    inflight: s.inflight as u64,
+                    sent: s.sent,
+                    received: s.received,
+                    errors: s.errors,
+                    latency_p50_us: s.latency_us.summary.p50_us,
+                    latency_p95_us: s.latency_us.summary.p95_us,
+                    latency_mean_us: s.latency_us.summary.mean_us,
+                },
+            };
+            let _ = lg.metrics.write_event(&mev);
         }
         Ok(())
     }

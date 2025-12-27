@@ -12,6 +12,7 @@ import sys
 from . import __version__
 from .server import server as infer_server
 from .trainer import train as train_mod
+from . import wandb_sync
 
 
 def cmd_infer_server(args: argparse.Namespace) -> int:
@@ -29,6 +30,11 @@ def cmd_controller(args: argparse.Namespace) -> int:
     """Run one full iteration end-to-end (optional orchestration)."""
     print("Controller (not yet implemented)")
     return 0
+
+
+def cmd_wandb_sync(args: argparse.Namespace) -> int:
+    """Consume runs/<id>/logs/metrics.ndjson and emit W&B-friendly JSON."""
+    return wandb_sync.run_from_args(args)
 
 
 def main() -> int:
@@ -70,6 +76,14 @@ def main() -> int:
         help="Run one iteration end-to-end (self-play + train + gate)",
     )
     p_ctrl.set_defaults(func=cmd_controller)
+
+    # wandb-sync
+    p_wandb = subparsers.add_parser(
+        "wandb-sync",
+        help="Read runs/<id>/logs/metrics.ndjson and emit W&B-friendly JSON (stdout)",
+    )
+    wandb_sync.add_args(p_wandb)
+    p_wandb.set_defaults(func=cmd_wandb_sync)
 
     args = parser.parse_args()
 

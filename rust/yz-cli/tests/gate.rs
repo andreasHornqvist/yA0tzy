@@ -173,6 +173,15 @@ gating:
     assert!(v.get("oracle_match_rate_mark").is_some());
     assert!(v.get("oracle_match_rate_reroll").is_some());
     assert!(v.get("oracle_keepall_ignored").is_some());
+
+    // E10.5S2: metrics.ndjson includes gate_summary.
+    let metrics = run_dir.join("logs").join("metrics.ndjson");
+    assert!(metrics.exists());
+    let s = fs::read_to_string(metrics).unwrap();
+    assert!(
+        s.lines().any(|l| l.contains(r#""event":"gate_summary""#)),
+        "expected gate_summary event in metrics.ndjson"
+    );
 }
 
 

@@ -375,6 +375,8 @@ OPTIONS:
     let mut loggers = yz_runtime::RunLoggers {
         run_id,
         v,
+        git_hash: manifest.git_hash.clone(),
+        config_snapshot: manifest.config_snapshot.clone(),
         root_log_every_n: root_log_every,
         iter: yz_logging::NdjsonWriter::open_append_with_flush(iter_log_path, log_flush_every)
             .unwrap_or_else(|e| {
@@ -386,6 +388,14 @@ OPTIONS:
                 eprintln!("Failed to create root log: {e:?}");
                 process::exit(1);
             }),
+        metrics: yz_logging::NdjsonWriter::open_append_with_flush(
+            logs_dir.join("metrics.ndjson"),
+            log_flush_every,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create metrics log: {e:?}");
+            process::exit(1);
+        }),
     };
 
     let mut completed_games: u32 = 0;
@@ -430,6 +440,7 @@ OPTIONS:
     });
     let _ = loggers.iter.flush();
     let _ = loggers.roots.flush();
+    let _ = loggers.metrics.flush();
 
     // Final manifest update.
     manifest.selfplay_games_completed = completed_games as u64;
@@ -601,6 +612,43 @@ OPTIONS:
                 }
 
                 let _ = yz_logging::write_manifest_atomic(&run_json, &m);
+
+                // E10.5S2: unified metrics stream.
+                let logs_dir = run_dir.join(&m.logs_dir);
+                let _ = std::fs::create_dir_all(&logs_dir);
+                let metrics_path = logs_dir.join("metrics.ndjson");
+                if let Ok(mut w) = yz_logging::NdjsonWriter::open_append(metrics_path) {
+                    let ev = yz_logging::MetricsGateSummaryV1 {
+                        event: "gate_summary",
+                        ts_ms: yz_logging::now_ms(),
+                        v: yz_logging::VersionInfoV1 {
+                            protocol_version: m.protocol_version,
+                            feature_schema_id: m.feature_schema_id,
+                            action_space_id: "oracle_keepmask_v1",
+                            ruleset_id: "swedish_scandinavian_v1",
+                        },
+                        run_id: m.run_id.clone(),
+                        git_hash: m.git_hash.clone(),
+                        config_snapshot: m.config_snapshot.clone(),
+                        decision: decision.to_string(),
+                        games: report.games,
+                        wins: report.cand_wins,
+                        losses: report.cand_losses,
+                        draws: report.draws,
+                        win_rate: wr,
+                        mean_score_diff: report.mean_score_diff(),
+                        score_diff_se: report.score_diff_se,
+                        score_diff_ci95_low: report.score_diff_ci95_low,
+                        score_diff_ci95_high: report.score_diff_ci95_high,
+                        seeds_hash: report.seeds_hash.clone(),
+                        oracle_match_rate_overall: report.oracle_match_rate_overall,
+                        oracle_match_rate_mark: report.oracle_match_rate_mark,
+                        oracle_match_rate_reroll: report.oracle_match_rate_reroll,
+                        oracle_keepall_ignored: report.oracle_keepall_ignored,
+                    };
+                    let _ = w.write_event(&ev);
+                    let _ = w.flush();
+                }
             }
             Err(e) => {
                 eprintln!("Warning: failed to update run manifest: {e:?}");

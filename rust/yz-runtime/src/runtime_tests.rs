@@ -149,10 +149,13 @@ fn scheduler_writes_ndjson_iteration_and_root_logs() {
             action_space_id: "oracle_keepmask_v1",
             ruleset_id: "swedish_scandinavian_v1",
         },
+        git_hash: None,
+        config_snapshot: Some("config.yaml".to_string()),
         root_log_every_n: 1,
         iter: yz_logging::NdjsonWriter::open_append(logs_dir.join("iteration_stats.ndjson"))
             .unwrap(),
         roots: yz_logging::NdjsonWriter::open_append(logs_dir.join("mcts_roots.ndjson")).unwrap(),
+        metrics: yz_logging::NdjsonWriter::open_append(logs_dir.join("metrics.ndjson")).unwrap(),
     };
 
     for _ in 0..200 {
@@ -167,14 +170,17 @@ fn scheduler_writes_ndjson_iteration_and_root_logs() {
     writer.finish().unwrap();
     loggers.iter.flush().unwrap();
     loggers.roots.flush().unwrap();
+    loggers.metrics.flush().unwrap();
 
     let iter_path = logs_dir.join("iteration_stats.ndjson");
     let roots_path = logs_dir.join("mcts_roots.ndjson");
+    let metrics_path = logs_dir.join("metrics.ndjson");
     assert!(iter_path.exists());
     assert!(roots_path.exists());
+    assert!(metrics_path.exists());
 
     // Validate that all complete lines are valid JSON objects.
-    for p in [iter_path, roots_path] {
+    for p in [iter_path, roots_path, metrics_path] {
         let s = std::fs::read_to_string(&p).unwrap();
         let mut ok = 0usize;
         for line in s.lines() {

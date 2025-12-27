@@ -198,6 +198,84 @@ pub struct MctsRootEventV1 {
     pub pi: PiSummaryV1,
 }
 
+// -------------------------
+// E10.5S2: Unified metrics stream (runs/<id>/logs/metrics.ndjson)
+// -------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSelfplayIterV1 {
+    pub event: &'static str, // "selfplay_iter"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub tick: u64,
+    pub global_ply: u64,
+    pub tasks: u64,
+    pub completed_games: u64,
+    pub steps: u64,
+    pub would_block: u64,
+    pub terminal: u64,
+    pub infer: InferStatsV1,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsMctsRootSampleV1 {
+    pub event: &'static str, // "mcts_root_sample"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub global_ply: u64,
+
+    pub game_id: u64,
+    pub game_ply: u32,
+    pub player_to_move: u8,
+    pub rerolls_left: u8,
+    pub dice: [u8; 5],
+
+    pub chosen_action: u8,
+    pub root_value: f32,
+    pub fallbacks: u32,
+    pub pending_count_max: u64,
+    pub pending_collisions: u32,
+
+    pub pi: PiSummaryV1,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsGateSummaryV1 {
+    pub event: &'static str, // "gate_summary"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub decision: String,
+    pub games: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub draws: u32,
+    pub win_rate: f64,
+
+    pub mean_score_diff: f64,
+    pub score_diff_se: f64,
+    pub score_diff_ci95_low: f64,
+    pub score_diff_ci95_high: f64,
+
+    pub seeds_hash: String,
+
+    pub oracle_match_rate_overall: f64,
+    pub oracle_match_rate_mark: f64,
+    pub oracle_match_rate_reroll: f64,
+    pub oracle_keepall_ignored: u64,
+}
+
 #[derive(Debug)]
 pub enum NdjsonError {
     Io(io::Error),
@@ -345,6 +423,51 @@ mod tests {
         let vals = read_ndjson_lenient(&path);
         assert_eq!(vals.len(), 1);
         assert_eq!(vals[0]["x"], 1);
+    }
+
+    #[test]
+    fn metrics_gate_summary_serializes_as_one_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.ndjson");
+        let mut w = NdjsonWriter::open_append(&path).unwrap();
+
+        let ev = MetricsGateSummaryV1 {
+            event: "gate_summary",
+            ts_ms: now_ms(),
+            v: VersionInfoV1 {
+                protocol_version: 1,
+                feature_schema_id: 1,
+                action_space_id: "oracle_keepmask_v1",
+                ruleset_id: "swedish_scandinavian_v1",
+            },
+            run_id: "r".to_string(),
+            git_hash: None,
+            config_snapshot: Some("config.yaml".to_string()),
+            decision: "promote".to_string(),
+            games: 2,
+            wins: 1,
+            losses: 1,
+            draws: 0,
+            win_rate: 0.5,
+            mean_score_diff: 0.0,
+            score_diff_se: 1.0,
+            score_diff_ci95_low: -2.0,
+            score_diff_ci95_high: 2.0,
+            seeds_hash: "abc".to_string(),
+            oracle_match_rate_overall: 0.1,
+            oracle_match_rate_mark: 0.2,
+            oracle_match_rate_reroll: 0.3,
+            oracle_keepall_ignored: 4,
+        };
+        w.write_event(&ev).unwrap();
+        w.flush().unwrap();
+
+        let vals = read_ndjson_lenient(&path);
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0]["event"], "gate_summary");
+        assert_eq!(vals[0]["games"], 2);
+        assert_eq!(vals[0]["decision"], "promote");
+        assert_eq!(vals[0]["oracle_keepall_ignored"], 4);
     }
 
     #[test]

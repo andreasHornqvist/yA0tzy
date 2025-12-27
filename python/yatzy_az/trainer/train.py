@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +134,66 @@ def _ensure_run_config_snapshot(*, run_root: Path, config_path: Path | None) -> 
         pass
 
 
+def _append_metrics_train_step(
+    *,
+    run_root: Path,
+    train_step: int,
+    loss_total: float,
+    loss_policy: float,
+    loss_value: float,
+    entropy: float,
+    lr: float,
+    throughput_steps_s: float,
+) -> None:
+    """Append a train_step metrics event to runs/<id>/logs/metrics.ndjson (best-effort)."""
+    run_root = Path(run_root)
+    if not (run_root / "run.json").exists():
+        return
+
+    logs_dir = run_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = logs_dir / "metrics.ndjson"
+
+    run_id = run_root.name
+    git_hash = None
+    config_snapshot = "config.yaml" if (run_root / "config.yaml").exists() else None
+    try:
+        from ..run_manifest import load_manifest
+
+        m = load_manifest(run_root)
+        run_id = str(m.get("run_id", run_id))
+        git_hash = m.get("git_hash")
+        config_snapshot = m.get("config_snapshot", config_snapshot)
+    except Exception:
+        pass
+
+    from ..replay_dataset import FEATURE_SCHEMA_ID, PROTOCOL_VERSION, RULESET_ID
+
+    ev = {
+        "event": "train_step",
+        "ts_ms": int(time.time() * 1000),
+        "run_id": run_id,
+        "v": {
+            "protocol_version": int(PROTOCOL_VERSION),
+            "feature_schema_id": int(FEATURE_SCHEMA_ID),
+            "action_space_id": "oracle_keepmask_v1",
+            "ruleset_id": str(RULESET_ID),
+        },
+        "git_hash": git_hash,
+        "config_snapshot": config_snapshot,
+        "train_step": int(train_step),
+        "loss_total": float(loss_total),
+        "loss_policy": float(loss_policy),
+        "loss_value": float(loss_value),
+        "entropy": float(entropy),
+        "lr": float(lr),
+        "throughput_steps_s": float(throughput_steps_s),
+    }
+
+    with metrics_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
 def run_from_args(args: argparse.Namespace) -> int:
     try:
         import torch
@@ -221,6 +282,8 @@ def run_from_args(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     it = iter(dl)
+    last_log_t = time.perf_counter()
+    last_log_step = start_step
     for step in range(start_step + 1, start_step + int(args.steps) + 1):
         try:
             x, legal, pi, z, _z_margin = next(it)
@@ -256,10 +319,28 @@ def run_from_args(args: argparse.Namespace) -> int:
             with torch.no_grad():
                 p = torch.softmax(logits, dim=1)
                 ent = -(p * torch.log(p.clamp_min(1e-12))).sum(dim=1).mean()
+                now_t = time.perf_counter()
+                dt = max(1e-9, now_t - last_log_t)
+                steps_done = step - last_log_step
+                throughput = float(steps_done) / float(dt)
+                last_log_t = now_t
+                last_log_step = step
                 print(
                     f"step={step} loss={loss.item():.4f} "
                     f"loss_pi={loss_pi.item():.4f} loss_v={loss_v.item():.4f} "
                     f"entropy={ent.item():.3f} v_mean={v.mean().item():.3f}"
+                )
+
+                # E10.5S2: unified metrics stream (best-effort).
+                _append_metrics_train_step(
+                    run_root=run_root,
+                    train_step=int(step),
+                    loss_total=float(loss.item()),
+                    loss_policy=float(loss_pi.item()),
+                    loss_value=float(loss_v.item()),
+                    entropy=float(ent.item()),
+                    lr=float(args.lr),
+                    throughput_steps_s=float(throughput),
                 )
 
     ckpt_path = out_dir / "candidate.pt"
