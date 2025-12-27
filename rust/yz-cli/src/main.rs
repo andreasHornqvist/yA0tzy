@@ -889,17 +889,37 @@ fn cmd_bench(args: &[String]) {
 
 USAGE:
     yz bench [<cargo args>...]
+    yz bench e2e -- [OPTIONS]
 
 NOTES:
     - This is a thin wrapper around:
         cargo bench -p yz-bench <cargo args...>
+    - E2E benchmark is a separate harness crate:
+        cargo run -p yz-bench-e2e -- [OPTIONS]
 
 EXAMPLES:
     yz bench
     yz bench --bench scoring
     yz bench --bench scoring -- --warm-up-time 0.5 --measurement-time 1.0
+    yz bench e2e -- --seconds 10 --parallel 8 --simulations 64 --max-inflight 4 --chance deterministic
 "#
         );
+        return;
+    }
+
+    // Subcommand: yz bench e2e -- [opts]
+    if args.first().map(|s| s.as_str()) == Some("e2e") {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("run").arg("-p").arg("yz-bench-e2e").arg("--");
+        cmd.args(&args[1..]);
+        let status = cmd.status().unwrap_or_else(|e| {
+            eprintln!("Failed to run e2e bench harness: {e}");
+            eprintln!("Hint: ensure Rust tooling is installed and `cargo` is on PATH.");
+            process::exit(1);
+        });
+        if !status.success() {
+            process::exit(status.code().unwrap_or(1));
+        }
         return;
     }
 

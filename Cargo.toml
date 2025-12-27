@@ -12,6 +12,7 @@ members = [
   "rust/yz-logging",
   "rust/yz-cli",
   "rust/yz-bench",
+  "rust/yz-bench-e2e",
   "rust/swedish_yatzy_dp",
 ]
 

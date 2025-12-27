@@ -86,6 +86,7 @@ uv run pytest                        # Run tests (future)
 # Benchmarks
 cargo bench -p yz-bench              # Run Criterion microbenches
 cargo run --bin yz -- bench --bench scoring     # Run via yz wrapper (passes args to cargo bench)
+cargo run --bin yz -- bench e2e -- --seconds 10 --parallel 8 --simulations 64 --max-inflight 4 --chance deterministic
 ```
 
 ### CI
