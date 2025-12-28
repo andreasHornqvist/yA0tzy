@@ -91,6 +91,13 @@ uv run pytest                        # Run tests (future)
 # Terminal UI
 cargo run -p yz-cli --bin yz -- tui
 
+# Inference server (Python)
+cd python
+uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best dummy --cand dummy
+# Real checkpoints (E6.5):
+uv run python -m yatzy_az model-init --out runs/<id>/models/best.pt --hidden 256 --blocks 2
+uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best path:runs/<id>/models/best.pt --cand path:runs/<id>/models/candidate.pt
+
 # Benchmarks
 cargo bench -p yz-bench              # Run Criterion microbenches
 cargo run --bin yz -- bench --bench scoring     # Run via yz wrapper (passes args to cargo bench)

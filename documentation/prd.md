@@ -856,6 +856,7 @@ However, the current server-side “models” are **dummy/stub** implementations
      * loads `YatzyNet` from a checkpoint path
      * moves model to `--device cpu|cuda`
      * runs batched inference: input `[B, F]` → outputs `policy_logits[B, A]`, `value[B]`
+   * Note: CLI wiring for `path:...` model specs is handled in **E6.5S3**; this story focuses on the backend implementation + tests.
    * **AC:** unit test verifies shapes, dtypes, finiteness, and deterministic outputs for fixed weights.
 
 3. **Server CLI: real model specs**
@@ -864,13 +865,16 @@ However, the current server-side “models” are **dummy/stub** implementations
      * `--best path:/abs/to/best.pt`
      * `--cand path:/abs/to/candidate.pt`
      * retain `dummy:...` for testing
+   * **Spec grammar (v1):**
+     * `dummy` or `dummy:<float>`
+     * `path:<checkpoint_path>`
    * **AC:** server boots with real checkpoints and serves both model_ids correctly.
 
 4. **“New run” bootstrap: initialize best model if missing**
 
    * Provide a small utility to create a fresh `best.pt` for a new run, e.g.:
      * `python -m yatzy_az model-init --out runs/<id>/models/best.pt --hidden ... --blocks ...`
-   * Optionally: allow `infer-server` to auto-init if `--best` points to a missing path and `--init-if-missing` is passed.
+   * Note: v1 implements **explicit bootstrap** via `model-init` (no infer-server auto-init flag).
    * **AC:** a brand new run directory can be started without preexisting checkpoints.
 
 5. **Performance + batching correctness**

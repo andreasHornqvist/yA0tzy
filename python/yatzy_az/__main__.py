@@ -8,11 +8,13 @@ Usage:
 
 import argparse
 import sys
+from pathlib import Path
 
 from . import __version__
 from .server import server as infer_server
 from .trainer import train as train_mod
 from . import wandb_sync
+from .model.init import init_model_checkpoint
 
 
 def cmd_infer_server(args: argparse.Namespace) -> int:
@@ -35,6 +37,14 @@ def cmd_controller(args: argparse.Namespace) -> int:
 def cmd_wandb_sync(args: argparse.Namespace) -> int:
     """Consume runs/<id>/logs/metrics.ndjson and emit W&B-friendly JSON."""
     return wandb_sync.run_from_args(args)
+
+
+def cmd_model_init(args: argparse.Namespace) -> int:
+    """Create a fresh best.pt checkpoint for a new run."""
+    out = Path(args.out)
+    init_model_checkpoint(out, hidden=int(args.hidden), blocks=int(args.blocks))
+    print(f"wrote: {out}")
+    return 0
 
 
 def main() -> int:
@@ -84,6 +94,21 @@ def main() -> int:
     )
     wandb_sync.add_args(p_wandb)
     p_wandb.set_defaults(func=cmd_wandb_sync)
+
+    # model-init
+    p_init = subparsers.add_parser(
+        "model-init",
+        help="Initialize a fresh best.pt checkpoint for a new run",
+    )
+    p_init.add_argument("--out", required=True, help="Output checkpoint path (e.g. runs/<id>/models/best.pt)")
+    p_init.add_argument("--hidden", type=int, default=256, help="Hidden size")
+    p_init.add_argument("--blocks", type=int, default=2, help="Number of residual blocks")
+    p_init.add_argument(
+        "--device",
+        default="cpu",
+        help="Initialization device (cpu/cuda). Note: checkpoint is saved on CPU.",
+    )
+    p_init.set_defaults(func=cmd_model_init)
 
     args = parser.parse_args()
 

@@ -36,6 +36,7 @@ def _parse_bind(bind: str) -> tuple[str, str]:
 @dataclass(slots=True)
 class ServerConfig:
     bind: str
+    device: str
     max_batch: int
     max_wait_us: int
     print_stats_every_s: float
@@ -78,8 +79,8 @@ async def serve(config: ServerConfig) -> None:
 
     start_s = now_s()
     model_by_id = {
-        int(config.best_id): build_model(config.best_spec),
-        int(config.cand_id): build_model(config.cand_spec),
+        int(config.best_id): build_model(config.best_spec, device=config.device),
+        int(config.cand_id): build_model(config.cand_spec, device=config.device),
     }
     batcher = Batcher(model_by_id, max_batch=config.max_batch, max_wait_us=config.max_wait_us)
     batcher_task = asyncio.create_task(batcher.run())
@@ -176,9 +177,15 @@ def add_args(p: argparse.ArgumentParser) -> None:
     # Note: `--bind` is defined in the top-level CLI for help grouping.
     p.add_argument("--max-batch", type=int, default=256, help="Batch flush size threshold")
     p.add_argument("--max-wait-us", type=int, default=2000, help="Max queue wait before flush")
-    p.add_argument("--best", default="dummy", help="Best model spec (e.g. dummy or dummy:0.1)")
     p.add_argument(
-        "--cand", default="dummy", help="Candidate model spec (e.g. dummy or dummy:-0.1)"
+        "--best",
+        default="dummy",
+        help="Best model spec (dummy, dummy:0.1, or path:/abs/to/best.pt)",
+    )
+    p.add_argument(
+        "--cand",
+        default="dummy",
+        help="Candidate model spec (dummy, dummy:-0.1, or path:/abs/to/candidate.pt)",
     )
     p.add_argument("--best-id", type=int, default=0, help="model_id for best")
     p.add_argument("--cand-id", type=int, default=1, help="model_id for candidate")
@@ -199,6 +206,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 def run_from_args(args: argparse.Namespace) -> int:
     cfg = ServerConfig(
         bind=args.bind,
+        device=args.device,
         max_batch=args.max_batch,
         max_wait_us=args.max_wait_us,
         print_stats_every_s=args.print_stats_every_s,
