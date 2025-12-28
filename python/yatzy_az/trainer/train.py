@@ -434,6 +434,7 @@ def run_from_args(args: argparse.Namespace) -> int:
     ckpt_path = out_dir / "candidate.pt"
     torch.save(
         {
+            "checkpoint_version": 1,
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "config": {

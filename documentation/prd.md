@@ -846,6 +846,8 @@ However, the current server-side “models” are **dummy/stub** implementations
    * Define the exact checkpoint payload expected by the inference server:
      * `model` state_dict
      * minimal `config` (hidden/blocks, schema ids) or embed enough metadata to reconstruct `YatzyNet`
+     * **`checkpoint_version`** (required, v1 = `1`)
+     * **Required meta compatibility fields:** `protocol_version`, `feature_schema_id`, `ruleset_id`, `action_space_a`
    * **AC:** inference server can load `runs/<id>/models/best.pt` written by the trainer and validate schema compatibility.
 
 2. **TorchModel backend in inference server**
@@ -1173,7 +1175,7 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
    * Persist progress to `runs/<id>/run.json` (phase/status + timestamps) so the UI can recover after restart.
    * **AC:** from the TUI, pressing “Start” begins an iteration and `run.json` shows phase transitions (`selfplay → train → gate → done`) with status strings.
 
-4. **Dashboard: iteration history + live progress (remaining)**
+4. **Dashboard: iteration history + live progress (done)**
 
    * Replace “raw metrics tail only” with a two-panel dashboard driven by `run.json`:
      * **Left panel (across iterations):** show per-iteration summaries: promotion decision, loss summaries, oracle match rates, win_rate.

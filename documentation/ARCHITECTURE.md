@@ -174,6 +174,7 @@ See `.github/workflows/ci.yml` for details.
 | Training loop | `python/yatzy_az/trainer/` |
 | Metrics consumer (JSON-only, W&B-friendly) | `python/yatzy_az/wandb_sync.py` (`python -m yatzy_az wandb-sync --run runs/<id>/`) |
 | Python inference server (asyncio + batching + metrics) | `python/yatzy_az/server/` |
+| Inference checkpoint contract (E6.5S1) | `python/yatzy_az/server/checkpoint.py` |
 | Runtime scheduler + GameTask | `rust/yz-runtime/` (`src/game_task.rs`, `src/scheduler.rs`) |
 | CLI commands (Rust) | `rust/yz-cli/src/main.rs` |
 | Terminal UI (ratatui) | `rust/yz-tui/` |
@@ -213,7 +214,14 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard is moving toward a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/gating progress bars) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13 (dashboard polish + training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
+Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard now supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/gating progress bars) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13 (training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
+
+### TUI dashboard: source of truth (v1)
+- Progress bars and iteration summaries are driven primarily by `runs/<id>/run.json`:
+  - `controller_iteration_idx` selects the current entry in `iterations[]`
+  - `iterations[].selfplay.games_completed/games_target` drives self-play progress
+  - `iterations[].gate.games_completed/games_target` drives gating progress
+  - training loss scalars are stored as the latest values in `run.json` (best-effort) and copied into `iterations[]` by the controller
 
 ---
 
