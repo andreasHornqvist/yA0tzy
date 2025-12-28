@@ -889,6 +889,7 @@ However, the current server-side “models” are **dummy/stub** implementations
 6. **Compatibility tests (Rust client ↔ Python real model)**
 
    * Add an integration test that starts the Python server with a tiny real model and runs a short Rust MCTS search end-to-end.
+   * Note: the test is **opt-in** via `YZ_PY_E2E=1` to keep CI stable.
    * **AC:** `cargo test --workspace` includes at least one end-to-end test proving the real inference path works.
 
 ## Epic E7 — Self-play runtime + replay + NDJSON logs (yz-runtime/yz-replay/yz-logging)

@@ -80,6 +80,9 @@ cargo run --bin yz -- --help    # Run CLI
 cargo fmt --check               # Check formatting
 cargo clippy --workspace -- -D warnings  # Lint
 
+# Opt-in Rust↔Python inference e2e test (E6.5S6)
+YZ_PY_E2E=1 cargo test -p yz-mcts --test python_infer_e2e
+
 # Python
 cd python
 uv sync --all-extras                 # Install all dependencies (including dev)
