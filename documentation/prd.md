@@ -821,6 +821,69 @@ Below are epics with implementable stories. Each story includes **deliverable + 
 
 ---
 
+## Epic E6.5 — Proper inference server (real PyTorch model: YatzyNet)
+
+**Goal:** replace dummy inference with a **real PyTorch-backed inference path** so self-play, training, and gating can run end-to-end with actual NN policy/value outputs (CPU now, GPU later) while keeping protocol v1 and batching unchanged.
+
+**Motivation / current status**
+
+We already have a Python asyncio server with:
+
+* protocol v1 compatibility (Rust ↔ Python)
+* dynamic batching + multi-model routing (best vs candidate)
+* Prometheus `/metrics`
+
+However, the current server-side “models” are **dummy/stub** implementations. This epic adds the **real model backend**:
+
+* load `YatzyNet` checkpoints (`best.pt`, `candidate.pt`)
+* run forward passes on the configured device
+* return `(policy_logits[A], value)` (and optional margin later)
+
+**Stories**
+
+1. **Checkpoint format contract for inference**
+
+   * Define the exact checkpoint payload expected by the inference server:
+     * `model` state_dict
+     * minimal `config` (hidden/blocks, schema ids) or embed enough metadata to reconstruct `YatzyNet`
+   * **AC:** inference server can load `runs/<id>/models/best.pt` written by the trainer and validate schema compatibility.
+
+2. **TorchModel backend in inference server**
+
+   * Implement a `TorchModel` (or similar) in `python/yatzy_az/server/` that:
+     * loads `YatzyNet` from a checkpoint path
+     * moves model to `--device cpu|cuda`
+     * runs batched inference: input `[B, F]` → outputs `policy_logits[B, A]`, `value[B]`
+   * **AC:** unit test verifies shapes, dtypes, finiteness, and deterministic outputs for fixed weights.
+
+3. **Server CLI: real model specs**
+
+   * Extend `python -m yatzy_az infer-server` to accept real checkpoint specs, e.g.:
+     * `--best path:/abs/to/best.pt`
+     * `--cand path:/abs/to/candidate.pt`
+     * retain `dummy:...` for testing
+   * **AC:** server boots with real checkpoints and serves both model_ids correctly.
+
+4. **“New run” bootstrap: initialize best model if missing**
+
+   * Provide a small utility to create a fresh `best.pt` for a new run, e.g.:
+     * `python -m yatzy_az model-init --out runs/<id>/models/best.pt --hidden ... --blocks ...`
+   * Optionally: allow `infer-server` to auto-init if `--best` points to a missing path and `--init-if-missing` is passed.
+   * **AC:** a brand new run directory can be started without preexisting checkpoints.
+
+5. **Performance + batching correctness**
+
+   * Ensure the TorchModel path integrates with the existing batcher efficiently:
+     * no per-item python overhead inside the model forward
+     * uses `torch.inference_mode()`
+     * uses contiguous tensors and single device transfer per batch
+   * **AC:** Prometheus shows meaningful batch sizes and eval/sec with multiple concurrent Rust games.
+
+6. **Compatibility tests (Rust client ↔ Python real model)**
+
+   * Add an integration test that starts the Python server with a tiny real model and runs a short Rust MCTS search end-to-end.
+   * **AC:** `cargo test --workspace` includes at least one end-to-end test proving the real inference path works.
+
 ## Epic E7 — Self-play runtime + replay + NDJSON logs (yz-runtime/yz-replay/yz-logging)
 
 **Goal:** first end-to-end pipeline without training.

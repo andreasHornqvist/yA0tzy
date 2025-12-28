@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use thiserror::Error;
 use yz_logging::RunManifestV1;
@@ -44,6 +46,12 @@ pub enum ControllerError {
     Fs(#[from] std::io::Error),
     #[error("replay error: {0}")]
     Replay(#[from] yz_replay::ReplayError),
+    #[error("infer backend error: {0}")]
+    InferBackend(#[from] yz_mcts::InferBackendError),
+    #[error("gate error: {0}")]
+    Gate(#[from] yz_eval::GateError),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Minimal controller handle (phase/status updates only, v1).
@@ -67,6 +75,7 @@ impl IterationController {
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
+
 
     pub fn set_phase(&self, phase: Phase, status: impl Into<String>) -> Result<(), ControllerError> {
         let run_json = self.run_dir.join("run.json");
@@ -96,7 +105,33 @@ impl IterationController {
     }
 }
 
-fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
+#[derive(Debug)]
+pub struct IterationHandle {
+    cancel: Arc<AtomicBool>,
+    join: JoinHandle<Result<(), ControllerError>>,
+}
+
+impl IterationHandle {
+    pub fn cancel_hard(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+
+    pub fn join(self) -> Result<(), ControllerError> {
+        match self.join.join() {
+            Ok(r) => r,
+            Err(_) => Err(ControllerError::Fs(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "controller thread panicked",
+            ))),
+        }
+    }
+}
+
+fn connect_infer_backend(endpoint: &str) -> Result<yz_mcts::InferBackend, ControllerError> {
     let opts = yz_infer::ClientOptions {
         max_inflight_total: 8192,
         max_outbound_queue: 8192,
@@ -105,7 +140,7 @@ fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
     if let Some(rest) = endpoint.strip_prefix("unix://") {
         #[cfg(unix)]
         {
-            return yz_mcts::InferBackend::connect_uds(rest, 0, opts).unwrap();
+            return Ok(yz_mcts::InferBackend::connect_uds(rest, 0, opts)?);
         }
         #[cfg(not(unix))]
         {
@@ -113,7 +148,7 @@ fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
         }
     }
     if let Some(rest) = endpoint.strip_prefix("tcp://") {
-        return yz_mcts::InferBackend::connect_tcp(rest, 0, opts).unwrap();
+        return Ok(yz_mcts::InferBackend::connect_tcp(rest, 0, opts)?);
     }
     panic!("Unsupported infer endpoint: {endpoint}");
 }
@@ -201,10 +236,10 @@ pub fn run_selfplay_then_gate(
     let mut manifest = ensure_manifest(run_dir, &cfg)?;
 
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
-    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest)?;
+    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
-    run_gate(run_dir, &cfg, infer_endpoint)?;
+    run_gate(run_dir, &cfg, infer_endpoint, &ctrl)?;
 
     ctrl.set_phase(Phase::Done, "done")?;
     Ok(())
@@ -225,19 +260,91 @@ pub fn run_iteration(
     let mut manifest = ensure_manifest(run_dir, &cfg)?;
 
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
-    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest)?;
+    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl)?;
 
     ctrl.set_phase(Phase::Train, "starting train")?;
-    run_train_subprocess(run_dir, python_exe)?;
+    run_train_subprocess(run_dir, python_exe, &ctrl)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
-    run_gate(run_dir, &cfg, infer_endpoint)?;
+    run_gate(run_dir, &cfg, infer_endpoint, &ctrl)?;
 
     ctrl.set_phase(Phase::Done, "done")?;
     Ok(())
 }
 
-fn run_train_subprocess(run_dir: &Path, python_exe: &str) -> Result<(), ControllerError> {
+pub fn spawn_iteration(
+    run_dir: impl AsRef<Path>,
+    cfg: yz_core::Config,
+    infer_endpoint: String,
+    python_exe: String,
+) -> IterationHandle {
+    let run_dir = run_dir.as_ref().to_path_buf();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel2 = Arc::clone(&cancel);
+    let join = std::thread::spawn(move || {
+        // Create a controller bound to the shared cancel token.
+        let ctrl = IterationController {
+            run_dir: run_dir.clone(),
+            cancel: cancel2,
+        };
+        // Ensure manifest/config snapshot exists even if cancelled early.
+        let mut manifest = ensure_manifest(&run_dir, &cfg)?;
+
+        let res: Result<(), ControllerError> = (|| {
+            if ctrl.cancelled() {
+                return Err(ControllerError::Cancelled);
+            }
+
+            ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
+            run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl)?;
+            if ctrl.cancelled() {
+                return Err(ControllerError::Cancelled);
+            }
+
+            ctrl.set_phase(Phase::Train, "starting train")?;
+            run_train_subprocess(&run_dir, &python_exe, &ctrl)?;
+            if ctrl.cancelled() {
+                return Err(ControllerError::Cancelled);
+            }
+
+            ctrl.set_phase(Phase::Gate, "starting gate")?;
+            run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl)?;
+
+            ctrl.set_phase(Phase::Done, "done")?;
+            Ok(())
+        })();
+
+        if let Err(e) = &res {
+            let _ = ctrl.set_error(e.to_string());
+        }
+        res
+    });
+    IterationHandle { cancel, join }
+}
+
+fn wait_child_cancellable(mut child: std::process::Child, ctrl: &IterationController) -> Result<(), ControllerError> {
+    loop {
+        if ctrl.cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ControllerError::Cancelled);
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(ControllerError::Fs(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("train subprocess failed: {status}"),
+                )));
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+fn run_train_subprocess(run_dir: &Path, python_exe: &str, ctrl: &IterationController) -> Result<(), ControllerError> {
     // We expect the standard repo layout: python package lives under ./python
     // and run dir is runs/<id>/ with replay/ and models/.
     let out_models = run_dir.join("models");
@@ -245,7 +352,7 @@ fn run_train_subprocess(run_dir: &Path, python_exe: &str) -> Result<(), Controll
     std::fs::create_dir_all(&out_models)?;
 
     // Minimal args. Trainer will update run.json and metrics.ndjson itself (E10.5S2).
-    let status = std::process::Command::new(python_exe)
+    let child = std::process::Command::new(python_exe)
         .current_dir("python")
         .args([
             "-m",
@@ -258,15 +365,10 @@ fn run_train_subprocess(run_dir: &Path, python_exe: &str) -> Result<(), Controll
             "--config",
             run_dir.join("config.yaml").to_string_lossy().as_ref(),
         ])
-        .status()
+        .spawn()
         .map_err(ControllerError::Fs)?;
-    if !status.success() {
-        return Err(ControllerError::Fs(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("python train failed: {status}"),
-        )));
-    }
-    Ok(())
+
+    wait_child_cancellable(child, ctrl)
 }
 
 fn run_selfplay(
@@ -274,12 +376,13 @@ fn run_selfplay(
     cfg: &yz_core::Config,
     infer_endpoint: &str,
     manifest: &mut RunManifestV1,
+    ctrl: &IterationController,
 ) -> Result<(), ControllerError> {
     let replay_dir = run_dir.join("replay");
     let logs_dir = run_dir.join("logs");
     let run_json = run_dir.join("run.json");
 
-    let backend = connect_infer_backend(infer_endpoint);
+    let backend = connect_infer_backend(infer_endpoint)?;
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
         out_dir: replay_dir,
         max_samples_per_shard: 8192,
@@ -342,6 +445,9 @@ fn run_selfplay(
     let mut completed_games: u32 = 0;
     let mut next_game_id: u64 = parallel as u64;
     while completed_games < games {
+        if ctrl.cancelled() {
+            return Err(ControllerError::Cancelled);
+        }
         sched.tick_and_write(&backend, &mut writer, Some(&mut loggers))?;
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
@@ -379,7 +485,15 @@ fn run_selfplay(
     Ok(())
 }
 
-fn run_gate(run_dir: &Path, cfg: &yz_core::Config, infer_endpoint: &str) -> Result<(), ControllerError> {
+fn run_gate(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    infer_endpoint: &str,
+    ctrl: &IterationController,
+) -> Result<(), ControllerError> {
+    if ctrl.cancelled() {
+        return Err(ControllerError::Cancelled);
+    }
     let run_json = run_dir.join("run.json");
     let mut m = yz_logging::read_manifest(&run_json)?;
 
@@ -404,7 +518,7 @@ fn run_gate(run_dir: &Path, cfg: &yz_core::Config, infer_endpoint: &str) -> Resu
             },
         },
     )
-    .unwrap();
+    ?;
 
     let wr = report.win_rate();
     m.gate_games = Some(report.games as u64);
@@ -417,6 +531,57 @@ fn run_gate(run_dir: &Path, cfg: &yz_core::Config, infer_endpoint: &str) -> Resu
     yz_logging::write_manifest_atomic(&run_json, &m)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_kills_child_process() {
+        // This unit test exercises the cancellation kill loop without requiring torch/yatzy_az.
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl = IterationController::new(dir.path());
+        // Create a dummy run.json so set_error works if needed.
+        std::fs::write(dir.path().join("run.json"), serde_json::to_string_pretty(&RunManifestV1 {
+            run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
+            run_id: "test".to_string(),
+            created_ts_ms: yz_logging::now_ms(),
+            protocol_version: 1,
+            feature_schema_id: 1,
+            action_space_id: "oracle_keepmask_v1".to_string(),
+            ruleset_id: "swedish_scandinavian_v1".to_string(),
+            git_hash: None,
+            config_hash: None,
+            config_snapshot: None,
+            config_snapshot_hash: None,
+            replay_dir: "replay".to_string(),
+            logs_dir: "logs".to_string(),
+            models_dir: "models".to_string(),
+            selfplay_games_completed: 0,
+            train_step: 0,
+            best_checkpoint: None,
+            candidate_checkpoint: None,
+            promotion_decision: None,
+            promotion_ts_ms: None,
+            gate_games: None,
+            gate_win_rate: None,
+            gate_seeds_hash: None,
+            gate_oracle_match_rate_overall: None,
+            gate_oracle_match_rate_mark: None,
+            gate_oracle_match_rate_reroll: None,
+            gate_oracle_keepall_ignored: None,
+            controller_phase: None,
+            controller_status: None,
+            controller_last_ts_ms: None,
+            controller_error: None,
+        }).unwrap()).unwrap();
+
+        let child = std::process::Command::new("sleep").arg("10").spawn().unwrap();
+        ctrl.request_cancel();
+        let res = wait_child_cancellable(child, &ctrl);
+        assert!(matches!(res, Err(ControllerError::Cancelled)));
+    }
 }
 
 

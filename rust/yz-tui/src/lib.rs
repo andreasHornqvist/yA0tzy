@@ -24,6 +24,7 @@ use ratatui::Terminal;
 
 use crate::form::{EditMode, FieldId, FormState, Section, StepSize, ALL_FIELDS};
 use yz_core::config::TemperatureSchedule;
+use yz_logging::RunManifestV1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -45,6 +46,8 @@ struct App {
     form: FormState,
 
     metrics_tail: Vec<String>,
+
+    iter: Option<yz_controller::IterationHandle>,
 }
 
 impl App {
@@ -59,6 +62,7 @@ impl App {
             cfg: yz_core::Config::default(),
             form: FormState::default(),
             metrics_tail: Vec::new(),
+            iter: None,
         }
     }
 
@@ -162,14 +166,70 @@ impl App {
         }
         self.refresh_metrics_tail();
         self.screen = Screen::Dashboard;
-        self.status = "Dashboard: r refresh | Esc back | q quit".to_string();
+        self.status = "Dashboard: r refresh | x cancel | Esc back | q quit".to_string();
+    }
+
+    fn start_iteration(&mut self) {
+        if self.iter.is_some() {
+            self.status = "already running".to_string();
+            return;
+        }
+        let Some(run_dir) = self.run_dir() else {
+            self.status = "No run selected".to_string();
+            return;
+        };
+
+        // Validate config.
+        if let Err(e) = crate::validate::validate_config(&self.cfg) {
+            self.form.last_validation_error = Some(e.clone());
+            self.status = format!("cannot start (invalid): {e}");
+            return;
+        }
+
+        // Snapshot semantics: only allow start if config.yaml does not exist (run-local snapshot).
+        let snap = run_dir.join("config.yaml");
+        if snap.exists() {
+            self.status = "config.yaml already exists; create a new run to start with a new config".to_string();
+            return;
+        }
+
+        // Preflight inference endpoint for unix:// sockets (common local path).
+        if let Some(rest) = self.cfg.inference.bind.strip_prefix("unix://") {
+            let p = Path::new(rest);
+            if !p.exists() {
+                self.status = format!(
+                    "inference socket not found: {} (start `python -m yatzy_az infer-server` first)",
+                    p.display()
+                );
+                return;
+            }
+        }
+
+        // Best-effort save draft before starting.
+        self.save_config_draft();
+
+        // Spawn controller in background.
+        let infer_endpoint = self.cfg.inference.bind.clone();
+        let python_exe = "python".to_string();
+        let handle = yz_controller::spawn_iteration(run_dir, self.cfg.clone(), infer_endpoint, python_exe);
+        self.iter = Some(handle);
+        self.enter_dashboard();
+    }
+
+    fn cancel_iteration_hard(&mut self) {
+        if let Some(h) = &self.iter {
+            h.cancel_hard();
+            self.status = "cancel requested".to_string();
+        } else {
+            self.status = "no active run".to_string();
+        }
     }
 }
 
 fn config_help(form: &FormState) -> String {
     match form.edit_mode {
         EditMode::View => {
-            "Config: ↑/↓ select | Enter edit | ←/→ step | Shift+←/→ big step | Space toggle/cycle | Tab section | s save draft | d dashboard | Esc back | q quit"
+            "Config: ↑/↓ select | Enter edit | ←/→ step | Shift+←/→ big step | Space toggle/cycle | Tab section | s save draft | g start | d dashboard | Esc back | q quit"
                 .to_string()
         }
         EditMode::Editing => "Editing: type | Backspace | Enter commit | Esc cancel".to_string(),
@@ -251,6 +311,7 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::Char('s') => app.save_config_draft(),
                         KeyCode::Char('d') => app.enter_dashboard(),
+                        KeyCode::Char('g') => app.start_iteration(),
                         _ => handle_config_key(&mut app, k),
                     },
                     Screen::Dashboard => match k.code {
@@ -260,12 +321,21 @@ pub fn run() -> io::Result<()> {
                             app.status = config_help(&app.form);
                         }
                         KeyCode::Char('r') => app.refresh_metrics_tail(),
+                        KeyCode::Char('x') => app.cancel_iteration_hard(),
                         _ => {}
                     },
                 }
             }
         }
         if last_tick.elapsed() >= tick_rate {
+            // If controller finished, join and clear.
+            if let Some(h) = &app.iter {
+                if h.is_finished() {
+                    // Take ownership and join.
+                    let h = app.iter.take().unwrap();
+                    let _ = h.join();
+                }
+            }
             last_tick = Instant::now();
         }
     }
@@ -944,6 +1014,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Span::raw(format!("run={rid}")),
             ]);
             let mut body: Vec<Line> = Vec::new();
+            if let Some(s) = read_controller_status(app) {
+                body.push(Line::from(s));
+                body.push(Line::from(""));
+            }
             body.push(Line::from("Tail: logs/metrics.ndjson (last 20 lines)"));
             body.push(Line::from(""));
             if app.metrics_tail.is_empty() {
@@ -964,6 +1038,22 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(help, chunks[1]);
 }
 
+fn read_controller_status(app: &App) -> Option<String> {
+    let run_dir = app.run_dir()?;
+    let run_json = run_dir.join("run.json");
+    if !run_json.exists() {
+        return None;
+    }
+    let m: RunManifestV1 = yz_logging::read_manifest(&run_json).ok()?;
+    let phase = m.controller_phase.unwrap_or_else(|| "?".to_string());
+    let status = m.controller_status.unwrap_or_else(|| "".to_string());
+    let err = m.controller_error.unwrap_or_else(|| "".to_string());
+    if !err.is_empty() {
+        Some(format!("controller: phase={phase} status={status} error={err}"))
+    } else {
+        Some(format!("controller: phase={phase} status={status}"))
+    }
+}
 fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
     // Build rows with optional field ids.
     #[derive(Clone)]
