@@ -350,7 +350,7 @@ OPTIONS:
 
     let backend = connect_infer_backend(&infer);
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
-        out_dir: replay_dir,
+        out_dir: replay_dir.clone(),
         max_samples_per_shard,
         git_hash: None,
         config_hash: None,
@@ -462,6 +462,32 @@ OPTIONS:
     });
     let _ = loggers.iter.flush();
     let _ = loggers.roots.flush();
+
+    // E13.1S1: replay pruning (optional) + metrics event.
+    if let Some(cap) = cfg.replay.capacity_shards {
+        if cap > 0 {
+            match yz_replay::prune_shards_by_idx(&replay_dir, cap as usize) {
+                Ok(rep) => {
+                    let ev = yz_logging::MetricsReplayPruneV1 {
+                        event: "replay_prune",
+                        ts_ms: yz_logging::now_ms(),
+                        v: loggers.v.clone(),
+                        run_id: loggers.run_id.clone(),
+                        git_hash: loggers.git_hash.clone(),
+                        config_snapshot: loggers.config_snapshot.clone(),
+                        capacity_shards: cap,
+                        before_shards: rep.before_shards as u32,
+                        after_shards: rep.after_shards as u32,
+                        deleted_shards: rep.deleted_shards as u32,
+                        deleted_min_idx: rep.deleted_min_idx,
+                        deleted_max_idx: rep.deleted_max_idx,
+                    };
+                    let _ = loggers.metrics.write_event(&ev);
+                }
+                Err(e) => eprintln!("Replay prune error: {e}"),
+            }
+        }
+    }
     let _ = loggers.metrics.flush();
 
     // Final manifest update.

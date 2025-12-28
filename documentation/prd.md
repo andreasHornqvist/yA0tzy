@@ -1211,7 +1211,7 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
 
    * Implement deterministic pruning of `runs/<id>/replay/` after shard flush/close.
    * Emit a metrics event (e.g. `replay_prune`) to `logs/metrics.ndjson` summarizing what was removed.
-   * **AC:** replay directory growth is bounded across iterations and pruning behavior is reproducible/auditable.
+   * **Pruning policy (v1):** shard files are named `shard_{idx:06}.safetensors` + `shard_{idx:06}.meta.json` and pruning keeps the **newest N shards by filename index**.\n+     * Writer must **resume** at `max_existing_idx + 1` to avoid overwriting shards when continuing self-play in the same run directory.\n+   * **AC:**\n+     * replay directory growth is bounded across iterations (keeps newest N shards)\n+     * pruning behavior is reproducible/auditable (deterministic by shard idx)\n+     * `logs/metrics.ndjson` includes `event=\"replay_prune\"` with before/after/deleted counts
 
 2. **Controller iteration loop (`controller.total_iterations`)**
 

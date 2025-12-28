@@ -356,6 +356,23 @@ pub struct MetricsGateSummaryV1 {
     pub oracle_keepall_ignored: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsReplayPruneV1 {
+    pub event: &'static str, // "replay_prune"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub capacity_shards: u32,
+    pub before_shards: u32,
+    pub after_shards: u32,
+    pub deleted_shards: u32,
+    pub deleted_min_idx: Option<u64>,
+    pub deleted_max_idx: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum NdjsonError {
     Io(io::Error),

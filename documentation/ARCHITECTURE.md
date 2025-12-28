@@ -233,6 +233,9 @@ Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/d
 Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard now supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/gating progress bars) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13 (training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
 Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/train/gating) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning).
 
+### Replay shard naming + retention (E13.1S1)
+- Shards are stored as paired files under `runs/<id>/replay/`:\n+  - `shard_{idx:06}.safetensors`\n+  - `shard_{idx:06}.meta.json`\n+- `ShardWriter` resumes at `max_existing_idx + 1` to avoid overwriting shards when appending more data to an existing run.\n+- If `replay.capacity_shards` is set, we keep the **newest N shards by filename index** and delete older pairs.\n+- Pruning emits a `replay_prune` event into `runs/<id>/logs/metrics.ndjson` for auditability.
+
 ### TUI dashboard: source of truth (v1)
 - Progress bars and iteration summaries are driven primarily by `runs/<id>/run.json`:
   - `controller_iteration_idx` selects the current entry in `iterations[]`

@@ -4,7 +4,8 @@ pub mod schema;
 pub mod writer;
 
 pub use writer::{
-    cleanup_tmp_files, ReplayError, ReplaySample, ShardMeta, ShardWriter, ShardWriterConfig,
+    cleanup_tmp_files, prune_shards_by_idx, PruneReport, ReplayError, ReplaySample, ShardMeta,
+    ShardWriter, ShardWriterConfig,
 };
 
 /// Crate version.
