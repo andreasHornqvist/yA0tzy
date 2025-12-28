@@ -192,10 +192,14 @@ fn ensure_manifest(run_dir: &Path, cfg: &yz_core::Config) -> Result<RunManifestV
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            train_last_loss_total: None,
+            train_last_loss_policy: None,
+            train_last_loss_value: None,
             promotion_decision: None,
             promotion_ts_ms: None,
             gate_games: None,
             gate_win_rate: None,
+            gate_draw_rate: None,
             gate_seeds_hash: None,
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
@@ -205,6 +209,8 @@ fn ensure_manifest(run_dir: &Path, cfg: &yz_core::Config) -> Result<RunManifestV
             controller_status: Some("initialized".to_string()),
             controller_last_ts_ms: Some(yz_logging::now_ms()),
             controller_error: None,
+            controller_iteration_idx: 0,
+            iterations: Vec::new(),
         }
     };
 
@@ -236,10 +242,13 @@ pub fn run_selfplay_then_gate(
     let mut manifest = ensure_manifest(run_dir, &cfg)?;
 
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
-    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl)?;
+    let iter_idx = manifest.controller_iteration_idx;
+    begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
+    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
-    run_gate(run_dir, &cfg, infer_endpoint, &ctrl)?;
+    run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
+    finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
     ctrl.set_phase(Phase::Done, "done")?;
     Ok(())
@@ -258,15 +267,19 @@ pub fn run_iteration(
     let run_dir = run_dir.as_ref();
     let ctrl = IterationController::new(run_dir);
     let mut manifest = ensure_manifest(run_dir, &cfg)?;
+    let iter_idx = manifest.controller_iteration_idx;
+    begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
-    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl)?;
+    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Train, "starting train")?;
     run_train_subprocess(run_dir, python_exe, &ctrl)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
-    run_gate(run_dir, &cfg, infer_endpoint, &ctrl)?;
+    refresh_train_stats_from_run_json(run_dir, &mut manifest, iter_idx)?;
+    run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
+    finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
     ctrl.set_phase(Phase::Done, "done")?;
     Ok(())
@@ -295,20 +308,50 @@ pub fn spawn_iteration(
                 return Err(ControllerError::Cancelled);
             }
 
-            ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
-            run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl)?;
-            if ctrl.cancelled() {
-                return Err(ControllerError::Cancelled);
-            }
+            let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
 
-            ctrl.set_phase(Phase::Train, "starting train")?;
-            run_train_subprocess(&run_dir, &python_exe, &ctrl)?;
-            if ctrl.cancelled() {
-                return Err(ControllerError::Cancelled);
-            }
+            for _ in 0..total_iters {
+                if ctrl.cancelled() {
+                    return Err(ControllerError::Cancelled);
+                }
 
-            ctrl.set_phase(Phase::Gate, "starting gate")?;
-            run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl)?;
+                let iter_idx = manifest.controller_iteration_idx;
+                begin_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
+
+                ctrl.set_phase(
+                    Phase::Selfplay,
+                    format!(
+                        "starting selfplay (iter {}/{} )",
+                        iter_idx + 1,
+                        total_iters
+                    ),
+                )?;
+                run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
+                if ctrl.cancelled() {
+                    return Err(ControllerError::Cancelled);
+                }
+
+                ctrl.set_phase(
+                    Phase::Train,
+                    format!("starting train (iter {}/{})", iter_idx + 1, total_iters),
+                )?;
+                run_train_subprocess(&run_dir, &python_exe, &ctrl)?;
+                if ctrl.cancelled() {
+                    return Err(ControllerError::Cancelled);
+                }
+                // After training completes, pull the latest train stats from run.json (trainer updates it).
+                refresh_train_stats_from_run_json(&run_dir, &mut manifest, iter_idx)?;
+
+                ctrl.set_phase(
+                    Phase::Gate,
+                    format!("starting gate (iter {}/{})", iter_idx + 1, total_iters),
+                )?;
+                run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
+
+                finalize_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
+                manifest.controller_iteration_idx = manifest.controller_iteration_idx.saturating_add(1);
+                yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
+            }
 
             ctrl.set_phase(Phase::Done, "done")?;
             Ok(())
@@ -320,6 +363,100 @@ pub fn spawn_iteration(
         res
     });
     IterationHandle { cancel, join }
+}
+
+fn begin_iteration(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    manifest: &mut RunManifestV1,
+    iter_idx: u32,
+) -> Result<(), ControllerError> {
+    // Ensure the iteration entry exists.
+    if manifest.iterations.iter().all(|it| it.idx != iter_idx) {
+        let mut it = yz_logging::IterationSummaryV1::default();
+        it.idx = iter_idx;
+        it.started_ts_ms = yz_logging::now_ms();
+        it.selfplay.games_target = cfg.selfplay.games_per_iteration.max(1) as u64;
+        it.train.steps_target = cfg
+            .training
+            .steps_per_iteration
+            .map(|x| x.max(1) as u64);
+        // Gate schedule size can be clamped by seed set length; store configured target for now.
+        it.gate.games_target = cfg.gating.games.max(1) as u64;
+        manifest.iterations.push(it);
+    }
+
+    // Reset phase-local progress counters for the iteration.
+    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.ended_ts_ms = None;
+        it.promoted = None;
+        it.promoted_model = None;
+        it.promotion_reason = None;
+        it.selfplay.games_completed = 0;
+        it.gate.games_completed = 0;
+        it.gate.win_rate = None;
+        it.gate.draw_rate = None;
+        it.oracle.match_rate_overall = None;
+        it.oracle.match_rate_mark = None;
+        it.oracle.match_rate_reroll = None;
+        it.oracle.keepall_ignored = None;
+        it.train.steps_completed = None;
+        it.train.last_loss_total = None;
+        it.train.last_loss_policy = None;
+        it.train.last_loss_value = None;
+    }
+
+    yz_logging::write_manifest_atomic(run_dir.join("run.json"), manifest)?;
+    Ok(())
+}
+
+fn finalize_iteration(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    manifest: &mut RunManifestV1,
+    iter_idx: u32,
+) -> Result<(), ControllerError> {
+    let wr = manifest.gate_win_rate;
+    let threshold = cfg.gating.win_rate_threshold;
+    let promoted = wr.map(|x| x >= threshold);
+    let reason = wr.map(|x| format!("win_rate={x:.4} threshold={threshold:.4}"));
+
+    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.ended_ts_ms = Some(yz_logging::now_ms());
+        it.gate.win_rate = wr;
+        it.gate.draw_rate = manifest.gate_draw_rate;
+        it.oracle.match_rate_overall = manifest.gate_oracle_match_rate_overall;
+        it.oracle.match_rate_mark = manifest.gate_oracle_match_rate_mark;
+        it.oracle.match_rate_reroll = manifest.gate_oracle_match_rate_reroll;
+        it.oracle.keepall_ignored = manifest.gate_oracle_keepall_ignored;
+        it.promoted = promoted;
+        it.promoted_model = promoted.map(|p| if p { "candidate".to_string() } else { "best".to_string() });
+        it.promotion_reason = reason;
+        it.train.steps_completed = Some(manifest.train_step);
+    }
+
+    yz_logging::write_manifest_atomic(run_dir.join("run.json"), manifest)?;
+    Ok(())
+}
+
+fn refresh_train_stats_from_run_json(
+    run_dir: &Path,
+    manifest: &mut RunManifestV1,
+    iter_idx: u32,
+) -> Result<(), ControllerError> {
+    let run_json = run_dir.join("run.json");
+    let fresh = yz_logging::read_manifest(&run_json)?;
+    *manifest = fresh;
+
+    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.train.steps_completed = Some(manifest.train_step);
+        it.train.last_loss_total = manifest.train_last_loss_total;
+        it.train.last_loss_policy = manifest.train_last_loss_policy;
+        it.train.last_loss_value = manifest.train_last_loss_value;
+    }
+
+    yz_logging::write_manifest_atomic(run_dir.join("run.json"), manifest)?;
+    Ok(())
 }
 
 fn wait_child_cancellable(mut child: std::process::Child, ctrl: &IterationController) -> Result<(), ControllerError> {
@@ -377,6 +514,7 @@ fn run_selfplay(
     infer_endpoint: &str,
     manifest: &mut RunManifestV1,
     ctrl: &IterationController,
+    iter_idx: u32,
 ) -> Result<(), ControllerError> {
     let replay_dir = run_dir.join("replay");
     let logs_dir = run_dir.join("logs");
@@ -442,6 +580,7 @@ fn run_selfplay(
     };
 
     let games = cfg.selfplay.games_per_iteration.max(1);
+    let base_total = manifest.selfplay_games_completed;
     let mut completed_games: u32 = 0;
     let mut next_game_id: u64 = parallel as u64;
     while completed_games < games {
@@ -453,7 +592,12 @@ fn run_selfplay(
             if yz_core::is_terminal(&t.state) {
                 completed_games += 1;
                 if completed_games % 10 == 0 || completed_games == games {
-                    manifest.selfplay_games_completed = completed_games as u64;
+                    let total = base_total + completed_games as u64;
+                    manifest.selfplay_games_completed = total;
+                    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+                        it.selfplay.games_completed = completed_games as u64;
+                        it.selfplay.games_target = games as u64;
+                    }
                     let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
                 }
                 if completed_games >= games {
@@ -480,7 +624,12 @@ fn run_selfplay(
     let _ = loggers.roots.flush();
     let _ = loggers.metrics.flush();
 
-    manifest.selfplay_games_completed = completed_games as u64;
+    let total = base_total + completed_games as u64;
+    manifest.selfplay_games_completed = total;
+    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.selfplay.games_completed = completed_games as u64;
+        it.selfplay.games_target = games as u64;
+    }
     let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
     Ok(())
 }
@@ -490,6 +639,7 @@ fn run_gate(
     cfg: &yz_core::Config,
     infer_endpoint: &str,
     ctrl: &IterationController,
+    iter_idx: u32,
 ) -> Result<(), ControllerError> {
     if ctrl.cancelled() {
         return Err(ControllerError::Cancelled);
@@ -497,7 +647,30 @@ fn run_gate(
     let run_json = run_dir.join("run.json");
     let mut m = yz_logging::read_manifest(&run_json)?;
 
-    let report = yz_eval::gate(
+    struct ProgressSink {
+        run_json: PathBuf,
+        iter_idx: u32,
+    }
+    impl yz_eval::GateProgress for ProgressSink {
+        fn on_game_completed(&mut self, completed: u32, total: u32) {
+            let Ok(mut m) = yz_logging::read_manifest(&self.run_json) else {
+                return;
+            };
+            if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == self.iter_idx) {
+                it.gate.games_completed = completed as u64;
+                // Prefer the actual schedule length discovered by yz-eval.
+                it.gate.games_target = total as u64;
+            }
+            let _ = yz_logging::write_manifest_atomic(&self.run_json, &m);
+        }
+    }
+
+    let mut sink = ProgressSink {
+        run_json: run_json.clone(),
+        iter_idx,
+    };
+
+    let report = yz_eval::gate_with_progress(
         cfg,
         yz_eval::GateOptions {
             infer_endpoint: infer_endpoint.to_string(),
@@ -517,17 +690,31 @@ fn run_gate(
                 virtual_loss: 1.0,
             },
         },
+        Some(&mut sink),
     )
     ?;
 
     let wr = report.win_rate();
     m.gate_games = Some(report.games as u64);
     m.gate_win_rate = Some(wr);
+    m.gate_draw_rate = Some(report.draw_rate);
     m.gate_seeds_hash = Some(report.seeds_hash.clone());
     m.gate_oracle_match_rate_overall = Some(report.oracle_match_rate_overall);
     m.gate_oracle_match_rate_mark = Some(report.oracle_match_rate_mark);
     m.gate_oracle_match_rate_reroll = Some(report.oracle_match_rate_reroll);
     m.gate_oracle_keepall_ignored = Some(report.oracle_keepall_ignored);
+
+    // Also update current iteration entry (final values).
+    if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.gate.games_target = report.games as u64;
+        it.gate.games_completed = report.games as u64;
+        it.gate.win_rate = Some(wr);
+        it.gate.draw_rate = Some(report.draw_rate);
+        it.oracle.match_rate_overall = Some(report.oracle_match_rate_overall);
+        it.oracle.match_rate_mark = Some(report.oracle_match_rate_mark);
+        it.oracle.match_rate_reroll = Some(report.oracle_match_rate_reroll);
+        it.oracle.keepall_ignored = Some(report.oracle_keepall_ignored);
+    }
     yz_logging::write_manifest_atomic(&run_json, &m)?;
 
     Ok(())
@@ -562,10 +749,14 @@ mod cancel_tests {
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            train_last_loss_total: None,
+            train_last_loss_policy: None,
+            train_last_loss_value: None,
             promotion_decision: None,
             promotion_ts_ms: None,
             gate_games: None,
             gate_win_rate: None,
+            gate_draw_rate: None,
             gate_seeds_hash: None,
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
@@ -575,12 +766,38 @@ mod cancel_tests {
             controller_status: None,
             controller_last_ts_ms: None,
             controller_error: None,
+            controller_iteration_idx: 0,
+            iterations: Vec::new(),
         }).unwrap()).unwrap();
 
         let child = std::process::Command::new("sleep").arg("10").spawn().unwrap();
         ctrl.request_cancel();
         let res = wait_child_cancellable(child, &ctrl);
         assert!(matches!(res, Err(ControllerError::Cancelled)));
+    }
+
+    #[test]
+    fn begin_iteration_initializes_targets_and_resets_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let mut cfg = yz_core::Config::default();
+        cfg.selfplay.games_per_iteration = 7;
+        cfg.gating.games = 10;
+        cfg.training.steps_per_iteration = Some(123);
+
+        let mut m = ensure_manifest(run_dir, &cfg).unwrap();
+        assert!(m.iterations.is_empty());
+
+        begin_iteration(run_dir, &cfg, &mut m, 0).unwrap();
+        assert_eq!(m.controller_iteration_idx, 0);
+        assert_eq!(m.iterations.len(), 1);
+        let it = m.iterations.iter().find(|it| it.idx == 0).unwrap();
+        assert_eq!(it.selfplay.games_target, 7);
+        assert_eq!(it.selfplay.games_completed, 0);
+        assert_eq!(it.gate.games_target, 10);
+        assert_eq!(it.gate.games_completed, 0);
+        assert_eq!(it.train.steps_target, Some(123));
+        assert_eq!(it.train.steps_completed, None);
     }
 }
 

@@ -286,10 +286,14 @@ OPTIONS:
         train_step: 0,
         best_checkpoint: None,
         candidate_checkpoint: None,
+        train_last_loss_total: None,
+        train_last_loss_policy: None,
+        train_last_loss_value: None,
         promotion_decision: None,
         promotion_ts_ms: None,
         gate_games: None,
         gate_win_rate: None,
+        gate_draw_rate: None,
         gate_seeds_hash: None,
         gate_oracle_match_rate_overall: None,
         gate_oracle_match_rate_mark: None,
@@ -299,6 +303,8 @@ OPTIONS:
         controller_status: None,
         controller_last_ts_ms: None,
         controller_error: None,
+        controller_iteration_idx: 0,
+        iterations: Vec::new(),
     };
     // If a manifest already exists (resume), keep its created_ts_ms/run_id.
     if let Ok(existing) = yz_logging::read_manifest(&run_json) {
@@ -307,10 +313,14 @@ OPTIONS:
         manifest.train_step = existing.train_step;
         manifest.best_checkpoint = existing.best_checkpoint;
         manifest.candidate_checkpoint = existing.candidate_checkpoint;
+        manifest.train_last_loss_total = existing.train_last_loss_total;
+        manifest.train_last_loss_policy = existing.train_last_loss_policy;
+        manifest.train_last_loss_value = existing.train_last_loss_value;
         manifest.promotion_decision = existing.promotion_decision;
         manifest.promotion_ts_ms = existing.promotion_ts_ms;
         manifest.gate_games = existing.gate_games;
         manifest.gate_win_rate = existing.gate_win_rate;
+        manifest.gate_draw_rate = existing.gate_draw_rate;
         manifest.gate_seeds_hash = existing.gate_seeds_hash;
         manifest.gate_oracle_match_rate_overall = existing.gate_oracle_match_rate_overall;
         manifest.gate_oracle_match_rate_mark = existing.gate_oracle_match_rate_mark;
@@ -322,6 +332,8 @@ OPTIONS:
         manifest.controller_status = existing.controller_status;
         manifest.controller_last_ts_ms = existing.controller_last_ts_ms;
         manifest.controller_error = existing.controller_error;
+        manifest.controller_iteration_idx = existing.controller_iteration_idx;
+        manifest.iterations = existing.iterations;
     }
 
     // E10.5S1: run-local config snapshot (normalized).

@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use ratatui::Terminal;
 
 use crate::form::{EditMode, FieldId, FormState, Section, StepSize, ALL_FIELDS};
@@ -45,7 +45,8 @@ struct App {
     cfg: yz_core::Config,
     form: FormState,
 
-    metrics_tail: Vec<String>,
+    dashboard_manifest: Option<RunManifestV1>,
+    dashboard_err: Option<String>,
 
     iter: Option<yz_controller::IterationHandle>,
 }
@@ -61,7 +62,8 @@ impl App {
             active_run_id: None,
             cfg: yz_core::Config::default(),
             form: FormState::default(),
-            metrics_tail: Vec::new(),
+            dashboard_manifest: None,
+            dashboard_err: None,
             iter: None,
         }
     }
@@ -145,26 +147,35 @@ impl App {
         }
     }
 
-    fn refresh_metrics_tail(&mut self) {
+    fn refresh_dashboard(&mut self) {
         let Some(run_dir) = self.run_dir() else {
-            self.metrics_tail.clear();
+            self.dashboard_manifest = None;
+            self.dashboard_err = None;
             return;
         };
-        let metrics = run_dir.join("logs").join("metrics.ndjson");
-        let mut out: Vec<String> = Vec::new();
-        if let Ok(s) = std::fs::read_to_string(metrics) {
-            let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
-            let n = 20usize.min(lines.len());
-            out.extend(lines[lines.len().saturating_sub(n)..].iter().map(|x| x.to_string()));
+        let run_json = run_dir.join("run.json");
+        if !run_json.exists() {
+            self.dashboard_manifest = None;
+            self.dashboard_err = Some("run.json not found (start an iteration first)".to_string());
+            return;
         }
-        self.metrics_tail = out;
+        match yz_logging::read_manifest(&run_json) {
+            Ok(m) => {
+                self.dashboard_manifest = Some(m);
+                self.dashboard_err = None;
+            }
+            Err(e) => {
+                self.dashboard_manifest = None;
+                self.dashboard_err = Some(format!("failed to read run.json: {e}"));
+            }
+        }
     }
 
     fn enter_dashboard(&mut self) {
         if self.active_run_id.is_none() {
             return;
         }
-        self.refresh_metrics_tail();
+        self.refresh_dashboard();
         self.screen = Screen::Dashboard;
         self.status = "Dashboard: r refresh | x cancel | Esc back | q quit".to_string();
     }
@@ -320,7 +331,7 @@ pub fn run() -> io::Result<()> {
                             app.screen = Screen::Config;
                             app.status = config_help(&app.form);
                         }
-                        KeyCode::Char('r') => app.refresh_metrics_tail(),
+                        KeyCode::Char('r') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
                         _ => {}
                     },
@@ -335,6 +346,9 @@ pub fn run() -> io::Result<()> {
                     let h = app.iter.take().unwrap();
                     let _ = h.join();
                 }
+            }
+            if matches!(app.screen, Screen::Dashboard) {
+                app.refresh_dashboard();
             }
             last_tick = Instant::now();
         }
@@ -1013,23 +1027,157 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Span::raw("  "),
                 Span::raw(format!("run={rid}")),
             ]);
-            let mut body: Vec<Line> = Vec::new();
-            if let Some(s) = read_controller_status(app) {
-                body.push(Line::from(s));
-                body.push(Line::from(""));
-            }
-            body.push(Line::from("Tail: logs/metrics.ndjson (last 20 lines)"));
-            body.push(Line::from(""));
-            if app.metrics_tail.is_empty() {
-                body.push(Line::from("(no metrics yet)"));
-            } else {
-                for l in &app.metrics_tail {
-                    body.push(Line::from(l.clone()));
+
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(chunks[0]);
+
+            // Left: iteration history (across iterations).
+            let mut left: Vec<Line> = Vec::new();
+            match (&app.dashboard_manifest, &app.dashboard_err) {
+                (Some(m), _) => {
+                    left.push(Line::from("Across iterations"));
+                    left.push(Line::from(""));
+
+                    let cur_idx = m.controller_iteration_idx;
+                    if m.iterations.is_empty() {
+                        left.push(Line::from("(no iterations yet)"));
+                    } else {
+                        for it in &m.iterations {
+                            let marker = if it.idx == cur_idx { ">" } else { " " };
+                            let promo = it
+                                .promoted
+                                .map(|p| if p { "promote" } else { "reject" })
+                                .unwrap_or("-");
+                            let wr = it
+                                .gate
+                                .win_rate
+                                .map(|x| format!("{x:.3}"))
+                                .unwrap_or_else(|| "-".to_string());
+                            let oracle = it
+                                .oracle
+                                .match_rate_overall
+                                .map(|x| format!("{x:.3}"))
+                                .unwrap_or_else(|| "-".to_string());
+                            let lt = it
+                                .train
+                                .last_loss_total
+                                .map(|x| format!("{x:.3}"))
+                                .unwrap_or_else(|| "-".to_string());
+                            let lp = it
+                                .train
+                                .last_loss_policy
+                                .map(|x| format!("{x:.3}"))
+                                .unwrap_or_else(|| "-".to_string());
+                            let lv = it
+                                .train
+                                .last_loss_value
+                                .map(|x| format!("{x:.3}"))
+                                .unwrap_or_else(|| "-".to_string());
+
+                            left.push(Line::from(format!(
+                                "{marker} iter {:>3} | {promo:>7} | wr {wr:>6} | oracle {oracle:>6} | loss t/p/v {lt:>6}/{lp:>6}/{lv:>6}",
+                                it.idx
+                            )));
+                        }
+                    }
+                }
+                (_, Some(e)) => {
+                    left.push(Line::from("Across iterations"));
+                    left.push(Line::from(""));
+                    left.push(Line::from(format!("(dashboard unavailable: {e})")));
+                }
+                _ => {
+                    left.push(Line::from("Across iterations"));
+                    left.push(Line::from(""));
+                    left.push(Line::from("(no run selected)"));
                 }
             }
-            let p = Paragraph::new(body)
-                .block(Block::default().title(title).borders(Borders::ALL));
-            f.render_widget(p, chunks[0]);
+            let left_p = Paragraph::new(left).block(
+                Block::default()
+                    .title(title.clone())
+                    .borders(Borders::ALL),
+            );
+            f.render_widget(left_p, cols[0]);
+
+            // Right: live phase view + progress bars.
+            let mut right_lines: Vec<Line> = Vec::new();
+            let mut gauge: Option<(f64, String)> = None;
+            if let Some(m) = &app.dashboard_manifest {
+                let phase = m.controller_phase.as_deref().unwrap_or("?");
+                let status = m.controller_status.as_deref().unwrap_or("");
+                right_lines.push(Line::from(format!("Live ({phase})")));
+                if !status.is_empty() {
+                    right_lines.push(Line::from(format!("status: {status}")));
+                }
+                if let Some(e) = m.controller_error.as_deref() {
+                    if !e.is_empty() {
+                        right_lines.push(Line::from(format!("error: {e}")));
+                    }
+                }
+                right_lines.push(Line::from(""));
+
+                let cur_idx = m.controller_iteration_idx;
+                let cur = m.iterations.iter().find(|it| it.idx == cur_idx);
+                if let Some(it) = cur {
+                    match phase {
+                        "selfplay" => {
+                            let done = it.selfplay.games_completed;
+                            let tot = it.selfplay.games_target.max(1);
+                            gauge = Some((done as f64 / tot as f64, format!("{done}/{tot} games")));
+                        }
+                        "gate" => {
+                            let done = it.gate.games_completed;
+                            let tot = it.gate.games_target.max(1);
+                            gauge = Some((done as f64 / tot as f64, format!("{done}/{tot} games")));
+                        }
+                        "train" => {
+                            if let Some(tot) = it.train.steps_target {
+                                let done = it.train.steps_completed.unwrap_or(0);
+                                let tot = tot.max(1);
+                                gauge =
+                                    Some((done as f64 / tot as f64, format!("{done}/{tot} steps")));
+                            } else if let Some(done) = it.train.steps_completed {
+                                right_lines.push(Line::from(format!("train_step: {done}")));
+                            } else {
+                                right_lines.push(Line::from("train_step: -"));
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    right_lines.push(Line::from(format!(
+                        "no iteration summary for idx={cur_idx}"
+                    )));
+                }
+            } else if let Some(e) = &app.dashboard_err {
+                right_lines.push(Line::from("Live"));
+                right_lines.push(Line::from(""));
+                right_lines.push(Line::from(format!("(dashboard unavailable: {e})")));
+            } else {
+                right_lines.push(Line::from("Live"));
+                right_lines.push(Line::from(""));
+                right_lines.push(Line::from("(no data)"));
+            }
+
+            let right_block = Block::default().title("Live").borders(Borders::ALL);
+            if let Some((ratio, label)) = gauge {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(6), Constraint::Length(3), Constraint::Min(0)])
+                    .split(cols[1]);
+                let p = Paragraph::new(right_lines).block(right_block);
+                f.render_widget(p, rows[0]);
+                let g = Gauge::default()
+                    .block(Block::default().title("Progress").borders(Borders::ALL))
+                    .ratio(ratio.clamp(0.0, 1.0))
+                    .label(label);
+                f.render_widget(g, rows[1]);
+            } else {
+                let p = Paragraph::new(right_lines).block(right_block);
+                f.render_widget(p, cols[1]);
+            }
         }
     }
 
@@ -1038,22 +1186,6 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(help, chunks[1]);
 }
 
-fn read_controller_status(app: &App) -> Option<String> {
-    let run_dir = app.run_dir()?;
-    let run_json = run_dir.join("run.json");
-    if !run_json.exists() {
-        return None;
-    }
-    let m: RunManifestV1 = yz_logging::read_manifest(&run_json).ok()?;
-    let phase = m.controller_phase.unwrap_or_else(|| "?".to_string());
-    let status = m.controller_status.unwrap_or_else(|| "".to_string());
-    let err = m.controller_error.unwrap_or_else(|| "".to_string());
-    if !err.is_empty() {
-        Some(format!("controller: phase={phase} status={status} error={err}"))
-    } else {
-        Some(format!("controller: phase={phase} status={status}"))
-    }
-}
 fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
     // Build rows with optional field ids.
     #[derive(Clone)]

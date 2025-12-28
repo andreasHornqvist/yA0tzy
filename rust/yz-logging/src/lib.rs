@@ -47,11 +47,21 @@ pub struct RunManifestV1 {
     pub best_checkpoint: Option<String>,
     pub candidate_checkpoint: Option<String>,
 
+    // Training scalars (for TUI dashboard; best-effort).
+    #[serde(default)]
+    pub train_last_loss_total: Option<f64>,
+    #[serde(default)]
+    pub train_last_loss_policy: Option<f64>,
+    #[serde(default)]
+    pub train_last_loss_value: Option<f64>,
+
     // Gating/promotion (Epic E8.5.2).
     pub promotion_decision: Option<String>, // "promote" | "reject"
     pub promotion_ts_ms: Option<u64>,
     pub gate_games: Option<u64>,
     pub gate_win_rate: Option<f64>,
+    #[serde(default)]
+    pub gate_draw_rate: Option<f64>,
     pub gate_seeds_hash: Option<String>,
     pub gate_oracle_match_rate_overall: Option<f64>,
     pub gate_oracle_match_rate_mark: Option<f64>,
@@ -63,6 +73,66 @@ pub struct RunManifestV1 {
     pub controller_status: Option<String>, // human-readable status
     pub controller_last_ts_ms: Option<u64>,
     pub controller_error: Option<String>,
+
+    // Iteration history (TUI dashboard).
+    #[serde(default)]
+    pub controller_iteration_idx: u32, // 0-based, increments per full cycle
+    #[serde(default)]
+    pub iterations: Vec<IterationSummaryV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IterationSummaryV1 {
+    pub idx: u32,
+    pub started_ts_ms: u64,
+    pub ended_ts_ms: Option<u64>,
+
+    #[serde(default)]
+    pub promoted: Option<bool>,
+    #[serde(default)]
+    pub promoted_model: Option<String>, // "best" | "candidate"
+    #[serde(default)]
+    pub promotion_reason: Option<String>,
+
+    #[serde(default)]
+    pub selfplay: IterSelfplaySummaryV1,
+    #[serde(default)]
+    pub train: IterTrainSummaryV1,
+    #[serde(default)]
+    pub gate: IterGateSummaryV1,
+    #[serde(default)]
+    pub oracle: IterOracleSummaryV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IterSelfplaySummaryV1 {
+    pub games_target: u64,
+    pub games_completed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IterTrainSummaryV1 {
+    pub steps_target: Option<u64>,
+    pub steps_completed: Option<u64>,
+    pub last_loss_total: Option<f64>,
+    pub last_loss_policy: Option<f64>,
+    pub last_loss_value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IterGateSummaryV1 {
+    pub games_target: u64,
+    pub games_completed: u64,
+    pub win_rate: Option<f64>,
+    pub draw_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IterOracleSummaryV1 {
+    pub match_rate_overall: Option<f64>,
+    pub match_rate_mark: Option<f64>,
+    pub match_rate_reroll: Option<f64>,
+    pub keepall_ignored: Option<u64>,
 }
 
 pub fn now_ms() -> u64 {
@@ -520,10 +590,14 @@ mod tests {
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            train_last_loss_total: None,
+            train_last_loss_policy: None,
+            train_last_loss_value: None,
             promotion_decision: None,
             promotion_ts_ms: None,
             gate_games: None,
             gate_win_rate: None,
+            gate_draw_rate: None,
             gate_seeds_hash: None,
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
@@ -533,6 +607,8 @@ mod tests {
             controller_status: None,
             controller_last_ts_ms: None,
             controller_error: None,
+            controller_iteration_idx: 0,
+            iterations: Vec::new(),
         };
         write_manifest_atomic(&run_json, &m).unwrap();
 
@@ -548,6 +624,66 @@ mod tests {
         write_manifest_atomic(&run_json, &m).unwrap();
         let got2 = read_manifest(&run_json).unwrap();
         assert_eq!(got2.selfplay_games_completed, 7);
+    }
+
+    #[test]
+    fn manifest_deserialize_defaults_for_new_fields() {
+        let m = RunManifestV1 {
+            run_manifest_version: RUN_MANIFEST_VERSION,
+            run_id: "r".to_string(),
+            created_ts_ms: now_ms(),
+            protocol_version: 1,
+            feature_schema_id: 1,
+            action_space_id: "oracle_keepmask_v1".to_string(),
+            ruleset_id: "swedish_scandinavian_v1".to_string(),
+            git_hash: None,
+            config_hash: None,
+            config_snapshot: None,
+            config_snapshot_hash: None,
+            replay_dir: "replay".to_string(),
+            logs_dir: "logs".to_string(),
+            models_dir: "models".to_string(),
+            selfplay_games_completed: 0,
+            train_step: 0,
+            best_checkpoint: None,
+            candidate_checkpoint: None,
+            train_last_loss_total: None,
+            train_last_loss_policy: None,
+            train_last_loss_value: None,
+            promotion_decision: None,
+            promotion_ts_ms: None,
+            gate_games: None,
+            gate_win_rate: None,
+            gate_draw_rate: None,
+            gate_seeds_hash: None,
+            gate_oracle_match_rate_overall: None,
+            gate_oracle_match_rate_mark: None,
+            gate_oracle_match_rate_reroll: None,
+            gate_oracle_keepall_ignored: None,
+            controller_phase: None,
+            controller_status: None,
+            controller_last_ts_ms: None,
+            controller_error: None,
+            controller_iteration_idx: 0,
+            iterations: Vec::new(),
+        };
+
+        let mut v = serde_json::to_value(&m).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("controller_iteration_idx");
+        o.remove("iterations");
+        o.remove("train_last_loss_total");
+        o.remove("train_last_loss_policy");
+        o.remove("train_last_loss_value");
+        o.remove("gate_draw_rate");
+
+        let got: RunManifestV1 = serde_json::from_value(v).unwrap();
+        assert_eq!(got.controller_iteration_idx, 0);
+        assert!(got.iterations.is_empty());
+        assert!(got.train_last_loss_total.is_none());
+        assert!(got.train_last_loss_policy.is_none());
+        assert!(got.train_last_loss_value.is_none());
+        assert!(got.gate_draw_rate.is_none());
     }
 
     #[test]

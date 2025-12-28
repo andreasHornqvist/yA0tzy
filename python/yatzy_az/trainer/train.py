@@ -215,6 +215,32 @@ def _append_metrics_train_step(
         f.write(json.dumps(ev) + "\n")
 
 
+def _update_run_manifest_train_scalars(
+    *,
+    run_root: Path,
+    train_step: int,
+    loss_total: float,
+    loss_policy: float,
+    loss_value: float,
+) -> None:
+    """Best-effort: store latest training scalars in runs/<id>/run.json for the TUI."""
+    run_root = Path(run_root)
+    if not (run_root / "run.json").exists():
+        return
+    try:
+        from ..run_manifest import load_manifest, save_manifest_atomic
+
+        m = load_manifest(run_root)
+        m["train_step"] = int(train_step)
+        m["train_last_loss_total"] = float(loss_total)
+        m["train_last_loss_policy"] = float(loss_policy)
+        m["train_last_loss_value"] = float(loss_value)
+        save_manifest_atomic(run_root, m)
+    except Exception:
+        # Best-effort; training can still run without a manifest.
+        pass
+
+
 def run_from_args(args: argparse.Namespace) -> int:
     try:
         import torch
@@ -396,6 +422,13 @@ def run_from_args(args: argparse.Namespace) -> int:
                     entropy=float(ent.item()),
                     lr=float(args.lr),
                     throughput_steps_s=float(throughput),
+                )
+                _update_run_manifest_train_scalars(
+                    run_root=run_root,
+                    train_step=int(step),
+                    loss_total=float(loss.item()),
+                    loss_policy=float(loss_pi.item()),
+                    loss_value=float(loss_v.item()),
                 )
 
     ckpt_path = out_dir / "candidate.pt"

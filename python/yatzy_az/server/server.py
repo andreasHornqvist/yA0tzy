@@ -182,7 +182,11 @@ def add_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--best-id", type=int, default=0, help="model_id for best")
     p.add_argument("--cand-id", type=int, default=1, help="model_id for candidate")
-    p.add_argument("--metrics-bind", default="127.0.0.1:8000", help="Metrics HTTP bind host:port")
+    p.add_argument(
+        "--metrics-bind",
+        default="127.0.0.1:18080",
+        help="Metrics HTTP bind host:port",
+    )
     p.add_argument("--metrics-disable", action="store_true", help="Disable metrics endpoint")
     p.add_argument(
         "--print-stats-every-s",

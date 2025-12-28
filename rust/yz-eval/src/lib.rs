@@ -280,6 +280,11 @@ pub struct GateOptions {
     pub mcts_cfg: MctsConfig,
 }
 
+/// Optional progress sink for gating (used by TUI/controller to render live progress bars).
+pub trait GateProgress {
+    fn on_game_completed(&mut self, completed: u32, total: u32);
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GateReport {
     pub games: u32,
@@ -320,6 +325,14 @@ impl GateReport {
 }
 
 pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, GateError> {
+    gate_with_progress(cfg, opts, None)
+}
+
+pub fn gate_with_progress(
+    cfg: &yz_core::Config,
+    opts: GateOptions,
+    mut progress: Option<&mut dyn GateProgress>,
+) -> Result<GateReport, GateError> {
     let (schedule, seeds, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
         if cfg.gating.paired_seed_swap && (cfg.gating.games % 2 != 0) {
             return Err(GateError::InvalidConfig(
@@ -354,6 +367,8 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
 
     let mut diffs: Vec<i32> = Vec::with_capacity(schedule.len());
     let mut oracle_steps: Vec<OracleDiagStep> = Vec::new();
+    let total = report.games;
+    let mut completed: u32 = 0;
     for gs in schedule {
         let (cand_score, best_score, cand_outcome) =
             run_one_game(cfg, &mut mcts, &best_backend, &cand_backend, gs, &mut oracle_steps)?;
@@ -365,6 +380,11 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
         let d = cand_score - best_score;
         diffs.push(d);
         report.cand_score_diff_sum += d as i64;
+
+        completed += 1;
+        if let Some(p) = progress.as_deref_mut() {
+            p.on_game_completed(completed, total);
+        }
     }
 
     compute_score_diff_stats(&diffs, &mut report);

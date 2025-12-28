@@ -1166,20 +1166,23 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
    * Persist overwriteably to `runs/<id>/config.draft.yaml` (TUI-owned) and reload on open.
    * **AC:** user can configure a run without hand-editing YAML.
 
-3. **TUI starts an iteration (remaining)**
+3. **TUI starts an iteration (done)**
 
    * Add UI actions to start/cancel an iteration using the controller.
    * Run controller work on a background thread/task so the UI remains responsive.
    * Persist progress to `runs/<id>/run.json` (phase/status + timestamps) so the UI can recover after restart.
    * **AC:** from the TUI, pressing “Start” begins an iteration and `run.json` shows phase transitions (`selfplay → train → gate → done`) with status strings.
 
-4. **Dashboard: structured run status + metrics aggregation (remaining)**
+4. **Dashboard: iteration history + live progress (remaining)**
 
-   * Replace “raw metrics tail only” with a structured dashboard:
-     * render controller phase/status from `run.json`
-     * show key counters (selfplay games, train_step, gate games, win_rate)
-     * parse `logs/metrics.ndjson` events and show aggregates (throughput, loss, gating summary)
-   * **AC:** dashboard displays a stable “current iteration view” without requiring manual log inspection.
+   * Replace “raw metrics tail only” with a two-panel dashboard driven by `run.json`:
+     * **Left panel (across iterations):** show per-iteration summaries: promotion decision, loss summaries, oracle match rates, win_rate.
+     * **Right panel (live):** show phase-specific progress bars:
+       * self-play: games completed / target
+       * gating: games completed / target
+       * (optional) training: steps completed / target when `training.steps_per_iteration` is set
+   * Introduce `controller_iteration_idx` + `iterations[]` in `run.json` as the UI’s primary source of truth for iteration history.
+   * **AC:** dashboard shows iteration-to-iteration learning signals on the left, and a clean live progress view on the right without log tailing.
 
 5. **Training orchestration decision (remaining)**
 

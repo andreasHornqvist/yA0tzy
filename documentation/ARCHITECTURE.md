@@ -213,7 +213,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + metrics tail dashboard). Remaining work is tracked in PRD Epic E13 (start/stop controller + richer dashboard + training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
+Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard is moving toward a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/gating progress bars) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13 (dashboard polish + training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
 
 ---
 

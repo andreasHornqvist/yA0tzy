@@ -28,6 +28,7 @@ help:
 	@echo "Variables:"
 	@echo "  PYTHON=<exe>                   Python executable (default: python)"
 	@echo "  INFER_BIND=<endpoint>          Default: unix:///tmp/yatzy_infer.sock"
+	@echo "  METRICS_BIND=<host:port>       Default: 127.0.0.1:18080"
 	@echo "  CONFIG=<path>                  Default: configs/local_cpu.yaml"
 	@echo "  RUN=<id>                       Run id under runs/"
 
@@ -35,11 +36,13 @@ help:
 _print_env:
 	@echo "PYTHON=$(PYTHON)"
 	@echo "INFER_BIND=$(INFER_BIND)"
+	@echo "METRICS_BIND=$(METRICS_BIND)"
 	@echo "CONFIG=$(CONFIG)"
 	@echo "RUN=$(RUN)"
 
 PYTHON ?= python
 INFER_BIND ?= unix:///tmp/yatzy_infer.sock
+METRICS_BIND ?= 127.0.0.1:18080
 CONFIG ?= configs/local_cpu.yaml
 
 # Prefer `uv run` if uv exists; otherwise fall back to plain python.
@@ -83,16 +86,20 @@ tui:
 .PHONY: run
 run:
 	@set -euo pipefail; \
-	echo "Starting infer-server (dummy) on $(INFER_BIND) ..."; \
-	if [[ "$(INFER_BIND)" == unix://* ]]; then \
-	  sock="$${INFER_BIND#unix://}"; \
+	bind="$(INFER_BIND)"; \
+	metrics="$(METRICS_BIND)"; \
+	log_file="/tmp/yatzy_infer_server.log"; \
+	echo "Starting infer-server (dummy) on $$bind (metrics $$metrics) ..."; \
+	echo "Infer-server logs: $$log_file"; \
+	if [[ "$$bind" == unix://* ]]; then \
+	  sock="$${bind#unix://}"; \
 	  rm -f "$$sock"; \
 	fi; \
-	( $(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind "$(INFER_BIND)" ) & \
+	( $(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind "$$bind" --metrics-bind "$$metrics" --print-stats-every-s 0 >"$$log_file" 2>&1 ) & \
 	infer_pid="$$!"; \
-	trap 'echo ""; echo "Stopping infer-server pid=$$infer_pid"; kill "$$infer_pid" 2>/dev/null || true; wait "$$infer_pid" 2>/dev/null || true; if [[ "$(INFER_BIND)" == unix://* ]]; then rm -f "$${INFER_BIND#unix://}"; fi' EXIT INT TERM; \
-	if [[ "$(INFER_BIND)" == unix://* ]]; then \
-	  sock="$${INFER_BIND#unix://}"; \
+	trap 'echo ""; echo "Stopping infer-server pid=$$infer_pid"; kill "$$infer_pid" 2>/dev/null || true; wait "$$infer_pid" 2>/dev/null || true; if [[ "$$bind" == unix://* ]]; then rm -f "$${bind#unix://}"; fi' EXIT INT TERM; \
+	if [[ "$$bind" == unix://* ]]; then \
+	  sock="$${bind#unix://}"; \
 	  echo "Waiting for UDS socket $$sock ..."; \
 	  for _ in $$(seq 1 100); do \
 	    if [[ -S "$$sock" || -e "$$sock" ]]; then break; fi; \
@@ -110,7 +117,7 @@ run:
 
 .PHONY: infer-server-dummy
 infer-server-dummy:
-	$(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind $(INFER_BIND)
+	$(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind $(INFER_BIND) --metrics-bind $(METRICS_BIND) --print-stats-every-s 0
 
 # Convenience wrappers. These assume a run id under ./runs/<id>/.
 .PHONY: selfplay train gate
