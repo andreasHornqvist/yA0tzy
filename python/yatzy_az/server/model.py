@@ -68,19 +68,32 @@ class TorchModel(Model):
         if len(features_batch) == 0:
             return []
 
-        x = torch.as_tensor(features_batch, dtype=torch.float32, device=self._device)
+        # One conversion per batch. For GPU, do a single host->device transfer per batch.
+        x = torch.as_tensor(features_batch, dtype=torch.float32)
+        if x.ndim != 2:
+            raise RuntimeError(f"bad features tensor rank: {x.ndim} (expected 2)")
+        if self._device.type != "cpu":
+            x = x.to(self._device)
+        x = x.contiguous()
 
         with torch.inference_mode():
             logits, v = self._model(x)
 
-        logits_list: list[list[float]] = logits.detach().to("cpu").tolist()
-        v_list: list[float] = v.detach().to("cpu").tolist()
+        if logits.ndim != 2 or logits.shape[0] != x.shape[0] or logits.shape[1] != ACTION_SPACE_A:
+            raise RuntimeError(f"bad logits shape: {tuple(logits.shape)} (expected [B,{ACTION_SPACE_A}])")
+        if v.ndim != 1 or v.shape[0] != x.shape[0]:
+            raise RuntimeError(f"bad value shape: {tuple(v.shape)} (expected [B])")
+
+        logits_cpu = logits.detach().to("cpu")
+        v_cpu = v.detach().to("cpu")
+        logits_list: list[list[float]] = logits_cpu.tolist()
+        v_list: list[float] = v_cpu.tolist()
 
         out: list[InferOutput] = []
         for ls, vv in zip(logits_list, v_list, strict=True):
-            if len(ls) != ACTION_SPACE_A:
-                raise RuntimeError(f"bad logits length: {len(ls)} (expected {ACTION_SPACE_A})")
-            out.append(InferOutput(policy_logits=[float(x) for x in ls], value=float(vv), margin=None))
+            out.append(
+                InferOutput(policy_logits=[float(z) for z in ls], value=float(vv), margin=None)
+            )
         return out
 
 

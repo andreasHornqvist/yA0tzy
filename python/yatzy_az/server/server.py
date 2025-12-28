@@ -46,6 +46,19 @@ class ServerConfig:
     cand_spec: str
     metrics_bind: str
     metrics_disable: bool
+    torch_threads: int | None
+    torch_interop_threads: int | None
+
+
+def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
+    if cfg.torch_threads is None and cfg.torch_interop_threads is None:
+        return
+    import torch
+
+    if cfg.torch_threads is not None:
+        torch.set_num_threads(int(cfg.torch_threads))
+    if cfg.torch_interop_threads is not None:
+        torch.set_num_interop_threads(int(cfg.torch_interop_threads))
 
 
 async def _handle_conn(
@@ -190,6 +203,18 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--best-id", type=int, default=0, help="model_id for best")
     p.add_argument("--cand-id", type=int, default=1, help="model_id for candidate")
     p.add_argument(
+        "--torch-threads",
+        type=int,
+        default=None,
+        help="Optional: torch intra-op threads (CPU perf stability).",
+    )
+    p.add_argument(
+        "--torch-interop-threads",
+        type=int,
+        default=None,
+        help="Optional: torch inter-op threads (CPU perf stability).",
+    )
+    p.add_argument(
         "--metrics-bind",
         default="127.0.0.1:18080",
         help="Metrics HTTP bind host:port",
@@ -216,6 +241,9 @@ def run_from_args(args: argparse.Namespace) -> int:
         cand_spec=args.cand,
         metrics_bind=args.metrics_bind,
         metrics_disable=args.metrics_disable,
+        torch_threads=args.torch_threads,
+        torch_interop_threads=args.torch_interop_threads,
     )
+    _apply_torch_thread_settings(cfg)
     asyncio.run(serve(cfg))
     return 0

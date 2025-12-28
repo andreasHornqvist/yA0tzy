@@ -97,6 +97,8 @@ uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --dev
 # Real checkpoints (E6.5):
 uv run python -m yatzy_az model-init --out runs/<id>/models/best.pt --hidden 256 --blocks 2
 uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best path:runs/<id>/models/best.pt --cand path:runs/<id>/models/candidate.pt
+# Optional CPU perf stability knobs (E6.5S5):
+uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best path:runs/<id>/models/best.pt --cand path:runs/<id>/models/candidate.pt --torch-threads 1 --torch-interop-threads 1
 
 # Benchmarks
 cargo bench -p yz-bench              # Run Criterion microbenches

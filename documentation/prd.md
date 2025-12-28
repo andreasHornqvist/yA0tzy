@@ -883,6 +883,7 @@ However, the current server-side “models” are **dummy/stub** implementations
      * no per-item python overhead inside the model forward
      * uses `torch.inference_mode()`
      * uses contiguous tensors and single device transfer per batch
+     * optional: expose `--torch-threads` / `--torch-interop-threads` to stabilize CPU inference throughput
    * **AC:** Prometheus shows meaningful batch sizes and eval/sec with multiple concurrent Rust games.
 
 6. **Compatibility tests (Rust client ↔ Python real model)**
