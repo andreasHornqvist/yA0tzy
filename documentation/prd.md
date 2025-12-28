@@ -1195,10 +1195,9 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
 5. **Training orchestration decision (remaining)**
 
    * Decide and document how training should be driven by the controller:
-     * **Option A (current):** invoke Python trainer as a subprocess (simple, robust)
-     * **Option B:** embed Python (PyO3) and run training in-process (single-process UX, heavier integration)
-   * Keep the PRD requirement: “UI uses in-process Rust controller (not subprocess spawning)” as the desired end state; the current implementation is a pragmatic stepping stone.
-   * **AC:** PRD and architecture clearly state the chosen approach and the controller implements it end-to-end.
+     * **Chosen (v1):** invoke Python trainer as a subprocess (simple, robust, isolates failures, no tensor IPC).
+     * **Optional later:** embed Python (PyO3) and run training in-process (single-process UX, heavier integration).
+   * **Clarification:** v1 uses an in-process Rust controller for orchestration, but training itself is run as a Python subprocess that reads replay shards from disk and writes checkpoints/metrics to the run directory. This avoids any per-batch tensor serialization across processes.\n+\n+   **AC:**\n+   - Controller sets `controller_phase=\"train\"` with meaningful `controller_status` while training runs.\n+   - Training start/end is visible in `runs/<id>/run.json` (iteration train timestamps).\n+   - Training failure is reflected in `run.json` via `controller_error` and logs are captured under `runs/<id>/logs/`.\n+   - TUI dashboard shows training progress (`steps_completed/steps_target` when configured) and last loss scalars from `run.json`.
 
 ---
 

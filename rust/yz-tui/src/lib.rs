@@ -1143,6 +1143,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             } else {
                                 right_lines.push(Line::from("train_step: -"));
                             }
+
+                            if let Some(v) = it.train.last_loss_total {
+                                right_lines.push(Line::from(format!("loss_total: {v:.4}")));
+                            }
+                            if let Some(v) = it.train.last_loss_policy {
+                                right_lines.push(Line::from(format!("loss_policy: {v:.4}")));
+                            }
+                            if let Some(v) = it.train.last_loss_value {
+                                right_lines.push(Line::from(format!("loss_value: {v:.4}")));
+                            }
                         }
                         _ => {}
                     }

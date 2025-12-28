@@ -130,6 +130,10 @@ See `.github/workflows/ci.yml` for details.
 - **Python** handles GPU-bound work: neural network inference and training
 - Communication via Unix domain sockets (or TCP) with a batched request/response protocol
 
+### Controller + training orchestration (v1)
+- **Controller**: in-process Rust (`rust/yz-controller`) invoked by the TUI (`rust/yz-tui`).
+- **Training**: executed as a **Python subprocess** (`python -m yatzy_az train ...`), launched by the controller.\n+  - The subprocess **reads replay shards from disk** (`runs/<id>/replay/`) and writes checkpoints/metrics into the run directory.\n+  - There is **no tensor IPC** between Rust and Python for training (no per-batch serialization overhead).\n+  - Observability is via `runs/<id>/run.json` (phase/status + latest scalars) and `runs/<id>/logs/metrics.ndjson` (step events).
+
 ### Configuration
 - All runtime knobs live in YAML files under `configs/`
 - Schema validation in both languages:
@@ -227,6 +231,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
 Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard now supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/gating progress bars) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13 (training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
+Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/train/gating) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning).
 
 ### TUI dashboard: source of truth (v1)
 - Progress bars and iteration summaries are driven primarily by `runs/<id>/run.json`:

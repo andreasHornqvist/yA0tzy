@@ -112,6 +112,10 @@ pub struct IterSelfplaySummaryV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IterTrainSummaryV1 {
+    #[serde(default)]
+    pub started_ts_ms: Option<u64>,
+    #[serde(default)]
+    pub ended_ts_ms: Option<u64>,
     pub steps_target: Option<u64>,
     pub steps_completed: Option<u64>,
     pub last_loss_total: Option<f64>,
