@@ -1216,7 +1216,7 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
 2. **Controller iteration loop (`controller.total_iterations`)**
 
    * Implement a controller loop that runs N full iterations (selfplay → train → gate), updating `run.json` counters/status.
-   * **AC:** controller stops after N iterations and the run is auditable from `run.json` + metrics.
+   * **Semantics (v1):** `controller.total_iterations` is an **absolute cap** per run directory.\n+     * `runs/<id>/run.json:controller_iteration_idx` tracks how many iterations have completed.\n+     * If `controller_iteration_idx >= total_iterations`, starting the controller is a no-op (immediately `done`).\n+     * If `controller_iteration_idx = k < total_iterations`, the controller runs only the **remaining** iterations `[k..total_iterations)`.\n+   * **AC:** controller stops after N total iterations and the run is auditable from `run.json` + metrics.
 
 3. **Epochs vs steps semantics**
 

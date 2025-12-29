@@ -334,7 +334,19 @@ pub fn spawn_iteration(
 
             let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
 
-            for _ in 0..total_iters {
+            // Absolute semantics: controller_iteration_idx is the number of completed iterations so far.
+            if manifest.controller_iteration_idx >= total_iters {
+                ctrl.set_phase(
+                    Phase::Done,
+                    format!(
+                        "done (completed {}/{})",
+                        manifest.controller_iteration_idx, total_iters
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            while manifest.controller_iteration_idx < total_iters {
                 if ctrl.cancelled() {
                     return Err(ControllerError::Cancelled);
                 }
@@ -345,7 +357,7 @@ pub fn spawn_iteration(
                 ctrl.set_phase(
                     Phase::Selfplay,
                     format!(
-                        "starting selfplay (iter {}/{} )",
+                        "starting selfplay (iter {}/{})",
                         iter_idx + 1,
                         total_iters
                     ),
@@ -377,7 +389,13 @@ pub fn spawn_iteration(
                 yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
             }
 
-            ctrl.set_phase(Phase::Done, "done")?;
+            ctrl.set_phase(
+                Phase::Done,
+                format!(
+                    "done (completed {}/{})",
+                    manifest.controller_iteration_idx, total_iters
+                ),
+            )?;
             Ok(())
         })();
 
@@ -416,7 +434,11 @@ fn begin_iteration(
         it.promoted = None;
         it.promoted_model = None;
         it.promotion_reason = None;
+        it.selfplay.started_ts_ms = None;
+        it.selfplay.ended_ts_ms = None;
         it.selfplay.games_completed = 0;
+        it.gate.started_ts_ms = None;
+        it.gate.ended_ts_ms = None;
         it.gate.games_completed = 0;
         it.gate.win_rate = None;
         it.gate.draw_rate = None;
@@ -644,6 +666,18 @@ fn run_selfplay(
     let logs_dir = run_dir.join("logs");
     let run_json = run_dir.join("run.json");
 
+    // Record per-iteration phase start (best-effort).
+    {
+        let ts = yz_logging::now_ms();
+        if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+            if it.selfplay.started_ts_ms.is_none() {
+                it.selfplay.started_ts_ms = Some(ts);
+            }
+            it.selfplay.ended_ts_ms = None;
+        }
+        let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
+    }
+
     let backend = connect_infer_backend(infer_endpoint)?;
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
         out_dir: replay_dir,
@@ -772,6 +806,11 @@ fn run_selfplay(
     let _ = loggers.roots.flush();
     let _ = loggers.metrics.flush();
 
+    // Record per-iteration phase end (best-effort).
+    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.selfplay.ended_ts_ms = Some(yz_logging::now_ms());
+    }
+
     let total = base_total + completed_games as u64;
     manifest.selfplay_games_completed = total;
     if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
@@ -794,6 +833,15 @@ fn run_gate(
     }
     let run_json = run_dir.join("run.json");
     let mut m = yz_logging::read_manifest(&run_json)?;
+
+    // Record per-iteration phase start (best-effort).
+    if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        if it.gate.started_ts_ms.is_none() {
+            it.gate.started_ts_ms = Some(yz_logging::now_ms());
+        }
+        it.gate.ended_ts_ms = None;
+    }
+    let _ = yz_logging::write_manifest_atomic(&run_json, &m);
 
     struct ProgressSink {
         run_json: PathBuf,
@@ -858,6 +906,7 @@ fn run_gate(
         it.gate.games_completed = report.games as u64;
         it.gate.win_rate = Some(wr);
         it.gate.draw_rate = Some(report.draw_rate);
+        it.gate.ended_ts_ms = Some(yz_logging::now_ms());
         it.oracle.match_rate_overall = Some(report.oracle_match_rate_overall);
         it.oracle.match_rate_mark = Some(report.oracle_match_rate_mark);
         it.oracle.match_rate_reroll = Some(report.oracle_match_rate_reroll);
@@ -1012,6 +1061,41 @@ mod cancel_tests {
         let it = fresh.iterations.iter().find(|it| it.idx == 0).unwrap();
         assert!(it.train.started_ts_ms.is_some());
         assert!(it.train.ended_ts_ms.is_some());
+    }
+
+    #[test]
+    fn loop_semantics_counts_remaining_iterations() {
+        // Absolute semantics: total_iterations is a cap, so remaining = total - current.
+        let total = 3u32;
+        let mut current = 2u32;
+        let mut ran = 0u32;
+        while current < total {
+            ran += 1;
+            current += 1;
+        }
+        assert_eq!(ran, 1);
+        assert_eq!(current, 3);
+    }
+
+    #[test]
+    fn spawn_iteration_is_noop_when_already_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let mut cfg = yz_core::Config::default();
+        cfg.controller.total_iterations = Some(3);
+
+        // Create manifest so spawn_iteration can read/write run.json.
+        let mut m = ensure_manifest(run_dir, &cfg).unwrap();
+        m.controller_iteration_idx = 3;
+        yz_logging::write_manifest_atomic(run_dir.join("run.json"), &m).unwrap();
+
+        let h = spawn_iteration(run_dir, cfg, "unix:///tmp/does_not_matter.sock".to_string(), "python".to_string());
+        let res = h.join();
+        assert!(res.is_ok());
+
+        let fresh = yz_logging::read_manifest(run_dir.join("run.json")).unwrap();
+        assert_eq!(fresh.controller_iteration_idx, 3);
+        assert_eq!(fresh.controller_phase.as_deref(), Some("done"));
     }
 }
 

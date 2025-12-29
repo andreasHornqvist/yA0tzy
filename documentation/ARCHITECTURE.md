@@ -243,6 +243,9 @@ Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config 
   - `iterations[].gate.games_completed/games_target` drives gating progress
   - training loss scalars are stored as the latest values in `run.json` (best-effort) and copied into `iterations[]` by the controller
 
+### Controller loop semantics (E13.1S2)
+- `controller.total_iterations` is an **absolute cap** per run directory.\n+  - `run.json.controller_iteration_idx` counts completed iterations.\n+  - Starting the controller when `controller_iteration_idx >= total_iterations` is a no-op (immediately `done`).\n+  - Otherwise, the controller runs remaining iterations until `controller_iteration_idx == total_iterations`.
+
 ---
 
 ## Extending This Document
