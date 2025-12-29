@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,111 @@ def _ensure_run_config_snapshot(*, run_root: Path, config_path: Path | None) -> 
         pass
 
 
+def derive_steps_from_epochs(*, epochs: int, total_samples: int, batch_size: int) -> int:
+    if epochs <= 0:
+        raise ValueError("epochs must be > 0")
+    if total_samples <= 0:
+        raise ValueError("total_samples must be > 0")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    steps_per_epoch = int(math.ceil(float(total_samples) / float(batch_size)))
+    return int(epochs) * int(steps_per_epoch)
+
+
+def _best_effort_update_run_manifest_train_progress(
+    *,
+    run_root: Path,
+    steps_target: int | None,
+    steps_completed: int | None,
+) -> None:
+    run_root = Path(run_root)
+    if not (run_root / "run.json").exists():
+        return
+    try:
+        from ..run_manifest import load_manifest, save_manifest_atomic
+
+        m = load_manifest(run_root)
+        cur_idx = int(m.get("controller_iteration_idx", 0))
+        iterations = m.get("iterations")
+        if not isinstance(iterations, list):
+            return
+        for it in iterations:
+            if not isinstance(it, dict):
+                continue
+            if int(it.get("idx", -1)) != cur_idx:
+                continue
+            train = it.get("train")
+            if not isinstance(train, dict):
+                train = {}
+                it["train"] = train
+            if steps_target is not None:
+                train["steps_target"] = int(steps_target)
+            if steps_completed is not None:
+                train["steps_completed"] = int(steps_completed)
+            break
+        save_manifest_atomic(run_root, m)
+    except Exception:
+        pass
+
+
+def _append_metrics_train_plan(
+    *,
+    run_root: Path,
+    train_step_start: int,
+    steps_target: int,
+    epochs: int | None,
+    batch_size: int,
+    total_samples: int | None,
+    snapshot_path: str | None,
+) -> None:
+    """Append a one-time train_plan metrics event to runs/<id>/logs/metrics.ndjson (best-effort)."""
+    run_root = Path(run_root)
+    if not (run_root / "run.json").exists():
+        return
+
+    logs_dir = run_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = logs_dir / "metrics.ndjson"
+
+    run_id = run_root.name
+    git_hash = None
+    config_snapshot = "config.yaml" if (run_root / "config.yaml").exists() else None
+    try:
+        from ..run_manifest import load_manifest
+
+        m = load_manifest(run_root)
+        run_id = str(m.get("run_id", run_id))
+        git_hash = m.get("git_hash")
+        config_snapshot = m.get("config_snapshot", config_snapshot)
+    except Exception:
+        pass
+
+    from ..replay_dataset import FEATURE_SCHEMA_ID, PROTOCOL_VERSION, RULESET_ID
+
+    ev: dict[str, Any] = {
+        "event": "train_plan",
+        "ts_ms": int(time.time() * 1000),
+        "run_id": run_id,
+        "v": {
+            "protocol_version": int(PROTOCOL_VERSION),
+            "feature_schema_id": int(FEATURE_SCHEMA_ID),
+            "action_space_id": "oracle_keepmask_v1",
+            "ruleset_id": str(RULESET_ID),
+        },
+        "git_hash": git_hash,
+        "config_snapshot": config_snapshot,
+        "train_step_start": int(train_step_start),
+        "steps_target": int(steps_target),
+        "epochs": None if epochs is None else int(epochs),
+        "batch_size": int(batch_size),
+        "total_samples": None if total_samples is None else int(total_samples),
+        "snapshot": snapshot_path,
+    }
+
+    with metrics_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
 def _append_metrics_train_step(
     *,
     run_root: Path,
@@ -242,23 +348,9 @@ def _update_run_manifest_train_scalars(
 
 
 def run_from_args(args: argparse.Namespace) -> int:
-    try:
-        import torch
-        import torch.nn.functional as F
-        from torch.utils.data import DataLoader
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            "torch is required for `yatzy_az train` (E8). Install with the `train` extra."
-        ) from e
-
-    from ..replay_dataset import (
-        ACTION_SPACE_A,
-        FEATURE_LEN,
-        FEATURE_SCHEMA_ID,
-        PROTOCOL_VERSION,
-        RULESET_ID,
-        ReplayIterableDataset,
-    )
+    # Note: torch is imported later, after we resolve deterministic step semantics.
+    # This allows epochs-mode policy errors to be raised even if torch isn't installed.
+    from ..replay_dataset import ReplayIterableDataset
 
     replay_dir = Path(args.replay)
 
@@ -286,9 +378,6 @@ def run_from_args(args: argparse.Namespace) -> int:
             args.lr = float(cfg.training.learning_rate)
         if args.weight_decay is None:
             args.weight_decay = float(cfg.training.weight_decay)
-        if args.steps is None:
-            s = cfg.training.steps_per_iteration
-            args.steps = int(s) if s is not None else None
 
     # Final defaults (backwards compatible when no config is present).
     if args.batch_size is None:
@@ -297,10 +386,10 @@ def run_from_args(args: argparse.Namespace) -> int:
         args.lr = 1e-3
     if args.weight_decay is None:
         args.weight_decay = 0.0
-    if args.steps is None:
-        # If config didn't specify steps_per_iteration, keep existing default behavior.
-        args.steps = 200
+
     shard_files = None
+    snap: dict[str, Any] | None = None
+    snapshot_path: Path | None = None
     if not bool(args.no_snapshot):
         snapshot_path = (
             Path(args.snapshot) if args.snapshot is not None else run_root / "replay_snapshot.json"
@@ -323,6 +412,59 @@ def run_from_args(args: argparse.Namespace) -> int:
             save_manifest_atomic(run_root, m)
         except Exception:
             pass
+
+    # Determine training steps target (deterministic policy).
+    epochs_mode = False
+    steps_target: int | None = None
+    steps_source: str | None = None
+
+    if args.steps is not None:
+        steps_target = int(args.steps)
+        steps_source = "cli"
+    elif cfg is not None and cfg.training.steps_per_iteration is not None:
+        steps_target = int(cfg.training.steps_per_iteration)
+        steps_source = "config_steps_per_iteration"
+    elif cfg is not None:
+        # Epochs-mode requires a snapshot to be deterministic.
+        epochs_mode = True
+        if bool(args.no_snapshot):
+            raise RuntimeError(
+                "epochs-mode requires replay snapshot semantics. "
+                "Either enable snapshot mode (default) or provide explicit --steps."
+            )
+        if snap is None:
+            raise RuntimeError("epochs-mode requires replay_snapshot.json (missing snapshot)")
+        total_samples = int(snap.get("total_samples", 0))
+        steps_target = derive_steps_from_epochs(
+            epochs=int(cfg.training.epochs),
+            total_samples=total_samples,
+            batch_size=int(args.batch_size),
+        )
+        steps_source = "epochs_derived_from_snapshot"
+    else:
+        # Backwards-compatible ad-hoc behavior when no config is present.
+        steps_target = 200
+        steps_source = "default"
+
+    if steps_target is None or steps_target <= 0:
+        raise RuntimeError(f"invalid steps_target={steps_target} (source={steps_source})")
+
+    try:
+        import torch
+        import torch.nn.functional as F
+        from torch.utils.data import DataLoader
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "torch is required for `yatzy_az train` (E8). Install with the `train` extra."
+        ) from e
+
+    from ..replay_dataset import (
+        ACTION_SPACE_A,
+        FEATURE_LEN,
+        FEATURE_SCHEMA_ID,
+        PROTOCOL_VERSION,
+        RULESET_ID,
+    )
 
     ds = ReplayIterableDataset(
         replay_dir,
@@ -362,10 +504,27 @@ def run_from_args(args: argparse.Namespace) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Best-effort: write derived steps_target into run.json for TUI progress.
+    _best_effort_update_run_manifest_train_progress(
+        run_root=run_root, steps_target=int(steps_target), steps_completed=None
+    )
+
+    # Best-effort: record train plan into unified metrics stream.
+    total_samples_for_plan = int(snap.get("total_samples")) if isinstance(snap, dict) else None
+    _append_metrics_train_plan(
+        run_root=run_root,
+        train_step_start=int(start_step),
+        steps_target=int(steps_target),
+        epochs=int(cfg.training.epochs) if (epochs_mode and cfg is not None) else None,
+        batch_size=int(args.batch_size),
+        total_samples=total_samples_for_plan if epochs_mode else None,
+        snapshot_path=str(snapshot_path.name) if snapshot_path is not None else None,
+    )
+
     it = iter(dl)
     last_log_t = time.perf_counter()
     last_log_step = start_step
-    for step in range(start_step + 1, start_step + int(args.steps) + 1):
+    for step in range(start_step + 1, start_step + int(steps_target) + 1):
         try:
             x, legal, pi, z, _z_margin = next(it)
         except StopIteration:
@@ -429,6 +588,11 @@ def run_from_args(args: argparse.Namespace) -> int:
                     loss_total=float(loss.item()),
                     loss_policy=float(loss_pi.item()),
                     loss_value=float(loss_v.item()),
+                )
+                _best_effort_update_run_manifest_train_progress(
+                    run_root=run_root,
+                    steps_target=int(steps_target),
+                    steps_completed=int(step),
                 )
 
     ckpt_path = out_dir / "candidate.pt"

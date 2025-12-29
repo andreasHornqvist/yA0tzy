@@ -10,11 +10,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, wandb_sync
+from .model.init import init_model_checkpoint
 from .server import server as infer_server
 from .trainer import train as train_mod
-from . import wandb_sync
-from .model.init import init_model_checkpoint
 
 
 def cmd_infer_server(args: argparse.Namespace) -> int:

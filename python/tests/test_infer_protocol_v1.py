@@ -52,6 +52,7 @@ async def _uds_server_smoke_batches() -> None:
     sock = pathlib.Path("/tmp") / f"yatzy_infer_test_{time.time_ns()}.sock"
     cfg = ServerConfig(
         bind=f"unix://{sock}",
+        device="cpu",
         max_batch=128,
         max_wait_us=50_000,
         print_stats_every_s=0,
@@ -61,6 +62,8 @@ async def _uds_server_smoke_batches() -> None:
         cand_spec="dummy",
         metrics_bind="127.0.0.1:0",
         metrics_disable=True,
+        torch_threads=None,
+        torch_interop_threads=None,
     )
     task = asyncio.create_task(serve(cfg))
     await asyncio.sleep(0.05)
@@ -102,6 +105,7 @@ async def _uds_server_routes_by_model_id() -> None:
     sock = pathlib.Path("/tmp") / f"yatzy_infer_route_test_{time.time_ns()}.sock"
     cfg = ServerConfig(
         bind=f"unix://{sock}",
+        device="cpu",
         max_batch=128,
         max_wait_us=50_000,
         print_stats_every_s=0,
@@ -111,6 +115,8 @@ async def _uds_server_routes_by_model_id() -> None:
         cand_spec="dummy:-0.1",
         metrics_bind="127.0.0.1:0",
         metrics_disable=True,
+        torch_threads=None,
+        torch_interop_threads=None,
     )
     task = asyncio.create_task(serve(cfg))
     await asyncio.sleep(0.05)

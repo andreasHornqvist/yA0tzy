@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..model.net import A as ACTION_SPACE_A_MODEL
+from ..model.net import F as FEATURE_LEN
+from ..replay_dataset import FEATURE_SCHEMA_ID, PROTOCOL_VERSION, RULESET_ID
+from .protocol_v1 import ACTION_SPACE_A as ACTION_SPACE_A_PROTOCOL
+
 
 class CheckpointError(RuntimeError):
     pass
@@ -86,11 +91,6 @@ def load_checkpoint(path: Path, *, map_location: str = "cpu") -> CheckpointV1:
     if meta is None:
         raise CheckpointError(f"{path}: missing 'meta'")
     meta = _require_dict(meta, where=f"{path}:meta")
-
-    # Compatibility checks.
-    from ..model.net import F as FEATURE_LEN, A as ACTION_SPACE_A_MODEL
-    from ..replay_dataset import FEATURE_SCHEMA_ID, PROTOCOL_VERSION, RULESET_ID
-    from .protocol_v1 import ACTION_SPACE_A as ACTION_SPACE_A_PROTOCOL
 
     feature_len = _require_int(cfg, "feature_len", where=f"{path}:config")
     if feature_len != int(FEATURE_LEN):

@@ -1222,8 +1222,7 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
 
    * Make trainer behavior explicit and deterministic:
      * if `training.steps_per_iteration` is set, run exactly that many optimizer steps
-     * else derive steps from `training.epochs` and the replay snapshot size (or document a clear policy)
-   * **AC:** epochs/steps behavior is deterministic and logged.
+     * else derive steps from `training.epochs` and the replay snapshot size\n+       * `steps_per_epoch = ceil(replay_snapshot.total_samples / training.batch_size)`\n+       * `steps_target = training.epochs * steps_per_epoch`\n+     * epochs-mode requires replay snapshot semantics (or explicit `--steps`) for determinism\n+   * **Precedence:** CLI `--steps` > `training.steps_per_iteration` > epochs-derived\n+   * **AC:**\n+     * epochs/steps behavior is deterministic and logged\n+     * `runs/<id>/run.json` includes `iterations[].train.steps_target` so the TUI can show training progress\n+     * `logs/metrics.ndjson` includes a `train_plan` event capturing the derived target inputs
 
 ## Epic R1 — Refactor: Code quality & tech debt
 

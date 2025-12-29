@@ -246,6 +246,9 @@ Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config 
 ### Controller loop semantics (E13.1S2)
 - `controller.total_iterations` is an **absolute cap** per run directory.\n+  - `run.json.controller_iteration_idx` counts completed iterations.\n+  - Starting the controller when `controller_iteration_idx >= total_iterations` is a no-op (immediately `done`).\n+  - Otherwise, the controller runs remaining iterations until `controller_iteration_idx == total_iterations`.
 
+### Training duration semantics (E13.1S3)
+- Preferred: specify `training.steps_per_iteration` so each iteration has a **stable compute budget**.\n+- If `steps_per_iteration` is not set, training derives a deterministic step target from the frozen replay snapshot:\n+  - `steps_per_epoch = ceil(replay_snapshot.total_samples / training.batch_size)`\n+  - `steps_target = training.epochs * steps_per_epoch`\n+- Epochs-mode requires replay snapshot semantics (or explicit CLI `--steps`) for reproducibility.\n+- Trainer records `iterations[].train.steps_target` in `run.json` and emits a one-time `train_plan` event in `logs/metrics.ndjson`.
+
 ---
 
 ## Extending This Document
