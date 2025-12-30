@@ -14,6 +14,7 @@ class MetricsSnapshot:
     start_s: float
     queue_depth: int
     batcher: BatcherStats
+    reloads_total: int = 0
 
 
 def format_prometheus(snapshot: MetricsSnapshot) -> str:
@@ -39,6 +40,8 @@ def format_prometheus(snapshot: MetricsSnapshot) -> str:
     lines.append("# TYPE yatzy_infer_batch_size_bucket histogram")
     lines.append("# HELP yatzy_infer_batch_size_count Total number of batches (by model_id).")
     lines.append("# TYPE yatzy_infer_batch_size_count counter")
+    lines.append("# HELP yatzy_infer_model_reloads_total Total model hot-reloads (E13.2S4).")
+    lines.append("# TYPE yatzy_infer_model_reloads_total counter")
 
     uptime = max(0.0, snapshot.now_s - snapshot.start_s)
     gauge("yatzy_infer_uptime_seconds", uptime)
@@ -47,6 +50,7 @@ def format_prometheus(snapshot: MetricsSnapshot) -> str:
     # Global counters.
     counter("yatzy_infer_requests_total", float(snapshot.batcher.requests_total))
     counter("yatzy_infer_batches_total", float(snapshot.batcher.batches_total))
+    counter("yatzy_infer_model_reloads_total", float(snapshot.reloads_total))
 
     # Per-model histogram. We expose histogram buckets over batch sizes.
     for model_id, ms in sorted(snapshot.batcher.by_model.items()):

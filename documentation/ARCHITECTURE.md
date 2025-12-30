@@ -235,13 +235,23 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 in progress**: E13.2S1 (controller passes `--best`), E13.2S2 (auto-bootstrap `best.pt` via `model-init`), and E13.2S3 (auto-promotion after gating) are complete; remaining stories cover inference server hot-reload (E13.2S4–S5).
+Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 in progress**: E13.2S1–E13.2S4 are complete (controller passes `--best`, auto-bootstrap `best.pt`, auto-promotion, model hot-reload); remaining story is E13.2S5 (TUI preflight checks).
 
 ### Automatic promotion (E13.2S3)
 - After gating, `finalize_iteration` in `yz-controller` checks if `win_rate >= threshold`.
 - If promoted, `candidate.pt` is atomically copied to `best.pt` (via temp file + rename).
 - A `MetricsPromotionV1` event is emitted to `runs/<id>/logs/metrics.ndjson` for traceability.
 - `run.json.iterations[].promoted` records the decision; `manifest.best_checkpoint` is updated on promotion.
+
+### Model hot-reload (E13.2S4)
+- The Python inference server exposes `POST /reload` on the metrics HTTP endpoint (default `127.0.0.1:18080`).
+- Request body: `{"model_id": "best"|"cand", "path": "/abs/path/to/checkpoint.pt"}`.
+- `Batcher.replace_model()` atomically swaps the model (GIL-safe dict assignment).
+- Prometheus counter `yatzy_infer_model_reloads_total` tracks reload events.
+- Rust controller calls:
+  - `reload_best_for_selfplay()` before selfplay phase.
+  - `reload_models_for_gating()` before gating phase (reloads both best + candidate).
+- Config knob: `inference.metrics_bind` (default `127.0.0.1:18080`).
 
 ### Replay shard naming + retention (E13.1S1)
 - Shards are stored as paired files under `runs/<id>/replay/`:

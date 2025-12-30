@@ -1293,7 +1293,7 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
      * `run.json` and `logs/metrics.ndjson` record the promotion event.
    * **Status:** `finalize_iteration` in `yz-controller` performs atomic copy (`copy_atomic`) when `promoted=true` and emits a `MetricsPromotionV1` event to `logs/metrics.ndjson`.
 
-4. **Inference server model hot-reload**
+4. **Inference server model hot-reload (done)**
 
    * Extend the Python inference server to support hot-reloading models without restart:
      * Add a control endpoint (e.g. UDS command or HTTP `/reload`) that accepts `{"model_id": "best"|"cand", "path": "..."}`.
@@ -1305,6 +1305,10 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
      * Server stays running across phases; models are swapped via reload endpoint.
      * Prometheus metrics show `model_reloads_total` counter.
      * Integration test: start server → reload model → verify inference uses new weights.
+   * **Status:**
+     * Python: `POST /reload` endpoint in `metrics_server.py`; `Batcher.replace_model()` for atomic swap; `yatzy_infer_model_reloads_total` counter in Prometheus.
+     * Rust: `reload_model()` HTTP client using `ureq`; controller calls `reload_best_for_selfplay()` and `reload_models_for_gating()`.
+     * Config: `inference.metrics_bind` added to shared config schema (default `127.0.0.1:18080`).
 
 5. **TUI preflight checks + status**
 

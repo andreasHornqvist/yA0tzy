@@ -82,6 +82,14 @@ pub struct InferenceConfig {
     pub max_batch: u32,
     /// Maximum wait time in microseconds before flushing a partial batch.
     pub max_wait_us: u64,
+    /// Metrics/control HTTP bind address (e.g., "127.0.0.1:18080").
+    /// Used for hot-reloading models (E13.2S4).
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
+}
+
+fn default_metrics_bind() -> String {
+    "127.0.0.1:18080".to_string()
 }
 
 /// MCTS algorithm configuration.
@@ -244,6 +252,7 @@ impl Default for Config {
                 device: "cpu".to_string(),
                 max_batch: 32,
                 max_wait_us: 1000,
+                metrics_bind: default_metrics_bind(),
             },
             mcts: MctsConfig {
                 c_puct: 1.5,

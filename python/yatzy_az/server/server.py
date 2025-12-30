@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from .batcher import Batcher
 from .metrics import MetricsSnapshot, now_s
-from .metrics_server import start_metrics_server
+from .metrics_server import ReloadResult, start_metrics_server
 from .model import build_model
 from .protocol_v1 import (
     DecodeError,
@@ -104,7 +104,29 @@ async def serve(config: ServerConfig) -> None:
             start_s=start_s,
             queue_depth=batcher.queue_depth,
             batcher=batcher.stats,
+            reloads_total=batcher.reloads_total,
         )
+
+    def reload_model(model_id_str: str, path: str) -> ReloadResult:
+        """Hot-reload a model (E13.2S4)."""
+        try:
+            # Map model_id string to numeric ID.
+            if model_id_str == "best":
+                numeric_id = int(config.best_id)
+            elif model_id_str == "cand":
+                numeric_id = int(config.cand_id)
+            else:
+                return ReloadResult(ok=False, error=f"unknown model_id: {model_id_str}")
+
+            # Build new model from checkpoint.
+            new_model = build_model(f"path:{path}", device=config.device)
+
+            # Atomically swap the model.
+            batcher.replace_model(numeric_id, new_model)
+
+            return ReloadResult(ok=True)
+        except Exception as e:  # noqa: BLE001
+            return ReloadResult(ok=False, error=str(e))
 
     stop_ev = asyncio.Event()
 
@@ -138,7 +160,9 @@ async def serve(config: ServerConfig) -> None:
         async with server:
             metrics_srv = None
             if not config.metrics_disable:
-                metrics_srv = await start_metrics_server(config.metrics_bind, snapshot)
+                metrics_srv = await start_metrics_server(
+                    config.metrics_bind, snapshot, reload_callback=reload_model
+                )
             stats_task = asyncio.create_task(_print_stats_loop(batcher, config.print_stats_every_s))
             try:
                 await stop_ev.wait()

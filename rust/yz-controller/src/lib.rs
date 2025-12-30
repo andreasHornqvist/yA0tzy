@@ -52,6 +52,8 @@ pub enum ControllerError {
     Gate(#[from] yz_eval::GateError),
     #[error("cancelled")]
     Cancelled,
+    #[error("model reload failed: {0}")]
+    ReloadModel(String),
 }
 
 /// Minimal controller handle (phase/status updates only, v1).
@@ -267,9 +269,13 @@ pub fn run_selfplay_then_gate(
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
     let iter_idx = manifest.controller_iteration_idx;
     begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
+    // E13.2S4: Hot-reload best model before selfplay.
+    reload_best_for_selfplay(run_dir, &cfg)?;
     run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
+    // E13.2S4: Hot-reload best + candidate models before gating.
+    reload_models_for_gating(run_dir, &cfg)?;
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
     finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
@@ -298,6 +304,8 @@ pub fn run_iteration(
     begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
+    // E13.2S4: Hot-reload best model before selfplay.
+    reload_best_for_selfplay(run_dir, &cfg)?;
     run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Train, "starting train")?;
@@ -305,6 +313,8 @@ pub fn run_iteration(
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     refresh_train_stats_from_run_json(run_dir, &mut manifest, iter_idx)?;
+    // E13.2S4: Hot-reload best + candidate models before gating.
+    reload_models_for_gating(run_dir, &cfg)?;
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
     finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
@@ -368,6 +378,8 @@ pub fn spawn_iteration(
                         total_iters
                     ),
                 )?;
+                // E13.2S4: Hot-reload best model before selfplay.
+                reload_best_for_selfplay(&run_dir, &cfg)?;
                 run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
                 if ctrl.cancelled() {
                     return Err(ControllerError::Cancelled);
@@ -388,6 +400,8 @@ pub fn spawn_iteration(
                     Phase::Gate,
                     format!("starting gate (iter {}/{})", iter_idx + 1, total_iters),
                 )?;
+                // E13.2S4: Hot-reload best + candidate models before gating.
+                reload_models_for_gating(&run_dir, &cfg)?;
                 run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
 
                 finalize_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
@@ -477,6 +491,80 @@ fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     let tmp = dst.with_extension("pt.tmp");
     std::fs::copy(src, &tmp)?;
     std::fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
+/// Reload request payload (E13.2S4).
+#[derive(serde::Serialize)]
+struct ReloadRequest<'a> {
+    model_id: &'a str,
+    path: &'a str,
+}
+
+/// Reload response payload (E13.2S4).
+#[derive(serde::Deserialize)]
+struct ReloadResponse {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Call the inference server's `/reload` endpoint to hot-swap a model (E13.2S4).
+///
+/// * `metrics_bind` - HTTP bind address (e.g. "127.0.0.1:9100")
+/// * `model_id` - "best" or "cand"
+/// * `checkpoint_path` - absolute path to the checkpoint file
+fn reload_model(
+    metrics_bind: &str,
+    model_id: &str,
+    checkpoint_path: &Path,
+) -> Result<(), ControllerError> {
+    let url = format!("http://{}/reload", metrics_bind);
+    let body = ReloadRequest {
+        model_id,
+        path: checkpoint_path
+            .to_str()
+            .ok_or_else(|| ControllerError::ReloadModel("path contains invalid UTF-8".to_string()))?,
+    };
+
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(&body)
+        .map_err(|e| ControllerError::ReloadModel(format!("HTTP request failed: {e}")))?;
+
+    let resp_body: ReloadResponse = resp
+        .into_json()
+        .map_err(|e| ControllerError::ReloadModel(format!("invalid response JSON: {e}")))?;
+
+    if resp_body.ok {
+        Ok(())
+    } else {
+        Err(ControllerError::ReloadModel(
+            resp_body.error.unwrap_or_else(|| "unknown error".to_string()),
+        ))
+    }
+}
+
+/// Reload the "best" model before selfplay (E13.2S4).
+fn reload_best_for_selfplay(run_dir: &Path, cfg: &yz_core::Config) -> Result<(), ControllerError> {
+    let best_path = run_dir.join("models").join("best.pt");
+    if best_path.exists() {
+        reload_model(&cfg.inference.metrics_bind, "best", &best_path)?;
+    }
+    Ok(())
+}
+
+/// Reload both "best" and "cand" models before gating (E13.2S4).
+fn reload_models_for_gating(run_dir: &Path, cfg: &yz_core::Config) -> Result<(), ControllerError> {
+    let best_path = run_dir.join("models").join("best.pt");
+    let cand_path = run_dir.join("models").join("candidate.pt");
+
+    if best_path.exists() {
+        reload_model(&cfg.inference.metrics_bind, "best", &best_path)?;
+    }
+    if cand_path.exists() {
+        reload_model(&cfg.inference.metrics_bind, "cand", &cand_path)?;
+    }
     Ok(())
 }
 
@@ -1390,6 +1478,32 @@ mod cancel_tests {
         let it = fresh.iterations.iter().find(|it| it.idx == 0).unwrap();
         assert_eq!(it.promoted, Some(false));
         assert_eq!(it.promoted_model.as_deref(), Some("best"));
+    }
+
+    #[test]
+    fn reload_request_serializes_correctly() {
+        // E13.2S4: verify ReloadRequest JSON format.
+        let req = ReloadRequest {
+            model_id: "best",
+            path: "/tmp/models/best.pt",
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""model_id":"best""#));
+        assert!(json.contains(r#""path":"/tmp/models/best.pt""#));
+    }
+
+    #[test]
+    fn reload_response_deserializes_correctly() {
+        // E13.2S4: verify ReloadResponse JSON parsing.
+        let ok_json = r#"{"ok":true}"#;
+        let resp: ReloadResponse = serde_json::from_str(ok_json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+
+        let err_json = r#"{"ok":false,"error":"file not found"}"#;
+        let resp: ReloadResponse = serde_json::from_str(err_json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("file not found"));
     }
 }
 

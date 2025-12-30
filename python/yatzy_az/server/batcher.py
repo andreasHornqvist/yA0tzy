@@ -57,6 +57,7 @@ class Batcher:
         self._q: asyncio.Queue[_Queued] = asyncio.Queue()
         self._stats = BatcherStats()
         self._stop = asyncio.Event()
+        self._reloads_total: int = 0
 
     @property
     def stats(self) -> BatcherStats:
@@ -65,6 +66,19 @@ class Batcher:
     @property
     def queue_depth(self) -> int:
         return self._q.qsize()
+
+    @property
+    def reloads_total(self) -> int:
+        return self._reloads_total
+
+    def replace_model(self, model_id: int, new_model: Model) -> None:
+        """Atomically replace the model for the given ID (E13.2S4).
+
+        Safe because Python dict assignment is atomic under the GIL.
+        In-flight batches using the old model will complete; new requests use the new model.
+        """
+        self._models[model_id] = new_model
+        self._reloads_total += 1
 
     async def enqueue(self, req: InferRequestV1) -> InferResponseV1:
         loop = asyncio.get_running_loop()
