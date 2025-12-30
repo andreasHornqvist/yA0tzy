@@ -132,7 +132,10 @@ See `.github/workflows/ci.yml` for details.
 
 ### Controller + training orchestration (v1)
 - **Controller**: in-process Rust (`rust/yz-controller`) invoked by the TUI (`rust/yz-tui`).
-- **Training**: executed as a **Python subprocess** (`python -m yatzy_az train ...`), launched by the controller.\n+  - The subprocess **reads replay shards from disk** (`runs/<id>/replay/`) and writes checkpoints/metrics into the run directory.\n+  - There is **no tensor IPC** between Rust and Python for training (no per-batch serialization overhead).\n+  - Observability is via `runs/<id>/run.json` (phase/status + latest scalars) and `runs/<id>/logs/metrics.ndjson` (step events).
+- **Training**: executed as a **Python subprocess** (`python -m yatzy_az train ...`), launched by the controller.
+  - The subprocess **reads replay shards from disk** (`runs/<id>/replay/`) and writes checkpoints/metrics into the run directory.
+  - There is **no tensor IPC** between Rust and Python for training (no per-batch serialization overhead).
+  - Observability is via `runs/<id>/run.json` (phase/status + latest scalars) and `runs/<id>/logs/metrics.ndjson` (step events).
 
 ### Configuration
 - All runtime knobs live in YAML files under `configs/`
@@ -230,11 +233,15 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard now supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/gating progress bars) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13 (training orchestration decision) and Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning + controller iteration loops).
-Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config editor + dashboard). The dashboard supports a two-panel layout: **iteration history** (promotion/loss/oracle accuracy per iteration) + **live phase progress** (self-play/train/gating) driven primarily by `runs/<id>/run.json`. Remaining work is tracked in PRD Epic E13.1 (finish runtime behavior for newly added knobs like replay pruning).
+Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2** planned for closing the loop (auto-promotion, model bootstrap, inference server hot-reload).
 
 ### Replay shard naming + retention (E13.1S1)
-- Shards are stored as paired files under `runs/<id>/replay/`:\n+  - `shard_{idx:06}.safetensors`\n+  - `shard_{idx:06}.meta.json`\n+- `ShardWriter` resumes at `max_existing_idx + 1` to avoid overwriting shards when appending more data to an existing run.\n+- If `replay.capacity_shards` is set, we keep the **newest N shards by filename index** and delete older pairs.\n+- Pruning emits a `replay_prune` event into `runs/<id>/logs/metrics.ndjson` for auditability.
+- Shards are stored as paired files under `runs/<id>/replay/`:
+  - `shard_{idx:06}.safetensors`
+  - `shard_{idx:06}.meta.json`
+- `ShardWriter` resumes at `max_existing_idx + 1` to avoid overwriting shards when appending more data to an existing run.
+- If `replay.capacity_shards` is set, we keep the **newest N shards by filename index** and delete older pairs.
+- Pruning emits a `replay_prune` event into `runs/<id>/logs/metrics.ndjson` for auditability.
 
 ### TUI dashboard: source of truth (v1)
 - Progress bars and iteration summaries are driven primarily by `runs/<id>/run.json`:
@@ -244,10 +251,18 @@ Terminal UI status: **Epic E13 in progress** (`yz tui` run picker + full config 
   - training loss scalars are stored as the latest values in `run.json` (best-effort) and copied into `iterations[]` by the controller
 
 ### Controller loop semantics (E13.1S2)
-- `controller.total_iterations` is an **absolute cap** per run directory.\n+  - `run.json.controller_iteration_idx` counts completed iterations.\n+  - Starting the controller when `controller_iteration_idx >= total_iterations` is a no-op (immediately `done`).\n+  - Otherwise, the controller runs remaining iterations until `controller_iteration_idx == total_iterations`.
+- `controller.total_iterations` is an **absolute cap** per run directory.
+  - `run.json.controller_iteration_idx` counts completed iterations.
+  - Starting the controller when `controller_iteration_idx >= total_iterations` is a no-op (immediately `done`).
+  - Otherwise, the controller runs remaining iterations until `controller_iteration_idx == total_iterations`.
 
 ### Training duration semantics (E13.1S3)
-- Preferred: specify `training.steps_per_iteration` so each iteration has a **stable compute budget**.\n+- If `steps_per_iteration` is not set, training derives a deterministic step target from the frozen replay snapshot:\n+  - `steps_per_epoch = ceil(replay_snapshot.total_samples / training.batch_size)`\n+  - `steps_target = training.epochs * steps_per_epoch`\n+- Epochs-mode requires replay snapshot semantics (or explicit CLI `--steps`) for reproducibility.\n+- Trainer records `iterations[].train.steps_target` in `run.json` and emits a one-time `train_plan` event in `logs/metrics.ndjson`.
+- Preferred: specify `training.steps_per_iteration` so each iteration has a **stable compute budget**.
+- If `steps_per_iteration` is not set, training derives a deterministic step target from the frozen replay snapshot:
+  - `steps_per_epoch = ceil(replay_snapshot.total_samples / training.batch_size)`
+  - `steps_target = training.epochs * steps_per_epoch`
+- Epochs-mode requires replay snapshot semantics (or explicit CLI `--steps`) for reproducibility.
+- Trainer records `iterations[].train.steps_target` in `run.json` and emits a one-time `train_plan` event in `logs/metrics.ndjson`.
 
 ---
 

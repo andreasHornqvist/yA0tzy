@@ -1197,7 +1197,12 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
    * Decide and document how training should be driven by the controller:
      * **Chosen (v1):** invoke Python trainer as a subprocess (simple, robust, isolates failures, no tensor IPC).
      * **Optional later:** embed Python (PyO3) and run training in-process (single-process UX, heavier integration).
-   * **Clarification:** v1 uses an in-process Rust controller for orchestration, but training itself is run as a Python subprocess that reads replay shards from disk and writes checkpoints/metrics to the run directory. This avoids any per-batch tensor serialization across processes.\n+\n+   **AC:**\n+   - Controller sets `controller_phase=\"train\"` with meaningful `controller_status` while training runs.\n+   - Training start/end is visible in `runs/<id>/run.json` (iteration train timestamps).\n+   - Training failure is reflected in `run.json` via `controller_error` and logs are captured under `runs/<id>/logs/`.\n+   - TUI dashboard shows training progress (`steps_completed/steps_target` when configured) and last loss scalars from `run.json`.
+   * **Clarification:** v1 uses an in-process Rust controller for orchestration, but training itself is run as a Python subprocess that reads replay shards from disk and writes checkpoints/metrics to the run directory. This avoids any per-batch tensor serialization across processes.
+   * **AC:**
+     * Controller sets `controller_phase="train"` with meaningful `controller_status` while training runs.
+     * Training start/end is visible in `runs/<id>/run.json` (iteration train timestamps).
+     * Training failure is reflected in `run.json` via `controller_error` and logs are captured under `runs/<id>/logs/`.
+     * TUI dashboard shows training progress (`steps_completed/steps_target` when configured) and last loss scalars from `run.json`.
 
 ---
 
@@ -1211,18 +1216,104 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
 
    * Implement deterministic pruning of `runs/<id>/replay/` after shard flush/close.
    * Emit a metrics event (e.g. `replay_prune`) to `logs/metrics.ndjson` summarizing what was removed.
-   * **Pruning policy (v1):** shard files are named `shard_{idx:06}.safetensors` + `shard_{idx:06}.meta.json` and pruning keeps the **newest N shards by filename index**.\n+     * Writer must **resume** at `max_existing_idx + 1` to avoid overwriting shards when continuing self-play in the same run directory.\n+   * **AC:**\n+     * replay directory growth is bounded across iterations (keeps newest N shards)\n+     * pruning behavior is reproducible/auditable (deterministic by shard idx)\n+     * `logs/metrics.ndjson` includes `event=\"replay_prune\"` with before/after/deleted counts
+   * **Pruning policy (v1):** shard files are named `shard_{idx:06}.safetensors` + `shard_{idx:06}.meta.json` and pruning keeps the **newest N shards by filename index**.
+     * Writer must **resume** at `max_existing_idx + 1` to avoid overwriting shards when continuing self-play in the same run directory.
+   * **AC:**
+     * replay directory growth is bounded across iterations (keeps newest N shards)
+     * pruning behavior is reproducible/auditable (deterministic by shard idx)
+     * `logs/metrics.ndjson` includes `event="replay_prune"` with before/after/deleted counts
 
 2. **Controller iteration loop (`controller.total_iterations`)**
 
    * Implement a controller loop that runs N full iterations (selfplay → train → gate), updating `run.json` counters/status.
-   * **Semantics (v1):** `controller.total_iterations` is an **absolute cap** per run directory.\n+     * `runs/<id>/run.json:controller_iteration_idx` tracks how many iterations have completed.\n+     * If `controller_iteration_idx >= total_iterations`, starting the controller is a no-op (immediately `done`).\n+     * If `controller_iteration_idx = k < total_iterations`, the controller runs only the **remaining** iterations `[k..total_iterations)`.\n+   * **AC:** controller stops after N total iterations and the run is auditable from `run.json` + metrics.
+   * **Semantics (v1):** `controller.total_iterations` is an **absolute cap** per run directory.
+     * `runs/<id>/run.json:controller_iteration_idx` tracks how many iterations have completed.
+     * If `controller_iteration_idx >= total_iterations`, starting the controller is a no-op (immediately `done`).
+     * If `controller_iteration_idx = k < total_iterations`, the controller runs only the **remaining** iterations `[k..total_iterations)`.
+   * **AC:** controller stops after N total iterations and the run is auditable from `run.json` + metrics.
 
 3. **Epochs vs steps semantics**
 
    * Make trainer behavior explicit and deterministic:
      * if `training.steps_per_iteration` is set, run exactly that many optimizer steps
-     * else derive steps from `training.epochs` and the replay snapshot size\n+       * `steps_per_epoch = ceil(replay_snapshot.total_samples / training.batch_size)`\n+       * `steps_target = training.epochs * steps_per_epoch`\n+     * epochs-mode requires replay snapshot semantics (or explicit `--steps`) for determinism\n+   * **Precedence:** CLI `--steps` > `training.steps_per_iteration` > epochs-derived\n+   * **AC:**\n+     * epochs/steps behavior is deterministic and logged\n+     * `runs/<id>/run.json` includes `iterations[].train.steps_target` so the TUI can show training progress\n+     * `logs/metrics.ndjson` includes a `train_plan` event capturing the derived target inputs
+     * else derive steps from `training.epochs` and the replay snapshot size
+       * `steps_per_epoch = ceil(replay_snapshot.total_samples / training.batch_size)`
+       * `steps_target = training.epochs * steps_per_epoch`
+     * epochs-mode requires replay snapshot semantics (or explicit `--steps`) for determinism
+   * **Precedence:** CLI `--steps` > `training.steps_per_iteration` > epochs-derived
+   * **AC:**
+     * epochs/steps behavior is deterministic and logged
+     * `runs/<id>/run.json` includes `iterations[].train.steps_target` so the TUI can show training progress
+     * `logs/metrics.ndjson` includes a `train_plan` event capturing the derived target inputs
+
+---
+
+## Epic E13.2 — Close the loop: end-to-end iterations from TUI
+
+**Goal:** make a single TUI session capable of running multiple iterations (selfplay → train → gate) **without manual intervention**, including automatic model bootstrap, promotion, and inference server lifecycle management.
+
+**Background / motivation**
+
+The TUI + controller can already orchestrate phases, but several gaps prevent a truly hands-off multi-iteration loop:
+
+1. **Training requires `--best`** — the controller launches `python -m yatzy_az train ...` without `--best`, causing the training phase to fail on a fresh run.
+2. **No "new run" bootstrap** — a fresh run needs an initial `runs/<id>/models/best.pt` (via `model-init`), but the TUI/controller doesn't create it automatically.
+3. **Promotion not applied** — after gating, `run.json` records promote/reject, but `candidate.pt` is not copied to `best.pt` automatically.
+4. **Inference server lifecycle** — gating needs *both* best + candidate models loaded concurrently; candidate doesn't exist until after training; we need model hot-reload or controller-managed restart.
+
+This epic addresses all four gaps, choosing **model hot-reload** for the inference server (option b).
+
+**Stories**
+
+1. **Controller passes `--best` to trainer**
+
+   * Update `yz-controller::run_train_subprocess` to always pass `--best runs/<id>/models/best.pt`.
+   * Ensure the trainer fails cleanly if `best.pt` doesn't exist (Story 2 handles creation).
+   * **AC:**
+     * `controller_phase="train"` invokes trainer with correct `--best` path.
+     * Training succeeds when `best.pt` exists; fails with a clear error when it doesn't.
+
+2. **TUI/controller bootstraps initial `best.pt`**
+
+   * When creating a new run (or starting an iteration on a run with no `models/best.pt`), automatically invoke `python -m yatzy_az model-init --out runs/<id>/models/best.pt` using network architecture from config.
+   * Add config knobs (if not present): `model.hidden_dim`, `model.num_blocks` — these are passed to `model-init`.
+   * **AC:**
+     * Starting an iteration on a fresh run creates `models/best.pt` before self-play begins.
+     * Network shape matches config; `best.pt` is loadable by the inference server.
+
+3. **Automatic promotion after gating**
+
+   * After gating completes with `promoted=true`, the controller copies `candidate.pt` → `best.pt` atomically.
+   * If `promoted=false`, `candidate.pt` is left in place (or optionally deleted) and `best.pt` remains unchanged.
+   * Update `run.json` with `iterations[].promoted` flag (already exists) and a `best_model_path` or similar for traceability.
+   * **AC:**
+     * Promotion is automatic; next iteration uses the promoted model as `best`.
+     * `run.json` and `logs/metrics.ndjson` record the promotion event.
+
+4. **Inference server model hot-reload**
+
+   * Extend the Python inference server to support hot-reloading models without restart:
+     * Add a control endpoint (e.g. UDS command or HTTP `/reload`) that accepts `{"model_id": "best"|"cand", "path": "..."}`.
+     * Server loads the new checkpoint into memory and swaps atomically (no requests fail during reload).
+   * Controller calls the reload endpoint:
+     * Before self-play: reload `best` with current `best.pt`.
+     * Before gating: reload `best` + load `cand` with the newly trained `candidate.pt`.
+   * **AC:**
+     * Server stays running across phases; models are swapped via reload endpoint.
+     * Prometheus metrics show `model_reloads_total` counter.
+     * Integration test: start server → reload model → verify inference uses new weights.
+
+5. **TUI preflight checks + status**
+
+   * Before starting an iteration, the TUI verifies:
+     * Inference server is reachable (existing preflight).
+     * Server supports hot-reload (version check or capability flag).
+   * Dashboard shows model reload events in the live panel.
+   * **AC:**
+     * TUI prevents starting if server doesn't support hot-reload (or prompts user to restart server).
+     * Model reload success/failure is visible in TUI.
+
+---
 
 ## Epic R1 — Refactor: Code quality & tech debt
 
