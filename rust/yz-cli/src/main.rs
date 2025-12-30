@@ -433,7 +433,7 @@ OPTIONS:
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
                 completed_games += 1;
-                if completed_games % 10 == 0 || completed_games == games {
+                if completed_games.is_multiple_of(10) || completed_games == games {
                     manifest.selfplay_games_completed = completed_games as u64;
                     let _ = yz_logging::write_manifest_atomic(&run_json, &manifest);
                 }

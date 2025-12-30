@@ -147,8 +147,7 @@ impl IterationHandle {
     pub fn join(self) -> Result<(), ControllerError> {
         match self.join.join() {
             Ok(r) => r,
-            Err(_) => Err(ControllerError::Fs(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(_) => Err(ControllerError::Fs(std::io::Error::other(
                 "controller thread panicked",
             ))),
         }
@@ -422,16 +421,24 @@ fn begin_iteration(
 ) -> Result<(), ControllerError> {
     // Ensure the iteration entry exists.
     if manifest.iterations.iter().all(|it| it.idx != iter_idx) {
-        let mut it = yz_logging::IterationSummaryV1::default();
-        it.idx = iter_idx;
-        it.started_ts_ms = yz_logging::now_ms();
-        it.selfplay.games_target = cfg.selfplay.games_per_iteration.max(1) as u64;
-        it.train.steps_target = cfg
-            .training
-            .steps_per_iteration
-            .map(|x| x.max(1) as u64);
-        // Gate schedule size can be clamped by seed set length; store configured target for now.
-        it.gate.games_target = cfg.gating.games.max(1) as u64;
+        let it = yz_logging::IterationSummaryV1 {
+            idx: iter_idx,
+            started_ts_ms: yz_logging::now_ms(),
+            selfplay: yz_logging::IterSelfplaySummaryV1 {
+                games_target: cfg.selfplay.games_per_iteration.max(1) as u64,
+                ..Default::default()
+            },
+            train: yz_logging::IterTrainSummaryV1 {
+                steps_target: cfg.training.steps_per_iteration.map(|x| x.max(1) as u64),
+                ..Default::default()
+            },
+            gate: yz_logging::IterGateSummaryV1 {
+                // Gate schedule size can be clamped by seed set length; store configured target for now.
+                games_target: cfg.gating.games.max(1) as u64,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         manifest.iterations.push(it);
     }
 
@@ -465,6 +472,14 @@ fn begin_iteration(
     Ok(())
 }
 
+/// Copy a file atomically via temp + rename.
+fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let tmp = dst.with_extension("pt.tmp");
+    std::fs::copy(src, &tmp)?;
+    std::fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
 fn finalize_iteration(
     run_dir: &Path,
     cfg: &yz_core::Config,
@@ -474,7 +489,26 @@ fn finalize_iteration(
     let wr = manifest.gate_win_rate;
     let threshold = cfg.gating.win_rate_threshold;
     let promoted = wr.map(|x| x >= threshold);
-    let reason = wr.map(|x| format!("win_rate={x:.4} threshold={threshold:.4}"));
+    let reason = wr
+        .map(|x| format!("win_rate={x:.4} threshold={threshold:.4}"))
+        .unwrap_or_default();
+
+    let candidate_path = run_dir.join("models").join("candidate.pt");
+    let best_path = run_dir.join("models").join("best.pt");
+
+    // E13.2S3: If promoted, copy candidate.pt → best.pt atomically.
+    if promoted == Some(true) {
+        if candidate_path.exists() {
+            copy_atomic(&candidate_path, &best_path)?;
+            manifest.best_checkpoint = Some("models/best.pt".to_string());
+        } else {
+            // Defensive: candidate doesn't exist. Log warning but don't fail.
+            eprintln!(
+                "warning: promoted but candidate.pt does not exist: {}",
+                candidate_path.display()
+            );
+        }
+    }
 
     if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
         it.ended_ts_ms = Some(yz_logging::now_ms());
@@ -485,12 +519,46 @@ fn finalize_iteration(
         it.oracle.match_rate_reroll = manifest.gate_oracle_match_rate_reroll;
         it.oracle.keepall_ignored = manifest.gate_oracle_keepall_ignored;
         it.promoted = promoted;
-        it.promoted_model = promoted.map(|p| if p { "candidate".to_string() } else { "best".to_string() });
-        it.promotion_reason = reason;
+        it.promoted_model = promoted.map(|p| {
+            if p {
+                "candidate".to_string()
+            } else {
+                "best".to_string()
+            }
+        });
+        it.promotion_reason = Some(reason.clone());
         it.train.steps_completed = Some(manifest.train_step);
     }
 
     yz_logging::write_manifest_atomic(run_dir.join("run.json"), manifest)?;
+
+    // E13.2S3: Emit promotion metrics event.
+    let metrics_path = run_dir.join("logs").join("metrics.ndjson");
+    if let Ok(mut metrics) = yz_logging::NdjsonWriter::open_append_with_flush(&metrics_path, 1) {
+        let ev = yz_logging::MetricsPromotionV1 {
+            event: "promotion",
+            ts_ms: yz_logging::now_ms(),
+            v: yz_logging::VersionInfoV1 {
+                protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+                feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+                action_space_id: "oracle_keepmask_v1",
+                ruleset_id: "swedish_scandinavian_v1",
+            },
+            run_id: manifest.run_id.clone(),
+            git_hash: manifest.git_hash.clone(),
+            config_snapshot: manifest.config_snapshot.clone(),
+            iteration_idx: iter_idx,
+            promoted: promoted.unwrap_or(false),
+            win_rate: wr,
+            threshold,
+            reason,
+            candidate_path: candidate_path.to_string_lossy().to_string(),
+            best_path: best_path.to_string_lossy().to_string(),
+        };
+        let _ = metrics.write_event(&ev);
+        let _ = metrics.flush();
+    }
+
     Ok(())
 }
 
@@ -526,8 +594,7 @@ fn wait_child_cancellable(mut child: std::process::Child, ctrl: &IterationContro
                 if status.success() {
                     return Ok(());
                 }
-                return Err(ControllerError::Fs(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(ControllerError::Fs(std::io::Error::other(
                     format!("train subprocess failed: {status}"),
                 )));
             }
@@ -666,8 +733,7 @@ fn ensure_best_pt(
         .status()?;
 
     if !status.success() {
-        return Err(ControllerError::Fs(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(ControllerError::Fs(std::io::Error::other(
             format!("model-init failed: {status}"),
         )));
     }
@@ -744,8 +810,7 @@ fn run_train_subprocess(
                 msg.push_str("\n--- train_stderr_tail ---\n");
                 msg.push_str(&t);
             }
-            Err(ControllerError::Fs(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(ControllerError::Fs(std::io::Error::other(
                 msg,
             )))
         }
@@ -847,7 +912,7 @@ fn run_selfplay(
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
                 completed_games += 1;
-                if completed_games % 10 == 0 || completed_games == games {
+                if completed_games.is_multiple_of(10) || completed_games == games {
                     let total = base_total + completed_games as u64;
                     manifest.selfplay_games_completed = total;
                     if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
@@ -1253,6 +1318,78 @@ mod cancel_tests {
         let blocks_idx = args.iter().position(|a| a == "--blocks");
         assert!(blocks_idx.is_some(), "command must include --blocks; got: {:?}", args);
         assert_eq!(args[blocks_idx.unwrap() + 1], "3");
+    }
+
+    #[test]
+    fn promotion_copies_candidate_to_best() {
+        // E13.2S3: when promoted, candidate.pt is atomically copied to best.pt.
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let cfg = yz_core::Config::default();
+
+        // Set up run directory with manifest + models.
+        let mut m = ensure_manifest(run_dir, &cfg).unwrap();
+        std::fs::create_dir_all(run_dir.join("models")).unwrap();
+        std::fs::create_dir_all(run_dir.join("logs")).unwrap();
+
+        // Create fake candidate.pt and best.pt with distinct content.
+        let candidate = run_dir.join("models").join("candidate.pt");
+        let best = run_dir.join("models").join("best.pt");
+        std::fs::write(&candidate, b"candidate-content").unwrap();
+        std::fs::write(&best, b"original-best-content").unwrap();
+
+        // Set up manifest to trigger promotion (win_rate >= threshold).
+        m.gate_win_rate = Some(0.60);
+        begin_iteration(run_dir, &cfg, &mut m, 0).unwrap();
+        yz_logging::write_manifest_atomic(run_dir.join("run.json"), &m).unwrap();
+
+        finalize_iteration(run_dir, &cfg, &mut m, 0).unwrap();
+
+        // Verify best.pt now has candidate's content.
+        let best_content = std::fs::read_to_string(&best).unwrap();
+        assert_eq!(best_content, "candidate-content");
+
+        // Verify manifest records promotion.
+        let fresh = yz_logging::read_manifest(run_dir.join("run.json")).unwrap();
+        let it = fresh.iterations.iter().find(|it| it.idx == 0).unwrap();
+        assert_eq!(it.promoted, Some(true));
+        assert_eq!(it.promoted_model.as_deref(), Some("candidate"));
+    }
+
+    #[test]
+    fn no_promotion_leaves_best_unchanged() {
+        // E13.2S3: when not promoted, best.pt is left unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let cfg = yz_core::Config::default();
+
+        // Set up run directory with manifest + models.
+        let mut m = ensure_manifest(run_dir, &cfg).unwrap();
+        std::fs::create_dir_all(run_dir.join("models")).unwrap();
+        std::fs::create_dir_all(run_dir.join("logs")).unwrap();
+
+        // Create fake candidate.pt and best.pt with distinct content.
+        let candidate = run_dir.join("models").join("candidate.pt");
+        let best = run_dir.join("models").join("best.pt");
+        std::fs::write(&candidate, b"candidate-content").unwrap();
+        std::fs::write(&best, b"original-best-content").unwrap();
+
+        // Set up manifest to NOT trigger promotion (win_rate < threshold).
+        m.gate_win_rate = Some(0.40);
+        begin_iteration(run_dir, &cfg, &mut m, 0).unwrap();
+        yz_logging::write_manifest_atomic(run_dir.join("run.json"), &m).unwrap();
+
+        finalize_iteration(run_dir, &cfg, &mut m, 0).unwrap();
+
+        // Verify best.pt still has original content.
+        let best_content = std::fs::read_to_string(&best).unwrap();
+        assert_eq!(best_content, "original-best-content");
+
+        // Verify manifest records no promotion.
+        let fresh = yz_logging::read_manifest(run_dir.join("run.json")).unwrap();
+        let it = fresh.iterations.iter().find(|it| it.idx == 0).unwrap();
+        assert_eq!(it.promoted, Some(false));
+        assert_eq!(it.promoted_model.as_deref(), Some("best"));
     }
 }
 

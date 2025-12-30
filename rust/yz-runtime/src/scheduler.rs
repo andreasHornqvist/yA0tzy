@@ -94,7 +94,7 @@ impl Scheduler {
                         self.global_ply += 1;
                         if let Some(lg) = loggers.as_deref_mut() {
                             if lg.root_log_every_n > 0
-                                && (self.global_ply % lg.root_log_every_n == 0)
+                                && self.global_ply.is_multiple_of(lg.root_log_every_n)
                             {
                                 let ts_ms = now_ms();
                                 let pi = summarize_pi(&exec.search.pi);
@@ -160,7 +160,7 @@ impl Scheduler {
                 }
             }
         }
-        if let Some(lg) = loggers.as_deref_mut() {
+        if let Some(lg) = loggers {
             let s = backend.stats_snapshot();
             let ts_ms = now_ms();
             let ev = IterationStatsEventV1 {

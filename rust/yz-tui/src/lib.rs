@@ -480,7 +480,7 @@ fn commit_field_edit(app: &mut App, field: FieldId) {
     let buf = app.form.input_buf.trim().to_string();
     let mut next = app.cfg.clone();
     let res = apply_input_to_cfg(&mut next, field, &buf)
-        .and_then(|()| crate::validate::validate_config(&next).map_err(|e| e));
+        .and_then(|()| crate::validate::validate_config(&next));
     match res {
         Ok(()) => {
             app.cfg = next;
@@ -736,7 +736,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             .training
             .steps_per_iteration
             .map(|x| x.to_string())
-            .unwrap_or_else(|| "".to_string()),
+            .unwrap_or_default(),
 
         FieldId::GatingGames => cfg.gating.games.to_string(),
         FieldId::GatingSeed => cfg.gating.seed.to_string(),
@@ -744,7 +744,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             .gating
             .seed_set_id
             .clone()
-            .unwrap_or_else(|| "".to_string()),
+            .unwrap_or_default(),
         FieldId::GatingWinRateThreshold => format!("{:.4}", cfg.gating.win_rate_threshold),
         FieldId::GatingPairedSeedSwap => cfg.gating.paired_seed_swap.to_string(),
         FieldId::GatingDeterministicChance => cfg.gating.deterministic_chance.to_string(),
@@ -753,13 +753,13 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             .replay
             .capacity_shards
             .map(|x| x.to_string())
-            .unwrap_or_else(|| "".to_string()),
+            .unwrap_or_default(),
 
         FieldId::ControllerTotalIterations => cfg
             .controller
             .total_iterations
             .map(|x| x.to_string())
-            .unwrap_or_else(|| "".to_string()),
+            .unwrap_or_default(),
 
         FieldId::ModelHiddenDim => cfg.model.hidden_dim.to_string(),
         FieldId::ModelNumBlocks => cfg.model.num_blocks.to_string(),
@@ -1244,11 +1244,10 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
             if matches!(
                 f,
                 FieldId::MctsTempT1 | FieldId::MctsTempCutoffPly
-            ) {
-                if matches!(app.cfg.mcts.temperature_schedule, TemperatureSchedule::Constant { .. }) {
+            )
+                && matches!(app.cfg.mcts.temperature_schedule, TemperatureSchedule::Constant { .. }) {
                     continue;
                 }
-            }
             rows.push(Row::Field(f));
         }
         rows.push(Row::Spacer);

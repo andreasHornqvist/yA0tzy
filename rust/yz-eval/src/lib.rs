@@ -131,7 +131,7 @@ pub fn gating_schedule(seed0: u64, games: u32, paired_swap: bool) -> Result<Vec<
     if games == 0 {
         return Err(GateError::InvalidConfig("gating.games must be > 0"));
     }
-    if paired_swap && (games % 2 != 0) {
+    if paired_swap && !games.is_multiple_of(2) {
         return Err(GateError::InvalidConfig(
             "gating.games must be even when gating.paired_seed_swap=true",
         ));
@@ -334,7 +334,7 @@ pub fn gate_with_progress(
     mut progress: Option<&mut dyn GateProgress>,
 ) -> Result<GateReport, GateError> {
     let (schedule, seeds, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
-        if cfg.gating.paired_seed_swap && (cfg.gating.games % 2 != 0) {
+        if cfg.gating.paired_seed_swap && !cfg.gating.games.is_multiple_of(2) {
             return Err(GateError::InvalidConfig(
                 "gating.games must be even when gating.paired_seed_swap=true",
             ));
@@ -404,7 +404,7 @@ fn derived_seed_list(
     if games == 0 {
         return Err(GateError::InvalidConfig("gating.games must be > 0"));
     }
-    if paired_swap && (games % 2 != 0) {
+    if paired_swap && !games.is_multiple_of(2) {
         return Err(GateError::InvalidConfig(
             "gating.games must be even when gating.paired_seed_swap=true",
         ));
@@ -520,7 +520,7 @@ fn run_one_game(
         let is_cand_turn = state.player_to_move == cand_seat;
 
         let backend = select_backend(best_backend, cand_backend, state.player_to_move, gs.swap);
-        let sr: SearchResult = mcts.run_search_with_backend(state.clone(), chance_mode, backend);
+        let sr: SearchResult = mcts.run_search_with_backend(state, chance_mode, backend);
         let a = argmax_tie_lowest(&sr.pi);
         let action = yz_core::index_to_action(a);
 

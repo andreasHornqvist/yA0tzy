@@ -39,7 +39,7 @@ pub fn save_cfg_draft_atomic(run_dir: &Path, cfg: &Config) -> Result<(), std::io
     std::fs::create_dir_all(run_dir)?;
     let path = draft_path(run_dir);
     let tmp = run_dir.join("config.draft.yaml.tmp");
-    let s = serde_yaml::to_string(cfg).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let s = serde_yaml::to_string(cfg).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, s)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())

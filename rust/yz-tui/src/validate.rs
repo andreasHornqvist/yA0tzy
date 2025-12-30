@@ -17,7 +17,7 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     }
 
     // mcts
-    if !(cfg.mcts.c_puct > 0.0) {
+    if cfg.mcts.c_puct <= 0.0 {
         return Err("mcts.c_puct must be > 0".to_string());
     }
     if cfg.mcts.budget_reroll < 1 {
@@ -29,7 +29,7 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if cfg.mcts.max_inflight_per_game < 1 {
         return Err("mcts.max_inflight_per_game must be >= 1".to_string());
     }
-    if !(cfg.mcts.dirichlet_alpha > 0.0) {
+    if cfg.mcts.dirichlet_alpha <= 0.0 {
         return Err("mcts.dirichlet_alpha must be > 0".to_string());
     }
     if !(0.0..=1.0).contains(&cfg.mcts.dirichlet_epsilon) {
@@ -63,7 +63,7 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if cfg.training.batch_size < 1 {
         return Err("training.batch_size must be >= 1".to_string());
     }
-    if !(cfg.training.learning_rate > 0.0) {
+    if cfg.training.learning_rate <= 0.0 {
         return Err("training.learning_rate must be > 0".to_string());
     }
     if cfg.training.weight_decay < 0.0 {

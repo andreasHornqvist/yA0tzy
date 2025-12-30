@@ -381,6 +381,27 @@ pub struct MetricsReplayPruneV1 {
     pub deleted_max_idx: Option<u64>,
 }
 
+/// Metrics event emitted after gating to record promotion decision (E13.2S3).
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsPromotionV1 {
+    pub event: &'static str, // "promotion"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub iteration_idx: u32,
+    pub promoted: bool,
+    pub win_rate: Option<f64>,
+    pub threshold: f64,
+    pub reason: String,
+    /// Path to candidate checkpoint (source if promoted).
+    pub candidate_path: String,
+    /// Path to best checkpoint (destination if promoted).
+    pub best_path: String,
+}
+
 #[derive(Debug)]
 pub enum NdjsonError {
     Io(io::Error),
@@ -449,7 +470,6 @@ impl NdjsonWriter {
         let f = OpenOptions::new()
             .create(true)
             .append(true)
-            .write(true)
             .open(path)?;
         Ok(Self {
             w: BufWriter::new(f),

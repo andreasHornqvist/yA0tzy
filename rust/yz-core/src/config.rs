@@ -162,7 +162,7 @@ pub struct TrainingConfig {
 }
 
 /// Replay retention configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ReplayConfig {
     /// Keep at most N shards under runs/<id>/replay/ (prune older beyond capacity).
     ///
@@ -171,26 +171,14 @@ pub struct ReplayConfig {
     pub capacity_shards: Option<u32>,
 }
 
-impl Default for ReplayConfig {
-    fn default() -> Self {
-        Self { capacity_shards: None }
-    }
-}
-
 /// Iteration controller configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ControllerConfig {
     /// Optional number of full iterations to run (selfplay → train → gate).
     ///
     /// If None, controller runs until stopped externally.
     #[serde(default)]
     pub total_iterations: Option<u32>,
-}
-
-impl Default for ControllerConfig {
-    fn default() -> Self {
-        Self { total_iterations: None }
-    }
 }
 
 /// Gating (model evaluation) configuration.

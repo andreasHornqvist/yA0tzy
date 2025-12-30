@@ -1283,7 +1283,7 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
      * Network shape matches config; `best.pt` is loadable by the inference server.
    * **Status:** `model.hidden_dim` and `model.num_blocks` added to shared config schema; controller calls `ensure_best_pt()` which invokes `model-init` when `best.pt` is missing.
 
-3. **Automatic promotion after gating**
+3. **Automatic promotion after gating (done)**
 
    * After gating completes with `promoted=true`, the controller copies `candidate.pt` → `best.pt` atomically.
    * If `promoted=false`, `candidate.pt` is left in place (or optionally deleted) and `best.pt` remains unchanged.
@@ -1291,6 +1291,7 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
    * **AC:**
      * Promotion is automatic; next iteration uses the promoted model as `best`.
      * `run.json` and `logs/metrics.ndjson` record the promotion event.
+   * **Status:** `finalize_iteration` in `yz-controller` performs atomic copy (`copy_atomic`) when `promoted=true` and emits a `MetricsPromotionV1` event to `logs/metrics.ndjson`.
 
 4. **Inference server model hot-reload**
 
