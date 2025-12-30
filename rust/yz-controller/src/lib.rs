@@ -555,6 +555,7 @@ fn build_train_command(
     let py_dir = python_project_dir_from_run_dir(run_dir);
     let out_models = run_dir.join("models");
     let replay_dir = run_dir.join("replay");
+    let best_pt = run_dir.join("models").join("best.pt");
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -567,6 +568,8 @@ fn build_train_command(
             out_models.to_string_lossy().as_ref(),
             "--config",
             run_dir.join("config.yaml").to_string_lossy().as_ref(),
+            "--best",
+            best_pt.to_string_lossy().as_ref(),
         ]);
         cmd
     } else {
@@ -580,6 +583,8 @@ fn build_train_command(
             out_models.to_string_lossy().as_ref(),
             "--config",
             run_dir.join("config.yaml").to_string_lossy().as_ref(),
+            "--best",
+            best_pt.to_string_lossy().as_ref(),
         ]);
         cmd
     }
@@ -1096,6 +1101,26 @@ mod cancel_tests {
         let fresh = yz_logging::read_manifest(run_dir.join("run.json")).unwrap();
         assert_eq!(fresh.controller_iteration_idx, 3);
         assert_eq!(fresh.controller_phase.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn build_train_command_includes_best_arg() {
+        // E13.2S1: controller passes --best to trainer.
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let cmd = build_train_command(run_dir, "python");
+
+        // Collect args as strings for easy searching.
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        // Find --best in args and verify the next element is the expected path.
+        let idx = args.iter().position(|a| a == "--best");
+        assert!(idx.is_some(), "command must include --best; got: {:?}", args);
+        let best_path = &args[idx.unwrap() + 1];
+        let expected_suffix = run_dir.join("models").join("best.pt");
+        assert!(
+            best_path.ends_with(expected_suffix.to_string_lossy().as_ref()),
+            "--best value should point to models/best.pt: got {best_path:?}"
+        );
     }
 }
 

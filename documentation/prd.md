@@ -1265,13 +1265,14 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
 
 **Stories**
 
-1. **Controller passes `--best` to trainer**
+1. **Controller passes `--best` to trainer (done)**
 
    * Update `yz-controller::run_train_subprocess` to always pass `--best runs/<id>/models/best.pt`.
    * Ensure the trainer fails cleanly if `best.pt` doesn't exist (Story 2 handles creation).
    * **AC:**
      * `controller_phase="train"` invokes trainer with correct `--best` path.
      * Training succeeds when `best.pt` exists; fails with a clear error when it doesn't.
+   * **Status:** `--best` is always passed; new-run bootstrap handled by E13.2S2.
 
 2. **TUI/controller bootstraps initial `best.pt`**
 
