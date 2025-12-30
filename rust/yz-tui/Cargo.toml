@@ -13,7 +13,10 @@ crossterm = "0.29"
 ratatui = "0.30"
 yz-core = { path = "../yz-core" }
 yz-logging = { path = "../yz-logging" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
+ureq = { version = "2", features = ["json"] }
 yz-controller = { path = "../yz-controller" }
 
 [dev-dependencies]

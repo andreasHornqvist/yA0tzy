@@ -234,6 +234,7 @@ fn ensure_manifest(run_dir: &Path, cfg: &yz_core::Config) -> Result<RunManifestV
             controller_status: Some("initialized".to_string()),
             controller_last_ts_ms: Some(yz_logging::now_ms()),
             controller_error: None,
+            model_reloads: 0,
             controller_iteration_idx: 0,
             iterations: Vec::new(),
         }
@@ -270,12 +271,12 @@ pub fn run_selfplay_then_gate(
     let iter_idx = manifest.controller_iteration_idx;
     begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
     // E13.2S4: Hot-reload best model before selfplay.
-    reload_best_for_selfplay(run_dir, &cfg)?;
+    manifest.model_reloads += reload_best_for_selfplay(run_dir, &cfg)?;
     run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     // E13.2S4: Hot-reload best + candidate models before gating.
-    reload_models_for_gating(run_dir, &cfg)?;
+    manifest.model_reloads += reload_models_for_gating(run_dir, &cfg)?;
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
     finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
@@ -305,7 +306,7 @@ pub fn run_iteration(
 
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
     // E13.2S4: Hot-reload best model before selfplay.
-    reload_best_for_selfplay(run_dir, &cfg)?;
+    manifest.model_reloads += reload_best_for_selfplay(run_dir, &cfg)?;
     run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Train, "starting train")?;
@@ -314,7 +315,7 @@ pub fn run_iteration(
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     refresh_train_stats_from_run_json(run_dir, &mut manifest, iter_idx)?;
     // E13.2S4: Hot-reload best + candidate models before gating.
-    reload_models_for_gating(run_dir, &cfg)?;
+    manifest.model_reloads += reload_models_for_gating(run_dir, &cfg)?;
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
     finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
@@ -379,7 +380,7 @@ pub fn spawn_iteration(
                     ),
                 )?;
                 // E13.2S4: Hot-reload best model before selfplay.
-                reload_best_for_selfplay(&run_dir, &cfg)?;
+                manifest.model_reloads += reload_best_for_selfplay(&run_dir, &cfg)?;
                 run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
                 if ctrl.cancelled() {
                     return Err(ControllerError::Cancelled);
@@ -401,7 +402,7 @@ pub fn spawn_iteration(
                     format!("starting gate (iter {}/{})", iter_idx + 1, total_iters),
                 )?;
                 // E13.2S4: Hot-reload best + candidate models before gating.
-                reload_models_for_gating(&run_dir, &cfg)?;
+                manifest.model_reloads += reload_models_for_gating(&run_dir, &cfg)?;
                 run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
 
                 finalize_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
@@ -546,26 +547,33 @@ fn reload_model(
 }
 
 /// Reload the "best" model before selfplay (E13.2S4).
-fn reload_best_for_selfplay(run_dir: &Path, cfg: &yz_core::Config) -> Result<(), ControllerError> {
+/// Returns the number of reloads performed.
+fn reload_best_for_selfplay(run_dir: &Path, cfg: &yz_core::Config) -> Result<u64, ControllerError> {
     let best_path = run_dir.join("models").join("best.pt");
     if best_path.exists() {
         reload_model(&cfg.inference.metrics_bind, "best", &best_path)?;
+        Ok(1)
+    } else {
+        Ok(0)
     }
-    Ok(())
 }
 
 /// Reload both "best" and "cand" models before gating (E13.2S4).
-fn reload_models_for_gating(run_dir: &Path, cfg: &yz_core::Config) -> Result<(), ControllerError> {
+/// Returns the number of reloads performed.
+fn reload_models_for_gating(run_dir: &Path, cfg: &yz_core::Config) -> Result<u64, ControllerError> {
     let best_path = run_dir.join("models").join("best.pt");
     let cand_path = run_dir.join("models").join("candidate.pt");
 
+    let mut count = 0u64;
     if best_path.exists() {
         reload_model(&cfg.inference.metrics_bind, "best", &best_path)?;
+        count += 1;
     }
     if cand_path.exists() {
         reload_model(&cfg.inference.metrics_bind, "cand", &cand_path)?;
+        count += 1;
     }
-    Ok(())
+    Ok(count)
 }
 
 fn finalize_iteration(
@@ -1214,6 +1222,7 @@ mod cancel_tests {
             controller_status: None,
             controller_last_ts_ms: None,
             controller_error: None,
+            model_reloads: 0,
             controller_iteration_idx: 0,
             iterations: Vec::new(),
         }).unwrap()).unwrap();

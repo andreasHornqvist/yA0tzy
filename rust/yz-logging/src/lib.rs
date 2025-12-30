@@ -74,6 +74,10 @@ pub struct RunManifestV1 {
     pub controller_last_ts_ms: Option<u64>,
     pub controller_error: Option<String>,
 
+    // Model reloads counter (E13.2S5).
+    #[serde(default)]
+    pub model_reloads: u64,
+
     // Iteration history (TUI dashboard).
     #[serde(default)]
     pub controller_iteration_idx: u32, // 0-based, increments per full cycle

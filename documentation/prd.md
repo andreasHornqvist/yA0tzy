@@ -1310,7 +1310,7 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
      * Rust: `reload_model()` HTTP client using `ureq`; controller calls `reload_best_for_selfplay()` and `reload_models_for_gating()`.
      * Config: `inference.metrics_bind` added to shared config schema (default `127.0.0.1:18080`).
 
-5. **TUI preflight checks + status**
+5. **TUI preflight checks + status** *(done)*
 
    * Before starting an iteration, the TUI verifies:
      * Inference server is reachable (existing preflight).
@@ -1319,6 +1319,12 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
    * **AC:**
      * TUI prevents starting if server doesn't support hot-reload (or prompts user to restart server).
      * Model reload success/failure is visible in TUI.
+   * **Status:**
+     * Python: `GET /capabilities` endpoint in `metrics_server.py` returns `{"version": "1", "hot_reload": true|false}`.
+     * Rust: `check_server_supports_hot_reload()` function in `yz-tui` calls `/capabilities` and validates response.
+     * TUI: `start_iteration()` calls preflight check before spawning controller; fails with clear message if hot-reload not supported.
+     * Dashboard: Shows `model_reloads: N` counter from `run.json` (incremented by controller after each reload).
+     * Tests: Python tests for `/capabilities` endpoint; Rust tests for capabilities parsing and connection error handling.
 
 ---
 

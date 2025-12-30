@@ -83,6 +83,18 @@ async def start_metrics_server(
                     body,
                     content_type=b"text/plain; version=0.0.4; charset=utf-8",
                 )
+            elif method == "GET" and path == "/capabilities":
+                # E13.2S5: Return server capabilities for TUI preflight check.
+                caps = {
+                    "version": "1",
+                    "hot_reload": reload_callback is not None,
+                }
+                await _respond(
+                    writer,
+                    200,
+                    (json.dumps(caps) + "\n").encode(),
+                    content_type=b"application/json",
+                )
             elif method == "POST" and path == "/reload":
                 await _handle_reload(reader, writer, content_length, reload_callback)
             elif method == "GET":

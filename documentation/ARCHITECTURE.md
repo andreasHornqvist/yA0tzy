@@ -235,7 +235,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 in progress**: E13.2S1–E13.2S4 are complete (controller passes `--best`, auto-bootstrap `best.pt`, auto-promotion, model hot-reload); remaining story is E13.2S5 (TUI preflight checks).
+Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 complete**: E13.2S1–E13.2S5 are all done (controller passes `--best`, auto-bootstrap `best.pt`, auto-promotion, model hot-reload, TUI preflight checks).
 
 ### Automatic promotion (E13.2S3)
 - After gating, `finalize_iteration` in `yz-controller` checks if `win_rate >= threshold`.
@@ -252,6 +252,13 @@ Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteratio
   - `reload_best_for_selfplay()` before selfplay phase.
   - `reload_models_for_gating()` before gating phase (reloads both best + candidate).
 - Config knob: `inference.metrics_bind` (default `127.0.0.1:18080`).
+
+### TUI preflight checks (E13.2S5)
+- Before starting an iteration, the TUI verifies the inference server supports hot-reload.
+- Python server exposes `GET /capabilities` returning `{"version": "1", "hot_reload": true|false}`.
+- Rust function `check_server_supports_hot_reload()` in `yz-tui` calls this endpoint and parses the response.
+- If hot-reload is not supported, `start_iteration()` fails with a clear error message prompting the user to restart the server.
+- Dashboard displays `model_reloads: N` counter from `run.json.model_reloads` (incremented by controller after each successful reload).
 
 ### Replay shard naming + retention (E13.1S1)
 - Shards are stored as paired files under `runs/<id>/replay/`:

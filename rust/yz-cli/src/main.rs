@@ -303,6 +303,7 @@ OPTIONS:
         controller_status: None,
         controller_last_ts_ms: None,
         controller_error: None,
+        model_reloads: 0,
         controller_iteration_idx: 0,
         iterations: Vec::new(),
     };
