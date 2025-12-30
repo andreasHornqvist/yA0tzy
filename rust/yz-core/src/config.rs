@@ -37,6 +37,38 @@ pub struct Config {
     /// Iteration controller / orchestration settings.
     #[serde(default)]
     pub controller: ControllerConfig,
+
+    /// Neural network model architecture settings.
+    #[serde(default)]
+    pub model: ModelConfig,
+}
+
+/// Neural network model architecture configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelConfig {
+    /// Hidden layer size for the neural network.
+    #[serde(default = "default_model_hidden_dim")]
+    pub hidden_dim: u32,
+    /// Number of residual blocks in the network.
+    #[serde(default = "default_model_num_blocks")]
+    pub num_blocks: u32,
+}
+
+fn default_model_hidden_dim() -> u32 {
+    256
+}
+
+fn default_model_num_blocks() -> u32 {
+    2
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            hidden_dim: default_model_hidden_dim(),
+            num_blocks: default_model_num_blocks(),
+        }
+    }
 }
 
 /// Inference server configuration.
@@ -256,6 +288,7 @@ impl Default for Config {
             },
             replay: ReplayConfig::default(),
             controller: ControllerConfig::default(),
+            model: ModelConfig::default(),
         }
     }
 }

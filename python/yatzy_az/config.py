@@ -100,6 +100,13 @@ class ControllerConfig(BaseModel):
     )
 
 
+class ModelConfig(BaseModel):
+    """Neural network model architecture configuration."""
+
+    hidden_dim: int = Field(default=256, description="Hidden layer size for the neural network")
+    num_blocks: int = Field(default=2, description="Number of residual blocks in the network")
+
+
 class GatingConfig(BaseModel):
     """Gating (candidate vs best evaluation) configuration."""
 
@@ -139,6 +146,7 @@ class Config(BaseModel):
     gating: GatingConfig
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
     controller: ControllerConfig = Field(default_factory=ControllerConfig)
+    model: ModelConfig = Field(default_factory=ModelConfig)
 
 
 def load_config(path: str | Path) -> Config:

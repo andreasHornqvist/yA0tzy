@@ -60,3 +60,10 @@ gating:
   paired_seed_swap: true
   # Optional: use deterministic event-keyed chance stream for reproducible evals
   deterministic_chance: true
+
+# Neural network model architecture settings
+model:
+  # Hidden layer size for the neural network
+  hidden_dim: 256
+  # Number of residual blocks in the network
+  num_blocks: 2

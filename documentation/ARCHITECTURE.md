@@ -136,7 +136,8 @@ See `.github/workflows/ci.yml` for details.
   - The subprocess **reads replay shards from disk** (`runs/<id>/replay/`) and writes checkpoints/metrics into the run directory.
   - There is **no tensor IPC** between Rust and Python for training (no per-batch serialization overhead).
   - Observability is via `runs/<id>/run.json` (phase/status + latest scalars) and `runs/<id>/logs/metrics.ndjson` (step events).
-  - Controller passes `--best runs/<id>/models/best.pt` to the trainer (E13.2S1); if `best.pt` is missing, training fails cleanly (bootstrap handled by E13.2S2).
+  - Controller passes `--best runs/<id>/models/best.pt` to the trainer (E13.2S1).
+  - Controller auto-bootstraps `best.pt` via `model-init` if missing (E13.2S2), using `model.hidden_dim` and `model.num_blocks` from config.
 
 ### Configuration
 - All runtime knobs live in YAML files under `configs/`
@@ -234,7 +235,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 in progress**: E13.2S1 (controller passes `--best` to trainer) is complete; remaining stories cover auto-bootstrap, auto-promotion, and inference server hot-reload.
+Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 in progress**: E13.2S1 (controller passes `--best`) and E13.2S2 (auto-bootstrap `best.pt` via `model-init`) are complete; remaining stories cover auto-promotion (E13.2S3) and inference server hot-reload (E13.2S4–S5).
 
 ### Replay shard naming + retention (E13.1S1)
 - Shards are stored as paired files under `runs/<id>/replay/`:

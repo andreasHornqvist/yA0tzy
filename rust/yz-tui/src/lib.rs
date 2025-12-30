@@ -682,6 +682,15 @@ fn apply_input_to_cfg(
             };
             Ok(())
         }
+
+        FieldId::ModelHiddenDim => {
+            cfg.model.hidden_dim = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
+            Ok(())
+        }
+        FieldId::ModelNumBlocks => {
+            cfg.model.num_blocks = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
+            Ok(())
+        }
     }
 }
 
@@ -751,6 +760,9 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             .total_iterations
             .map(|x| x.to_string())
             .unwrap_or_else(|| "".to_string()),
+
+        FieldId::ModelHiddenDim => cfg.model.hidden_dim.to_string(),
+        FieldId::ModelNumBlocks => cfg.model.num_blocks.to_string(),
     }
 }
 
@@ -964,6 +976,24 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
                 cur.saturating_sub(inc)
             };
             next.controller.total_iterations = if v == 0 { None } else { Some(v) };
+            true
+        }
+        FieldId::ModelHiddenDim => {
+            let inc = if step == StepSize::Large { 64 } else { 32 };
+            next.model.hidden_dim = if dir >= 0 {
+                next.model.hidden_dim.saturating_add(inc)
+            } else {
+                next.model.hidden_dim.saturating_sub(inc).max(32)
+            };
+            true
+        }
+        FieldId::ModelNumBlocks => {
+            let inc = if step == StepSize::Large { 2 } else { 1 };
+            next.model.num_blocks = if dir >= 0 {
+                next.model.num_blocks.saturating_add(inc)
+            } else {
+                next.model.num_blocks.saturating_sub(inc).max(1)
+            };
             true
         }
         _ => false,

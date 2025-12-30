@@ -11,10 +11,11 @@ pub enum Section {
     Gating,
     Replay,
     Controller,
+    Model,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Inference,
         Section::Mcts,
         Section::Selfplay,
@@ -22,6 +23,7 @@ impl Section {
         Section::Gating,
         Section::Replay,
         Section::Controller,
+        Section::Model,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -33,6 +35,7 @@ impl Section {
             Section::Gating => "Gating",
             Section::Replay => "Replay",
             Section::Controller => "Controller",
+            Section::Model => "Model",
         }
     }
 }
@@ -82,6 +85,10 @@ pub enum FieldId {
 
     // controller
     ControllerTotalIterations,
+
+    // model
+    ModelHiddenDim,
+    ModelNumBlocks,
 }
 
 impl FieldId {
@@ -122,6 +129,8 @@ impl FieldId {
             FieldId::ReplayCapacityShards => Section::Replay,
 
             FieldId::ControllerTotalIterations => Section::Controller,
+
+            FieldId::ModelHiddenDim | FieldId::ModelNumBlocks => Section::Model,
         }
     }
 
@@ -163,6 +172,9 @@ impl FieldId {
             FieldId::ReplayCapacityShards => "replay.capacity_shards",
 
             FieldId::ControllerTotalIterations => "controller.total_iterations",
+
+            FieldId::ModelHiddenDim => "model.hidden_dim",
+            FieldId::ModelNumBlocks => "model.num_blocks",
         }
     }
 
@@ -256,6 +268,9 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::ReplayCapacityShards,
     // controller
     FieldId::ControllerTotalIterations,
+    // model
+    FieldId::ModelHiddenDim,
+    FieldId::ModelNumBlocks,
 ];
 
 

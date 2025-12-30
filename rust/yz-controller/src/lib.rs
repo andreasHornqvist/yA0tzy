@@ -291,6 +291,10 @@ pub fn run_iteration(
     let run_dir = run_dir.as_ref();
     let ctrl = IterationController::new(run_dir);
     let mut manifest = ensure_manifest(run_dir, &cfg)?;
+
+    // E13.2S2: Ensure best.pt exists (bootstrap via model-init if missing).
+    ensure_best_pt(run_dir, &cfg, python_exe)?;
+
     let iter_idx = manifest.controller_iteration_idx;
     begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
@@ -326,6 +330,9 @@ pub fn spawn_iteration(
         };
         // Ensure manifest/config snapshot exists even if cancelled early.
         let mut manifest = ensure_manifest(&run_dir, &cfg)?;
+
+        // E13.2S2: Ensure best.pt exists (bootstrap via model-init if missing).
+        ensure_best_pt(&run_dir, &cfg, &python_exe)?;
 
         let res: Result<(), ControllerError> = (|| {
             if ctrl.cancelled() {
@@ -588,6 +595,92 @@ fn build_train_command(
         ]);
         cmd
     }
+}
+
+fn build_model_init_command(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    python_exe: &str,
+) -> std::process::Command {
+    // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
+    let use_uv = std::process::Command::new("uv")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let py_dir = python_project_dir_from_run_dir(run_dir);
+    let best_pt = run_dir.join("models").join("best.pt");
+    let hidden = cfg.model.hidden_dim.to_string();
+    let blocks = cfg.model.num_blocks.to_string();
+
+    if use_uv {
+        let mut cmd = std::process::Command::new("uv");
+        cmd.current_dir(py_dir);
+        cmd.args(["run", "python", "-m", "yatzy_az", "model-init"]);
+        cmd.args([
+            "--out",
+            best_pt.to_string_lossy().as_ref(),
+            "--hidden",
+            &hidden,
+            "--blocks",
+            &blocks,
+        ]);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new(python_exe);
+        cmd.current_dir(py_dir);
+        cmd.args(["-m", "yatzy_az", "model-init"]);
+        cmd.args([
+            "--out",
+            best_pt.to_string_lossy().as_ref(),
+            "--hidden",
+            &hidden,
+            "--blocks",
+            &blocks,
+        ]);
+        cmd
+    }
+}
+
+/// Ensure `models/best.pt` exists, invoking `model-init` if missing.
+fn ensure_best_pt(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    python_exe: &str,
+) -> Result<(), ControllerError> {
+    let best_pt = run_dir.join("models").join("best.pt");
+    if best_pt.exists() {
+        return Ok(());
+    }
+
+    // Create models dir if needed.
+    std::fs::create_dir_all(run_dir.join("models"))?;
+
+    let mut cmd = build_model_init_command(run_dir, cfg, python_exe);
+    let status = cmd
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        return Err(ControllerError::Fs(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("model-init failed: {status}"),
+        )));
+    }
+
+    // Verify the file was created.
+    if !best_pt.exists() {
+        return Err(ControllerError::Fs(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("model-init did not create {}", best_pt.display()),
+        )));
+    }
+
+    Ok(())
 }
 
 fn run_train_subprocess(
@@ -1094,6 +1187,10 @@ mod cancel_tests {
         m.controller_iteration_idx = 3;
         yz_logging::write_manifest_atomic(run_dir.join("run.json"), &m).unwrap();
 
+        // E13.2S2: ensure_best_pt is called early; provide a fake best.pt to skip model-init.
+        std::fs::create_dir_all(run_dir.join("models")).unwrap();
+        std::fs::write(run_dir.join("models").join("best.pt"), b"fake").unwrap();
+
         let h = spawn_iteration(run_dir, cfg, "unix:///tmp/does_not_matter.sock".to_string(), "python".to_string());
         let res = h.join();
         assert!(res.is_ok());
@@ -1121,6 +1218,41 @@ mod cancel_tests {
             best_path.ends_with(expected_suffix.to_string_lossy().as_ref()),
             "--best value should point to models/best.pt: got {best_path:?}"
         );
+    }
+
+    #[test]
+    fn build_model_init_command_includes_correct_args() {
+        // E13.2S2: controller bootstraps best.pt via model-init.
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let mut cfg = yz_core::Config::default();
+        cfg.model.hidden_dim = 128;
+        cfg.model.num_blocks = 3;
+
+        let cmd = build_model_init_command(run_dir, &cfg, "python");
+
+        // Collect args as strings for easy searching.
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+
+        // Verify --out
+        let out_idx = args.iter().position(|a| a == "--out");
+        assert!(out_idx.is_some(), "command must include --out; got: {:?}", args);
+        let out_path = &args[out_idx.unwrap() + 1];
+        let expected_out = run_dir.join("models").join("best.pt");
+        assert!(
+            out_path.ends_with(expected_out.to_string_lossy().as_ref()),
+            "--out value should point to models/best.pt: got {out_path:?}"
+        );
+
+        // Verify --hidden
+        let hidden_idx = args.iter().position(|a| a == "--hidden");
+        assert!(hidden_idx.is_some(), "command must include --hidden; got: {:?}", args);
+        assert_eq!(args[hidden_idx.unwrap() + 1], "128");
+
+        // Verify --blocks
+        let blocks_idx = args.iter().position(|a| a == "--blocks");
+        assert!(blocks_idx.is_some(), "command must include --blocks; got: {:?}", args);
+        assert_eq!(args[blocks_idx.unwrap() + 1], "3");
     }
 }
 

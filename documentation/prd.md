@@ -1274,13 +1274,14 @@ This epic addresses all four gaps, choosing **model hot-reload** for the inferen
      * Training succeeds when `best.pt` exists; fails with a clear error when it doesn't.
    * **Status:** `--best` is always passed; new-run bootstrap handled by E13.2S2.
 
-2. **TUI/controller bootstraps initial `best.pt`**
+2. **TUI/controller bootstraps initial `best.pt` (done)**
 
    * When creating a new run (or starting an iteration on a run with no `models/best.pt`), automatically invoke `python -m yatzy_az model-init --out runs/<id>/models/best.pt` using network architecture from config.
    * Add config knobs (if not present): `model.hidden_dim`, `model.num_blocks` — these are passed to `model-init`.
    * **AC:**
      * Starting an iteration on a fresh run creates `models/best.pt` before self-play begins.
      * Network shape matches config; `best.pt` is loadable by the inference server.
+   * **Status:** `model.hidden_dim` and `model.num_blocks` added to shared config schema; controller calls `ensure_best_pt()` which invokes `model-init` when `best.pt` is missing.
 
 3. **Automatic promotion after gating**
 
