@@ -64,6 +64,19 @@ struct ServerCapabilities {
     #[allow(dead_code)]
     version: String,
     hot_reload: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pid: Option<u32>,
+    #[serde(default)]
+    bind: Option<String>,
+    #[serde(default)]
+    metrics_bind: Option<String>,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    max_batch: Option<u32>,
+    #[serde(default)]
+    max_wait_us: Option<u64>,
 }
 
 struct InferServerChild {
@@ -160,6 +173,21 @@ fn get_server_capabilities(metrics_bind: &str) -> Result<ServerCapabilities, Con
         .map_err(|e| ControllerError::InferServer(format!("invalid capabilities JSON: {e}")))
 }
 
+fn shutdown_server(metrics_bind: &str) -> Result<(), ControllerError> {
+    let url = format!("http://{}/shutdown", metrics_bind);
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string("{}")
+        .map_err(|e| ControllerError::InferServer(format!("shutdown request failed: {e}")))?;
+    if resp.status() != 200 {
+        return Err(ControllerError::InferServer(format!(
+            "shutdown returned status {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
 fn build_infer_server_command(
     run_dir: &Path,
     cfg: &yz_core::Config,
@@ -214,10 +242,26 @@ fn ensure_infer_server(
     cfg: &yz_core::Config,
     python_exe: &str,
 ) -> Result<Option<InferServerChild>, ControllerError> {
-    // If reachable and hot-reload capable, reuse existing server.
+    // If reachable, decide reuse vs restart. We restart if:
+    // - server is an older capabilities version (pre-v2, no config fields)
+    // - or server config doesn't match the desired config (TUI settings must win)
     if let Ok(caps) = get_server_capabilities(&cfg.inference.metrics_bind) {
         if caps.hot_reload {
-            return Ok(None);
+            let caps_is_v2 = caps.version.trim() == "2";
+            let cfg_matches = caps_is_v2
+                && caps.device.as_deref() == Some(cfg.inference.device.as_str())
+                && caps.bind.as_deref() == Some(cfg.inference.bind.as_str())
+                && caps.metrics_bind.as_deref() == Some(cfg.inference.metrics_bind.as_str())
+                && caps.max_batch == Some(cfg.inference.max_batch)
+                && caps.max_wait_us == Some(cfg.inference.max_wait_us);
+            if cfg_matches {
+                return Ok(None);
+            }
+
+            // Try to shut down the existing server so we can restart with correct settings.
+            let _ = shutdown_server(&cfg.inference.metrics_bind);
+            // Give it a moment to release the port/socket.
+            std::thread::sleep(Duration::from_millis(150));
         }
     }
 

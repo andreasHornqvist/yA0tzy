@@ -160,8 +160,24 @@ async def serve(config: ServerConfig) -> None:
         async with server:
             metrics_srv = None
             if not config.metrics_disable:
+                def capabilities() -> dict:
+                    return {
+                        "version": "2",
+                        "hot_reload": True,
+                        "pid": os.getpid(),
+                        "bind": config.bind,
+                        "metrics_bind": config.metrics_bind,
+                        "device": config.device,
+                        "max_batch": int(config.max_batch),
+                        "max_wait_us": int(config.max_wait_us),
+                    }
+
                 metrics_srv = await start_metrics_server(
-                    config.metrics_bind, snapshot, reload_callback=reload_model
+                    config.metrics_bind,
+                    snapshot,
+                    reload_callback=reload_model,
+                    capabilities_callback=capabilities,
+                    shutdown_callback=_stop,
                 )
             stats_task = asyncio.create_task(_print_stats_loop(batcher, config.print_stats_every_s))
             try:

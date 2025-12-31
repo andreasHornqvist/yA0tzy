@@ -33,12 +33,16 @@ class ReloadResult:
 
 # Callback signature: (model_id, path) -> ReloadResult
 ReloadCallback = Callable[[str, str], ReloadResult]
+ShutdownCallback = Callable[[], None]
+CapabilitiesCallback = Callable[[], dict]
 
 
 async def start_metrics_server(
     bind: str,
     get_snapshot: Callable[[], MetricsSnapshot],
     reload_callback: ReloadCallback | None = None,
+    capabilities_callback: CapabilitiesCallback | None = None,
+    shutdown_callback: ShutdownCallback | None = None,
 ) -> asyncio.AbstractServer:
     """Start the metrics/control HTTP server.
 
@@ -46,6 +50,8 @@ async def start_metrics_server(
         bind: Host:port to bind (e.g. "127.0.0.1:9100").
         get_snapshot: Callback to get current metrics snapshot.
         reload_callback: Optional callback for POST /reload (E13.2S4).
+        capabilities_callback: Optional callback for GET /capabilities (returns JSON dict).
+        shutdown_callback: Optional callback for POST /shutdown (local dev convenience).
     """
     host, port = parse_metrics_bind(bind)
 
@@ -85,10 +91,14 @@ async def start_metrics_server(
                 )
             elif method == "GET" and path == "/capabilities":
                 # E13.2S5: Return server capabilities for TUI preflight check.
-                caps = {
-                    "version": "1",
-                    "hot_reload": reload_callback is not None,
-                }
+                caps = (
+                    capabilities_callback()
+                    if capabilities_callback is not None
+                    else {
+                        "version": "1",
+                        "hot_reload": reload_callback is not None,
+                    }
+                )
                 await _respond(
                     writer,
                     200,
@@ -97,6 +107,22 @@ async def start_metrics_server(
                 )
             elif method == "POST" and path == "/reload":
                 await _handle_reload(reader, writer, content_length, reload_callback)
+            elif method == "POST" and path == "/shutdown":
+                if shutdown_callback is None:
+                    await _respond(
+                        writer,
+                        501,
+                        b'{"error":"shutdown not supported"}\n',
+                        content_type=b"application/json",
+                    )
+                else:
+                    shutdown_callback()
+                    await _respond(
+                        writer,
+                        200,
+                        b'{"ok":true}\n',
+                        content_type=b"application/json",
+                    )
             elif method == "GET":
                 await _respond(writer, 404, b'{"error":"not found"}\n')
             else:
