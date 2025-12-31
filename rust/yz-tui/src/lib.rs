@@ -379,7 +379,15 @@ pub fn run() -> io::Result<()> {
                 if h.is_finished() {
                     // Take ownership and join.
                     let h = app.iter.take().unwrap();
-                    let _ = h.join();
+                    match h.join() {
+                        Ok(()) => {
+                            app.status = "iteration completed".to_string();
+                        }
+                        Err(e) => {
+                            app.status = format!("iteration failed: {}", e);
+                        }
+                    }
+                    app.refresh_dashboard();
                 }
             }
             if matches!(app.screen, Screen::Dashboard) {
