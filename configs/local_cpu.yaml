@@ -58,6 +58,8 @@ training:
   batch_size: 256
   # Learning rate
   learning_rate: 0.001
+  # Weight decay (L2 regularization) - 0 disables
+  weight_decay: 0.0001
   # Number of epochs per training iteration
   epochs: 10
 
@@ -65,15 +67,15 @@ training:
 gating:
   # Number of games to play for evaluation
   games: 100
-  # Base seed for deterministic paired-seed scheduling
+  # Base seed for deterministic paired-seed scheduling (used if seed_set_id not set)
   seed: 0
-  # Optional: fixed seed set id under configs/seed_sets/<id>.txt (overrides `seed` for scheduling)
-  # seed_set_id: "dev_small_v1"
+  # Fixed seed set id under configs/seed_sets/<id>.txt (overrides `seed` for scheduling)
+  seed_set_id: "dev_v1"
   # Win rate threshold for promotion (0.55 = 55%)
   win_rate_threshold: 0.55
   # Use paired seeds with side swap for reduced variance
   paired_seed_swap: true
-  # Optional: use deterministic event-keyed chance stream for reproducible evals
+  # Use deterministic event-keyed chance stream for reproducible evals
   deterministic_chance: true
 
 # Neural network model architecture settings

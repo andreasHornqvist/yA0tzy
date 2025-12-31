@@ -306,15 +306,15 @@ mod tests {
         assert_eq!(config.mcts.budget_reroll, 100);
         assert_eq!(config.selfplay.workers, 4);
         assert_eq!(config.training.batch_size, 256);
-        assert_eq!(config.training.weight_decay, 0.0);
+        assert!((config.training.weight_decay - 0.0001).abs() < 1e-9);
         assert_eq!(config.training.steps_per_iteration, None);
         assert_eq!(config.gating.games, 100);
         assert_eq!(config.gating.seed, 0);
         assert_eq!(config.gating.seed_set_id.as_deref(), Some("dev_v1"));
         assert!(config.gating.paired_seed_swap);
         assert!(config.gating.deterministic_chance);
-        assert_eq!(config.replay.capacity_shards, None);
-        assert_eq!(config.controller.total_iterations, None);
+        assert_eq!(config.replay.capacity_shards, Some(20));
+        assert_eq!(config.controller.total_iterations, Some(10));
     }
 
     #[test]
