@@ -205,24 +205,6 @@ impl App {
             return;
         }
 
-        // Preflight inference endpoint for unix:// sockets (common local path).
-        if let Some(rest) = self.cfg.inference.bind.strip_prefix("unix://") {
-            let p = Path::new(rest);
-            if !p.exists() {
-                self.status = format!(
-                    "inference socket not found: {} (start `python -m yatzy_az infer-server` first)",
-                    p.display()
-                );
-                return;
-            }
-        }
-
-        // Preflight: check server supports hot-reload (E13.2S5).
-        if let Err(e) = check_server_supports_hot_reload(&self.cfg.inference.metrics_bind) {
-            self.status = format!("preflight failed: {}", e);
-            return;
-        }
-
         // Best-effort save draft before starting.
         self.save_config_draft();
 
@@ -242,35 +224,6 @@ impl App {
         } else {
             self.status = "no active run".to_string();
         }
-    }
-}
-
-/// Response from GET /capabilities on the inference server (E13.2S5).
-#[derive(serde::Deserialize)]
-struct ServerCapabilities {
-    #[allow(dead_code)]
-    version: String,
-    hot_reload: bool,
-}
-
-/// Check if the inference server supports hot-reload (E13.2S5).
-///
-/// Returns Ok(()) if the server is reachable and supports hot-reload,
-/// otherwise returns an error message.
-fn check_server_supports_hot_reload(metrics_bind: &str) -> Result<(), String> {
-    let url = format!("http://{}/capabilities", metrics_bind);
-    let resp = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("cannot reach metrics server at {}: {}", metrics_bind, e))?;
-
-    let caps: ServerCapabilities = resp
-        .into_json()
-        .map_err(|e| format!("invalid capabilities response: {}", e))?;
-
-    if caps.hot_reload {
-        Ok(())
-    } else {
-        Err("server does not support hot-reload (restart server with reload callback)".to_string())
     }
 }
 
@@ -1370,31 +1323,4 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_server_capabilities_parsing() {
-        // Test that we can parse a valid capabilities response.
-        let json = r#"{"version":"1","hot_reload":true}"#;
-        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
-        assert_eq!(caps.version, "1");
-        assert!(caps.hot_reload);
-
-        // Test parsing with hot_reload=false.
-        let json = r#"{"version":"1","hot_reload":false}"#;
-        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
-        assert_eq!(caps.version, "1");
-        assert!(!caps.hot_reload);
-    }
-
-    #[test]
-    fn test_check_server_invalid_bind() {
-        // Test with invalid endpoint (should fail to connect).
-        let result = check_server_supports_hot_reload("127.0.0.1:0");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("cannot reach metrics server"));
-    }
-}
+// (no tests)

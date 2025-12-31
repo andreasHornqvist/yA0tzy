@@ -5,6 +5,7 @@
 //! - write controller phase/status fields into `runs/<id>/run.json`
 
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -54,6 +55,26 @@ pub enum ControllerError {
     Cancelled,
     #[error("model reload failed: {0}")]
     ReloadModel(String),
+    #[error("infer-server failed: {0}")]
+    InferServer(String),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ServerCapabilities {
+    #[allow(dead_code)]
+    version: String,
+    hot_reload: bool,
+}
+
+struct InferServerChild {
+    child: Child,
+}
+
+impl Drop for InferServerChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Minimal controller handle (phase/status updates only, v1).
@@ -122,6 +143,132 @@ fn repo_root_from_run_dir(run_dir: &Path) -> PathBuf {
 
 fn python_project_dir_from_run_dir(run_dir: &Path) -> PathBuf {
     repo_root_from_run_dir(run_dir).join("python")
+}
+
+fn get_server_capabilities(metrics_bind: &str) -> Result<ServerCapabilities, ControllerError> {
+    let url = format!("http://{}/capabilities", metrics_bind);
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| ControllerError::InferServer(format!("HTTP request failed: {e}")))?;
+    if resp.status() != 200 {
+        return Err(ControllerError::InferServer(format!(
+            "capabilities returned status {}",
+            resp.status()
+        )));
+    }
+    resp.into_json()
+        .map_err(|e| ControllerError::InferServer(format!("invalid capabilities JSON: {e}")))
+}
+
+fn build_infer_server_command(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    python_exe: &str,
+) -> Command {
+    // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
+    let use_uv = Command::new("uv")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let py_dir = python_project_dir_from_run_dir(run_dir);
+
+    let bind = cfg.inference.bind.clone();
+    let metrics_bind = cfg.inference.metrics_bind.clone();
+    let device = cfg.inference.device.clone();
+    let max_batch = cfg.inference.max_batch.to_string();
+    let max_wait_us = cfg.inference.max_wait_us.to_string();
+
+    if use_uv {
+        let mut cmd = Command::new("uv");
+        cmd.current_dir(py_dir);
+        cmd.args(["run", "python", "-m", "yatzy_az", "infer-server"]);
+        cmd.args(["--best", "dummy", "--cand", "dummy"]);
+        cmd.args(["--bind", &bind]);
+        cmd.args(["--metrics-bind", &metrics_bind]);
+        cmd.args(["--device", &device]);
+        cmd.args(["--max-batch", &max_batch]);
+        cmd.args(["--max-wait-us", &max_wait_us]);
+        cmd.args(["--print-stats-every-s", "0"]);
+        cmd
+    } else {
+        let mut cmd = Command::new(python_exe);
+        cmd.current_dir(py_dir);
+        cmd.args(["-m", "yatzy_az", "infer-server"]);
+        cmd.args(["--best", "dummy", "--cand", "dummy"]);
+        cmd.args(["--bind", &bind]);
+        cmd.args(["--metrics-bind", &metrics_bind]);
+        cmd.args(["--device", &device]);
+        cmd.args(["--max-batch", &max_batch]);
+        cmd.args(["--max-wait-us", &max_wait_us]);
+        cmd.args(["--print-stats-every-s", "0"]);
+        cmd
+    }
+}
+
+fn ensure_infer_server(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    python_exe: &str,
+) -> Result<Option<InferServerChild>, ControllerError> {
+    // If reachable and hot-reload capable, reuse existing server.
+    if let Ok(caps) = get_server_capabilities(&cfg.inference.metrics_bind) {
+        if caps.hot_reload {
+            return Ok(None);
+        }
+    }
+
+    // Clean up UDS socket path if configured (server will recreate it).
+    if let Some(rest) = cfg.inference.bind.strip_prefix("unix://") {
+        #[cfg(unix)]
+        {
+            let sock = Path::new(rest);
+            let _ = std::fs::remove_file(sock);
+        }
+    }
+
+    // Capture server logs to run-local file for debugging.
+    let log_path = run_dir.join("logs").join("infer_server.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    let mut cmd = build_infer_server_command(run_dir, cfg, python_exe);
+    cmd.stdout(Stdio::from(stdout));
+    cmd.stderr(Stdio::from(stderr));
+    let mut child = cmd.spawn().map_err(|e| {
+        ControllerError::InferServer(format!("failed to spawn infer-server: {e}"))
+    })?;
+
+    // Wait for readiness (capabilities endpoint).
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(25));
+        if let Ok(caps) = get_server_capabilities(&cfg.inference.metrics_bind) {
+            if caps.hot_reload {
+                return Ok(Some(InferServerChild { child }));
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let tail = tail_file(&log_path, 16 * 1024).unwrap_or_default();
+            return Err(ControllerError::InferServer(format!(
+                "infer-server exited early: {status}\n{tail}"
+            )));
+        }
+    }
+
+    let tail = tail_file(&log_path, 16 * 1024).unwrap_or_default();
+    Err(ControllerError::InferServer(format!(
+        "infer-server did not become ready (metrics_bind={}); log tail:\n{}",
+        cfg.inference.metrics_bind, tail
+    )))
 }
 
 fn update_manifest_atomic(
@@ -360,6 +507,10 @@ pub fn spawn_iteration(
         };
         // Ensure manifest/config snapshot exists even if cancelled early.
         let mut manifest = ensure_manifest(&run_dir, &cfg)?;
+
+        // Ensure inference server is running (owned by controller for this iteration).
+        // If one is already running, we reuse it.
+        let _infer_srv = ensure_infer_server(&run_dir, &cfg, &python_exe)?;
 
         // E13.2S2: Ensure best.pt exists (bootstrap via model-init if missing).
         ensure_best_pt(&run_dir, &cfg, &python_exe)?;
