@@ -216,6 +216,7 @@ class Batcher:
 
             # region agent log
             try:
+                _t_log0 = time.monotonic()
                 with open(
                     "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
                     "a",
@@ -241,6 +242,32 @@ class Batcher:
                         )
                         + "\n"
                     )
+                _t_log_ms = (time.monotonic() - _t_log0) * 1000.0
+                if _t_log_ms > 5.0:
+                    with open(
+                        "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                        "a",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(
+                            _json.dumps(
+                                {
+                                    "timestamp": int(time.time() * 1000),
+                                    "sessionId": "debug-session",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "H_logio",
+                                    "location": "python/yatzy_az/server/batcher.py:_apply_batch",
+                                    "message": "slow debug.log write",
+                                    "data": {
+                                        "log_write_ms": _t_log_ms,
+                                        "model_id": int(model_id),
+                                        "items": int(len(items)),
+                                        "queue_depth": int(self._q.qsize()),
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
             except Exception:
                 pass
             # endregion agent log
