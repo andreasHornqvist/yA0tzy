@@ -823,15 +823,18 @@ fn ensure_best_pt(
     std::fs::create_dir_all(run_dir.join("models"))?;
 
     let mut cmd = build_model_init_command(run_dir, cfg, python_exe);
-    let status = cmd
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()?;
+    // Capture output to avoid corrupting TUI display.
+    let output = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
 
-    if !status.success() {
-        return Err(ControllerError::Fs(std::io::Error::other(
-            format!("model-init failed: {status}"),
-        )));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ControllerError::Fs(std::io::Error::other(format!(
+            "model-init failed: {}\nstderr: {}",
+            output.status, stderr
+        ))));
     }
 
     // Verify the file was created.

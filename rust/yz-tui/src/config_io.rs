@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use yz_core::Config;
 
 pub const CONFIG_DRAFT_NAME: &str = "config.draft.yaml";
+pub const DEFAULT_CONFIG_PATH: &str = "configs/local_cpu.yaml";
 
 pub fn draft_path(run_dir: &Path) -> PathBuf {
     run_dir.join(CONFIG_DRAFT_NAME)
@@ -19,7 +20,7 @@ pub fn load_cfg_for_run(run_dir: &Path) -> (Config, Option<String>) {
             Ok(cfg) => return (cfg, Some(format!("Loaded {}", CONFIG_DRAFT_NAME))),
             Err(e) => {
                 return (
-                    Config::default(),
+                    load_default_config(),
                     Some(format!("Failed to load {}: {e}", CONFIG_DRAFT_NAME)),
                 );
             }
@@ -29,10 +30,22 @@ pub fn load_cfg_for_run(run_dir: &Path) -> (Config, Option<String>) {
     if s.exists() {
         match Config::load(&s) {
             Ok(cfg) => return (cfg, Some("Loaded config.yaml".to_string())),
-            Err(e) => return (Config::default(), Some(format!("Failed to load config.yaml: {e}"))),
+            Err(e) => return (load_default_config(), Some(format!("Failed to load config.yaml: {e}"))),
         }
     }
-    (Config::default(), Some("Using Config::default()".to_string()))
+    // For new runs, try to load from configs/local_cpu.yaml as the default template.
+    let default_cfg = load_default_config();
+    let msg = if Path::new(DEFAULT_CONFIG_PATH).exists() {
+        format!("Loaded {}", DEFAULT_CONFIG_PATH)
+    } else {
+        "Using built-in defaults".to_string()
+    };
+    (default_cfg, Some(msg))
+}
+
+/// Load the default config from configs/local_cpu.yaml, falling back to built-in defaults.
+fn load_default_config() -> Config {
+    Config::load(DEFAULT_CONFIG_PATH).unwrap_or_default()
 }
 
 pub fn save_cfg_draft_atomic(run_dir: &Path, cfg: &Config) -> Result<(), std::io::Error> {
