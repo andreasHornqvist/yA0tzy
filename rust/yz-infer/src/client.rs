@@ -244,6 +244,7 @@ impl InferenceClient {
     ///
     /// Note: the client overwrites `req.request_id` with a unique id and returns it in the ticket.
     pub fn submit(&self, mut req: InferRequestV1) -> Result<Ticket, ClientError> {
+        let t0 = Instant::now();
         // Backpressure: inflight cap.
         if !self.try_acquire_inflight() {
             self.stats_lock().on_error();
@@ -253,8 +254,11 @@ impl InferenceClient {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         req.request_id = request_id;
 
+        let t_ch0 = Instant::now();
         let (tx, rx) = mpsc::channel::<Result<InferResponseV1, ClientError>>();
+        let ch_ms = t_ch0.elapsed().as_secs_f64() * 1000.0;
         {
+            let t_ins0 = Instant::now();
             let mut g = self.pending.lock().unwrap();
             g.insert(
                 request_id,
@@ -263,6 +267,18 @@ impl InferenceClient {
                     tx,
                 },
             );
+            let ins_ms = t_ins0.elapsed().as_secs_f64() * 1000.0;
+            // region agent log
+            // If insert itself is slow, log it; otherwise rely on total breakdown below.
+            if ins_ms >= 1.0 {
+                dbg_log(
+                    "H_client_breakdown",
+                    "rust/yz-infer/src/client.rs:InferenceClient::submit",
+                    "slow pending.insert",
+                    serde_json::json!({ "insert_ms": ins_ms, "pending_len": g.len() }),
+                );
+            }
+            // endregion agent log
         }
 
         let (mut payload, reused) = match self.pool_rx.lock().unwrap().try_recv() {
@@ -278,7 +294,32 @@ impl InferenceClient {
         let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
 
         let tx = self.outbound_tx.as_ref().ok_or(ClientError::Disconnected)?;
-        match tx.try_send(payload) {
+        let t_send0 = Instant::now();
+        let r = tx.try_send(payload);
+        let send_ms = t_send0.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // region agent log
+        // Outlier-only, but captures the full breakdown so we can optimize with confidence.
+        if total_ms >= 1.0 {
+            dbg_log(
+                "H_client_breakdown",
+                "rust/yz-infer/src/client.rs:InferenceClient::submit",
+                "submit breakdown",
+                serde_json::json!({
+                    "total_ms": total_ms,
+                    "channel_ms": ch_ms,
+                    "encode_ms": enc_ms,
+                    "try_send_ms": send_ms,
+                    "reused_buf": reused,
+                    "features_len": req.features.len(),
+                    "legal_len": req.legal_mask.len(),
+                }),
+            );
+        }
+        // endregion agent log
+
+        match r {
             Ok(()) => {
                 self.stats_lock().on_sent();
                 // region agent log
