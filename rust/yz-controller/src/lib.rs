@@ -549,7 +549,11 @@ fn reload_model(
 /// Reload the "best" model before selfplay (E13.2S4).
 /// Returns the number of reloads performed.
 fn reload_best_for_selfplay(run_dir: &Path, cfg: &yz_core::Config) -> Result<u64, ControllerError> {
-    let best_path = run_dir.join("models").join("best.pt");
+    // Must use absolute path since server runs from different directory.
+    let run_dir_abs = run_dir
+        .canonicalize()
+        .unwrap_or_else(|_| run_dir.to_path_buf());
+    let best_path = run_dir_abs.join("models").join("best.pt");
     if best_path.exists() {
         reload_model(&cfg.inference.metrics_bind, "best", &best_path)?;
         Ok(1)
@@ -561,8 +565,12 @@ fn reload_best_for_selfplay(run_dir: &Path, cfg: &yz_core::Config) -> Result<u64
 /// Reload both "best" and "cand" models before gating (E13.2S4).
 /// Returns the number of reloads performed.
 fn reload_models_for_gating(run_dir: &Path, cfg: &yz_core::Config) -> Result<u64, ControllerError> {
-    let best_path = run_dir.join("models").join("best.pt");
-    let cand_path = run_dir.join("models").join("candidate.pt");
+    // Must use absolute path since server runs from different directory.
+    let run_dir_abs = run_dir
+        .canonicalize()
+        .unwrap_or_else(|_| run_dir.to_path_buf());
+    let best_path = run_dir_abs.join("models").join("best.pt");
+    let cand_path = run_dir_abs.join("models").join("candidate.pt");
 
     let mut count = 0u64;
     if best_path.exists() {
