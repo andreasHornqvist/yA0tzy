@@ -94,7 +94,10 @@ class Batcher:
                 continue
 
             batch: list[_Queued] = [first]
-            deadline = first.t0 + self._max_wait_s
+            # IMPORTANT: the batching window is relative to *now*, not relative to when the first
+            # request was enqueued. If the queue backs up (or inference is slow), using first.t0
+            # would make `remaining` <= 0 immediately, forcing batch size 1 forever.
+            deadline = time.monotonic() + self._max_wait_s
 
             while len(batch) < self._max_batch:
                 remaining = deadline - time.monotonic()
