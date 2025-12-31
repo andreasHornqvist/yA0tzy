@@ -723,9 +723,14 @@ fn build_train_command(
 
     // We expect the standard repo layout: python package lives under ./python.
     let py_dir = python_project_dir_from_run_dir(run_dir);
-    let out_models = run_dir.join("models");
-    let replay_dir = run_dir.join("replay");
-    let best_pt = run_dir.join("models").join("best.pt");
+    // Must use absolute paths since command runs from py_dir, not cwd.
+    let run_dir_abs = run_dir
+        .canonicalize()
+        .unwrap_or_else(|_| run_dir.to_path_buf());
+    let out_models = run_dir_abs.join("models");
+    let replay_dir = run_dir_abs.join("replay");
+    let best_pt = run_dir_abs.join("models").join("best.pt");
+    let config_yaml = run_dir_abs.join("config.yaml");
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -737,7 +742,7 @@ fn build_train_command(
             "--out",
             out_models.to_string_lossy().as_ref(),
             "--config",
-            run_dir.join("config.yaml").to_string_lossy().as_ref(),
+            config_yaml.to_string_lossy().as_ref(),
             "--best",
             best_pt.to_string_lossy().as_ref(),
         ]);
@@ -752,7 +757,7 @@ fn build_train_command(
             "--out",
             out_models.to_string_lossy().as_ref(),
             "--config",
-            run_dir.join("config.yaml").to_string_lossy().as_ref(),
+            config_yaml.to_string_lossy().as_ref(),
             "--best",
             best_pt.to_string_lossy().as_ref(),
         ]);
@@ -775,7 +780,12 @@ fn build_model_init_command(
         .unwrap_or(false);
 
     let py_dir = python_project_dir_from_run_dir(run_dir);
-    let best_pt = run_dir.join("models").join("best.pt");
+    // Must use absolute path since command runs from py_dir, not cwd.
+    let best_pt = run_dir
+        .canonicalize()
+        .unwrap_or_else(|_| run_dir.to_path_buf())
+        .join("models")
+        .join("best.pt");
     let hidden = cfg.model.hidden_dim.to_string();
     let blocks = cfg.model.num_blocks.to_string();
 
