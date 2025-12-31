@@ -22,6 +22,34 @@ use crate::codec::{decode_response_v1, encode_request_v1, DecodeError};
 use crate::frame::{read_frame, write_frame, FrameError};
 use crate::protocol::{InferRequestV1, InferResponseV1};
 
+// region agent log
+fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let payload = serde_json::json!({
+        "timestamp": (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64),
+        "sessionId": "debug-session",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+    });
+    if let Ok(line) = serde_json::to_string(&payload) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+        {
+            let _ = std::io::Write::write_all(&mut f, line.as_bytes());
+            let _ = std::io::Write::write_all(&mut f, b"\n");
+        }
+    }
+}
+static CLIENT_SUBMIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+// endregion agent log
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("io error: {0}")]
@@ -230,12 +258,30 @@ impl InferenceClient {
             );
         }
 
+        let t_enc0 = Instant::now();
         let payload = encode_request_v1(&req);
+        let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
 
         let tx = self.outbound_tx.as_ref().ok_or(ClientError::Disconnected)?;
         match tx.try_send(payload) {
             Ok(()) => {
                 self.stats_lock().on_sent();
+                // region agent log
+                let n = CLIENT_SUBMIT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                if enc_ms >= 0.5 || (n % 50_000 == 0) {
+                    dbg_log(
+                        "H_codec",
+                        "rust/yz-infer/src/client.rs:InferenceClient::submit",
+                        "encode_request_v1 timing",
+                        serde_json::json!({
+                            "n": n,
+                            "encode_ms": enc_ms,
+                            "features_len": req.features.len(),
+                            "legal_len": req.legal_mask.len(),
+                        }),
+                    );
+                }
+                // endregion agent log
                 Ok(Ticket { request_id, rx })
             }
             Err(mpsc::TrySendError::Full(_)) => {

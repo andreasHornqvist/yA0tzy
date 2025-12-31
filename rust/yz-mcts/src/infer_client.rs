@@ -8,12 +8,42 @@
 
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 use yz_core::{GameState, A};
 use yz_features::{encode_state_v1, schema};
 use yz_infer::protocol;
 use yz_infer::{ClientError, ClientOptions, InferenceClient, Ticket};
+
+// region agent log
+fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let payload = serde_json::json!({
+        "timestamp": (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64),
+        "sessionId": "debug-session",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+    });
+    if let Ok(line) = serde_json::to_string(&payload) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+        {
+            let _ = std::io::Write::write_all(&mut f, line.as_bytes());
+            let _ = std::io::Write::write_all(&mut f, b"\n");
+        }
+    }
+}
+static SUBMIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+// endregion agent log
 
 #[derive(Debug, Error)]
 pub enum InferBackendError {
@@ -67,13 +97,19 @@ impl InferBackend {
         state: &GameState,
         legal: &[bool; A],
     ) -> Result<Ticket, InferBackendError> {
+        let t0 = Instant::now();
+        let t_enc0 = Instant::now();
         let features = encode_state_v1(state);
+        let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
 
+        let t_mask0 = Instant::now();
         let mut legal_mask = Vec::with_capacity(A);
         for &ok in legal.iter() {
             legal_mask.push(if ok { 1u8 } else { 0u8 });
         }
+        let mask_ms = t_mask0.elapsed().as_secs_f64() * 1000.0;
 
+        let t_req0 = Instant::now();
         let req = protocol::InferRequestV1 {
             request_id: 0, // overwritten by client
             model_id: self.model_id,
@@ -81,7 +117,32 @@ impl InferBackend {
             features: features.to_vec(),
             legal_mask,
         };
-        Ok(self.client.submit(req)?)
+        let t_submit0 = Instant::now();
+        let out = self.client.submit(req)?;
+        let req_build_ms = t_req0.elapsed().as_secs_f64() * 1000.0;
+        let submit_ms = t_submit0.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // region agent log
+        let n = SUBMIT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        if total_ms >= 0.5 || (n % 50_000 == 0) {
+            dbg_log(
+                "H_submit_alloc",
+                "rust/yz-mcts/src/infer_client.rs:InferBackend::submit",
+                "submit timing",
+                serde_json::json!({
+                    "n": n,
+                    "enc_ms": enc_ms,
+                    "mask_ms": mask_ms,
+                    "req_build_ms": req_build_ms,
+                    "client_submit_ms": submit_ms,
+                    "total_ms": total_ms,
+                }),
+            );
+        }
+        // endregion agent log
+
+        Ok(out)
     }
 
     pub fn recv_timeout(
