@@ -12,6 +12,21 @@ inference:
   max_batch: 32
   # Maximum wait time (microseconds) before flushing a partial batch
   max_wait_us: 1000
+  # Metrics/control HTTP server bind address (used for hot-reload and Prometheus metrics)
+  metrics_bind: "127.0.0.1:18080"
+
+# Controller settings (orchestration)
+controller:
+  # Number of full iteration cycles to run (selfplay → train → gate)
+  # Set higher for multi-iteration training runs
+  total_iterations: 10
+
+# Replay buffer settings
+replay:
+  # Keep at most N shards under runs/<id>/replay/ (prune older beyond capacity)
+  # Prevents unbounded disk growth during long runs
+  # Comment out or set to 0 to disable pruning (keep all shards)
+  capacity_shards: 20
 
 # MCTS (Monte Carlo Tree Search) settings
 mcts:

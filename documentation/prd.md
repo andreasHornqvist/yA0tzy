@@ -397,13 +397,13 @@ Every shard/checkpoint/log includes:
 
 ### 10.4 Replay retention / capacity knobs (status)
 
-We currently store replay as append-only shards under `runs/<id>/replay/`. To avoid unbounded disk growth and to support stable “replay buffer” semantics, we define the following knobs:
+We currently store replay as append-only shards under `runs/<id>/replay/`. To avoid unbounded disk growth and to support stable "replay buffer" semantics, we define the following knobs:
 
 * **Replay buffer capacity**: `replay.capacity_shards` (or `replay.capacity_samples`)
   * Definition: keep at most N shards (or M samples) worth of replay for training; prune older shards beyond capacity.
   * Pruning policy should be deterministic and recorded (e.g. keep newest by shard sequence/mtime).
-  * **Status:** `replay.capacity_shards` is **implemented in the shared config schema** (Rust + Python) and editable in the TUI; **pruning behavior is not implemented yet**.
-  * **AC (later):** running multiple iterations does not grow replay storage unbounded; pruning is logged and reproducible.
+  * **Status:** ✅ **Implemented** (E13.1S1). Pruning keeps newest N shards by filename index; emits `replay_prune` event to `logs/metrics.ndjson`.
+  * **AC:** running multiple iterations does not grow replay storage unbounded; pruning is logged and reproducible.
 
 ---
 
@@ -452,8 +452,9 @@ This section enumerates training-related config knobs and their implementation s
 * **Total iterations**: `controller.total_iterations` (or `run.total_iterations`)
   * Definition: how many full iteration cycles to run (self-play → train → gate).
   * This is orchestration/controller config (not a per-step training knob).
-  * **Status:** `controller.total_iterations` is implemented in the shared config schema, but the controller loop is not implemented yet.
-  * **AC (later):** controller stops after N iterations and records progress in `run.json`.
+  * Default: `1` (single iteration). Set higher for multi-iteration training runs.
+  * **Status:** ✅ **Implemented** (E13.1S2). Controller runs N iterations, updates `run.json` with progress, and stops when `controller_iteration_idx >= total_iterations`.
+  * **AC:** controller stops after N iterations and records progress in `run.json`.
 
 ---
 
@@ -1206,13 +1207,13 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
 
 ---
 
-## Epic E13.1 — Integrate newly added knobs (finish runtime behavior)
+## Epic E13.1 — Integrate newly added knobs (finish runtime behavior) *(complete)*
 
 **Goal:** complete recently added config knobs by implementing their runtime behavior (not just schema/UI).
 
 **Stories**
 
-1. **Replay pruning (`replay.capacity_shards`)**
+1. **Replay pruning (`replay.capacity_shards`)** *(done)*
 
    * Implement deterministic pruning of `runs/<id>/replay/` after shard flush/close.
    * Emit a metrics event (e.g. `replay_prune`) to `logs/metrics.ndjson` summarizing what was removed.
@@ -1222,8 +1223,9 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
      * replay directory growth is bounded across iterations (keeps newest N shards)
      * pruning behavior is reproducible/auditable (deterministic by shard idx)
      * `logs/metrics.ndjson` includes `event="replay_prune"` with before/after/deleted counts
+   * **Status:** Implemented in `yz-replay::prune_shards_by_idx()`. Called by `yz-runtime` after shard close when `capacity_shards > 0`.
 
-2. **Controller iteration loop (`controller.total_iterations`)**
+2. **Controller iteration loop (`controller.total_iterations`)** *(done)*
 
    * Implement a controller loop that runs N full iterations (selfplay → train → gate), updating `run.json` counters/status.
    * **Semantics (v1):** `controller.total_iterations` is an **absolute cap** per run directory.
@@ -1231,8 +1233,9 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
      * If `controller_iteration_idx >= total_iterations`, starting the controller is a no-op (immediately `done`).
      * If `controller_iteration_idx = k < total_iterations`, the controller runs only the **remaining** iterations `[k..total_iterations)`.
    * **AC:** controller stops after N total iterations and the run is auditable from `run.json` + metrics.
+   * **Status:** Implemented in `yz-controller::spawn_iteration()`. Loop runs remaining iterations; tested.
 
-3. **Epochs vs steps semantics**
+3. **Epochs vs steps semantics** *(done)*
 
    * Make trainer behavior explicit and deterministic:
      * if `training.steps_per_iteration` is set, run exactly that many optimizer steps
@@ -1245,6 +1248,7 @@ This epic adds a **ratatui-based UI** and a small **Rust controller** that updat
      * epochs/steps behavior is deterministic and logged
      * `runs/<id>/run.json` includes `iterations[].train.steps_target` so the TUI can show training progress
      * `logs/metrics.ndjson` includes a `train_plan` event capturing the derived target inputs
+   * **Status:** Implemented in Python trainer. Emits `train_plan` event; records `steps_target` in `run.json`.
 
 ---
 
