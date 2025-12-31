@@ -53,6 +53,7 @@ fn iter_finalize_promote_creates_best_and_updates_manifest() {
         controller_status: None,
         controller_last_ts_ms: None,
         controller_error: None,
+        model_reloads: 0,
         controller_iteration_idx: 0,
         iterations: Vec::new(),
     };
@@ -134,6 +135,7 @@ fn iter_finalize_reject_does_not_create_best_but_updates_manifest() {
         controller_status: None,
         controller_last_ts_ms: None,
         controller_error: None,
+        model_reloads: 0,
         controller_iteration_idx: 0,
         iterations: Vec::new(),
     };

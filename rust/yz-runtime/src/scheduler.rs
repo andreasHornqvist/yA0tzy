@@ -161,10 +161,10 @@ impl Scheduler {
             }
         }
         // Rate-limit iteration stats logging to avoid huge log files.
-        // Only log every 100 ticks (~10-100ms depending on workload).
+        // Always log the first tick (for quick feedback + tests), then every N ticks thereafter.
         const ITER_STATS_LOG_EVERY_N: u64 = 100;
         if let Some(lg) = loggers {
-            if self.stats.ticks % ITER_STATS_LOG_EVERY_N == 0 {
+            if self.stats.ticks == 1 || self.stats.ticks % ITER_STATS_LOG_EVERY_N == 0 {
                 let s = backend.stats_snapshot();
                 let ts_ms = now_ms();
                 let ev = IterationStatsEventV1 {

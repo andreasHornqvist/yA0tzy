@@ -58,7 +58,8 @@ fn start_dummy_infer_server_tcp() -> (std::net::SocketAddr, std::thread::JoinHan
 fn pi_is_valid_distribution_and_respects_legality() {
     let mut mcts = Mcts::new(MctsConfig {
         c_puct: 1.5,
-        simulations: 64,
+        simulations_mark: 64,
+        simulations_reroll: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
@@ -110,7 +111,8 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
 
     let mut mcts = Mcts::new(MctsConfig {
         c_puct: 1.5,
-        simulations: 64,
+        simulations_mark: 64,
+        simulations_reroll: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
@@ -153,7 +155,8 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
 fn eval_mode_is_deterministic() {
     let cfg = MctsConfig {
         c_puct: 1.5,
-        simulations: 128,
+        simulations_mark: 128,
+        simulations_reroll: 128,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
         max_inflight: 8,
@@ -185,7 +188,8 @@ fn eval_mode_is_deterministic() {
 fn root_noise_is_only_applied_in_rng_mode() {
     let cfg = MctsConfig {
         c_puct: 1.5,
-        simulations: 32,
+        simulations_mark: 32,
+        simulations_reroll: 32,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
         max_inflight: 8,
@@ -219,7 +223,8 @@ fn root_noise_is_only_applied_in_rng_mode() {
 fn temperature_changes_exec_distribution_but_not_pi_target() {
     let cfg = MctsConfig {
         c_puct: 1.5,
-        simulations: 128,
+        simulations_mark: 128,
+        simulations_reroll: 128,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
@@ -260,7 +265,8 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
 fn fallback_can_be_triggered_and_returns_uniform_pi() {
     let cfg = MctsConfig {
         c_puct: 1.5,
-        simulations: 64,
+        simulations_mark: 64,
+        simulations_reroll: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
@@ -304,7 +310,8 @@ fn virtual_loss_reduces_pending_collisions() {
 
     let cfg_no_vl = MctsConfig {
         c_puct: 1.5,
-        simulations: 64,
+        simulations_mark: 64,
+        simulations_reroll: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,

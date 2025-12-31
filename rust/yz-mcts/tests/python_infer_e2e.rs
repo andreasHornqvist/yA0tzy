@@ -134,7 +134,8 @@ fn python_infer_server_real_checkpoint_e2e_opt_in() {
 
     let mut mcts = Mcts::new(MctsConfig {
         c_puct: 1.5,
-        simulations: 32,
+        simulations_mark: 32,
+        simulations_reroll: 32,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,

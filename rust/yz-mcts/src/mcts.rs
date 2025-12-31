@@ -24,7 +24,10 @@ pub enum ChanceMode {
 #[derive(Clone, Copy)]
 pub struct MctsConfig {
     pub c_puct: f32,
-    pub simulations: u32,
+    /// Simulation budget for mark decisions (rerolls_left==0).
+    pub simulations_mark: u32,
+    /// Simulation budget for reroll/keep decisions (rerolls_left>0).
+    pub simulations_reroll: u32,
     /// Root Dirichlet alpha (self-play only).
     pub dirichlet_alpha: f32,
     /// Root Dirichlet epsilon mix-in fraction (self-play only).
@@ -39,7 +42,8 @@ impl Default for MctsConfig {
     fn default() -> Self {
         Self {
             c_puct: 1.5,
-            simulations: 64,
+            simulations_mark: 64,
+            simulations_reroll: 64,
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.25,
             max_inflight: 8,
@@ -87,6 +91,7 @@ pub struct SearchDriver {
     root_state: GameState,
     mode: ChanceMode,
     root_id: NodeId,
+    target_sims: u32,
 
     // Root evaluation is async.
     root_ticket: Option<yz_infer::Ticket>,
@@ -129,9 +134,9 @@ impl Mcts {
                 msg: "c_puct must be finite and > 0",
             });
         }
-        if cfg.simulations == 0 {
+        if cfg.simulations_mark == 0 || cfg.simulations_reroll == 0 {
             return Err(MctsError::InvalidConfig {
-                msg: "simulations must be > 0",
+                msg: "simulations_mark and simulations_reroll must be > 0",
             });
         }
         if cfg.max_inflight == 0 {
@@ -159,6 +164,11 @@ impl Mcts {
         mode: ChanceMode,
         infer: &impl Inference,
     ) -> SearchResult {
+        let target_sims = if root_state.rerolls_left > 0 {
+            self.cfg.simulations_reroll
+        } else {
+            self.cfg.simulations_mark
+        };
         self.reset_tree();
         self.stats = SearchStats::default();
         self.force_uniform_root_pi = false;
@@ -208,9 +218,9 @@ impl Mcts {
         let mut pending: std::collections::VecDeque<PendingEval> =
             std::collections::VecDeque::new();
 
-        while completed < self.cfg.simulations {
+        while completed < target_sims {
             while pending.len() < self.cfg.max_inflight
-                && (completed as usize + pending.len()) < (self.cfg.simulations as usize)
+                && (completed as usize + pending.len()) < (target_sims as usize)
             {
                 sel_counter += 1;
                 let mut ctx = match mode {
@@ -289,6 +299,12 @@ impl Mcts {
         mode: ChanceMode,
         backend: &InferBackend,
     ) -> SearchDriver {
+        let target_sims = if root_state.rerolls_left > 0 {
+            self.cfg.simulations_reroll
+        } else {
+            self.cfg.simulations_mark
+        };
+
         // region agent log
         {
             use std::io::Write;
@@ -298,8 +314,8 @@ impl Mcts {
                 .unwrap_or_default()
                 .as_millis() as u64;
             let line = format!(
-                "{{\"timestamp\":{ts},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_budget\",\"location\":\"rust/yz-mcts/src/mcts.rs:begin_search_with_backend\",\"message\":\"begin_search\",\"data\":{{\"rerolls_left\":{},\"simulations_cfg\":{}}}}}",
-                root_state.rerolls_left, self.cfg.simulations
+                "{{\"timestamp\":{ts},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_budget\",\"location\":\"rust/yz-mcts/src/mcts.rs:begin_search_with_backend\",\"message\":\"begin_search\",\"data\":{{\"rerolls_left\":{},\"sim_mark\":{},\"sim_reroll\":{},\"target_sims\":{}}}}}",
+                root_state.rerolls_left, self.cfg.simulations_mark, self.cfg.simulations_reroll, target_sims
             );
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -329,6 +345,7 @@ impl Mcts {
             root_state,
             mode,
             root_id,
+            target_sims,
             root_ticket,
             root_priors_raw: None,
             root_priors_noisy: None,
@@ -669,13 +686,13 @@ impl SearchDriver {
                 continue;
             }
 
-            if self.completed >= mcts.cfg.simulations {
+            if self.completed >= self.target_sims {
                 return Some(self.finish(mcts));
             }
 
             // Enqueue one leaf selection if we are under inflight cap and budget.
             if self.pending.len() < mcts.cfg.max_inflight
-                && (self.completed as usize + self.pending.len()) < (mcts.cfg.simulations as usize)
+                && (self.completed as usize + self.pending.len()) < (self.target_sims as usize)
             {
                 self.sel_counter += 1;
                 let mut ctx = match self.mode {

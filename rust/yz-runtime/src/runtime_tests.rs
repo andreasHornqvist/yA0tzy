@@ -66,7 +66,8 @@ fn scheduler_multiplexes_many_games_without_deadlock() {
         let mut ctx = yz_core::TurnContext::new_rng(123 ^ i);
         let state = yz_core::initial_state(&mut ctx);
         let mcts_cfg = MctsConfig {
-            simulations: 32,
+            simulations_mark: 32,
+            simulations_reroll: 32,
             max_inflight: 4,
             ..MctsConfig::default()
         };
@@ -128,7 +129,8 @@ fn scheduler_writes_ndjson_iteration_and_root_logs() {
         let mut ctx = yz_core::TurnContext::new_rng(123 ^ i);
         let state = yz_core::initial_state(&mut ctx);
         let mcts_cfg = MctsConfig {
-            simulations: 16,
+            simulations_mark: 16,
+            simulations_reroll: 16,
             max_inflight: 2,
             ..MctsConfig::default()
         };

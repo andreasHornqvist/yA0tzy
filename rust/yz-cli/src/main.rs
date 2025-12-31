@@ -364,7 +364,8 @@ OPTIONS:
     let parallel = cfg.selfplay.threads_per_worker.max(1) as usize;
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
-        simulations: cfg.mcts.budget_mark.max(1),
+        simulations_mark: cfg.mcts.budget_mark.max(1),
+        simulations_reroll: cfg.mcts.budget_reroll.max(1),
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
@@ -588,7 +589,8 @@ OPTIONS:
 
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
-        simulations: cfg.mcts.budget_mark.max(1),
+        simulations_mark: cfg.mcts.budget_mark.max(1),
+        simulations_reroll: cfg.mcts.budget_reroll.max(1),
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: 0.0, // gating: no root noise
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,

@@ -176,7 +176,8 @@ fn main() {
     };
 
     let mcts_cfg = MctsConfig {
-        simulations: opts.simulations,
+        simulations_mark: opts.simulations,
+        simulations_reroll: opts.simulations,
         max_inflight: opts.max_inflight as usize,
         ..MctsConfig::default()
     };

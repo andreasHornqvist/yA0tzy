@@ -799,7 +799,8 @@ gating:
                 },
                 mcts_cfg: MctsConfig {
                     c_puct: 1.5,
-                    simulations: 8,
+                    simulations_mark: 8,
+                    simulations_reroll: 8,
                     dirichlet_alpha: 0.3,
                     dirichlet_epsilon: 0.0,
                     max_inflight: 4,

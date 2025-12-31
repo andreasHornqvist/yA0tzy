@@ -1215,7 +1215,8 @@ fn run_selfplay(
     let parallel = (cfg.selfplay.workers.max(1) as usize) * (cfg.selfplay.threads_per_worker.max(1) as usize);
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
-        simulations: cfg.mcts.budget_mark.max(1),
+        simulations_mark: cfg.mcts.budget_mark.max(1),
+        simulations_reroll: cfg.mcts.budget_reroll.max(1),
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
@@ -1416,7 +1417,8 @@ fn run_gate(
             },
             mcts_cfg: yz_mcts::MctsConfig {
                 c_puct: cfg.mcts.c_puct,
-                simulations: cfg.mcts.budget_mark.max(1),
+                simulations_mark: cfg.mcts.budget_mark.max(1),
+                simulations_reroll: cfg.mcts.budget_reroll.max(1),
                 dirichlet_alpha: cfg.mcts.dirichlet_alpha,
                 dirichlet_epsilon: 0.0,
                 max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,

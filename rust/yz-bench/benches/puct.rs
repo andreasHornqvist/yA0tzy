@@ -29,7 +29,8 @@ fn make_legal() -> [bool; A] {
 fn bench_puct_select(c: &mut Criterion) {
     let cfg = MctsConfig {
         c_puct: 1.5,
-        simulations: 64,
+        simulations_mark: 64,
+        simulations_reroll: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
         max_inflight: 8,
