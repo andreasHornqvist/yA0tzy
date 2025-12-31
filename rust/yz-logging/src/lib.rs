@@ -4,8 +4,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -461,6 +462,7 @@ pub struct NdjsonWriter {
     w: BufWriter<File>,
     lines_since_flush: u64,
     flush_every_lines: u64,
+    path: Option<PathBuf>,
 }
 
 impl NdjsonWriter {
@@ -474,15 +476,18 @@ impl NdjsonWriter {
         path: impl AsRef<Path>,
         flush_every_lines: u64,
     ) -> Result<Self, NdjsonError> {
-        let f = OpenOptions::new().create(true).append(true).open(path)?;
+        let p = path.as_ref().to_path_buf();
+        let f = OpenOptions::new().create(true).append(true).open(&p)?;
         Ok(Self {
             w: BufWriter::new(f),
             lines_since_flush: 0,
             flush_every_lines,
+            path: Some(p),
         })
     }
 
     pub fn write_event<T: Serialize>(&mut self, event: &T) -> Result<(), NdjsonError> {
+        let t0 = Instant::now();
         let mut buf = serde_json::to_vec(event)?;
         buf.push(b'\n');
         self.w.write_all(&buf)?;
@@ -490,15 +495,75 @@ impl NdjsonWriter {
         if self.flush_every_lines > 0 && self.lines_since_flush >= self.flush_every_lines {
             self.flush()?;
         }
+        let dt = t0.elapsed();
+        if dt.as_millis() >= 5 {
+            // region agent log
+            let _ = log_debug_outlier(
+                "H_rust_logio",
+                "rust/yz-logging/src/lib.rs:NdjsonWriter::write_event",
+                "slow ndjson write_event",
+                self.path.as_deref(),
+                dt.as_secs_f64() * 1000.0,
+            );
+            // endregion agent log
+        }
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<(), NdjsonError> {
+        let t0 = Instant::now();
         self.w.flush()?;
         self.lines_since_flush = 0;
+        let dt = t0.elapsed();
+        if dt.as_millis() >= 5 {
+            // region agent log
+            let _ = log_debug_outlier(
+                "H_rust_logio",
+                "rust/yz-logging/src/lib.rs:NdjsonWriter::flush",
+                "slow ndjson flush",
+                self.path.as_deref(),
+                dt.as_secs_f64() * 1000.0,
+            );
+            // endregion agent log
+        }
         Ok(())
     }
 }
+
+// region agent log
+fn log_debug_outlier(
+    hypothesis_id: &str,
+    location: &str,
+    message: &str,
+    ndjson_path: Option<&Path>,
+    dt_ms: f64,
+) -> io::Result<()> {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let payload = serde_json::json!({
+        "timestamp": ts_ms,
+        "sessionId": "debug-session",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": {
+            "dt_ms": dt_ms,
+            "ndjson_path": ndjson_path.map(|p| p.to_string_lossy().to_string()),
+        }
+    });
+    let line = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")?;
+    f.write_all(line.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
+}
+// endregion agent log
 
 #[cfg(test)]
 mod tests {
