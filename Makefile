@@ -6,9 +6,9 @@ help:
 	@echo "yA0tzy Make targets"
 	@echo ""
 	@echo "Core:"
-	@echo "  make run                      Start infer-server (dummy) + run TUI (all-in-one)"
+	@echo "  make run                      Start inference server + TUI (all-in-one)"
 	@echo "  make tui                      Run the Ratatui UI (yz tui)"
-	@echo "  make infer-server-dummy        Run Python infer-server with dummy best/cand models (UDS)"
+	@echo "  make infer-server             Run Python inference server (with hot-reload)"
 	@echo ""
 	@echo "Rust:"
 	@echo "  make rust-test                 cargo test --workspace"
@@ -89,34 +89,44 @@ run:
 	bind="$(INFER_BIND)"; \
 	metrics="$(METRICS_BIND)"; \
 	log_file="/tmp/yatzy_infer_server.log"; \
-	echo "Starting infer-server (dummy) on $$bind (metrics $$metrics) ..."; \
-	echo "Infer-server logs: $$log_file"; \
+	metrics_host="$${metrics%:*}"; \
+	metrics_port="$${metrics##*:}"; \
+	echo "Starting inference server on $$bind (metrics $$metrics) ..."; \
+	echo "Server logs: $$log_file"; \
+	existing_pid=$$(lsof -ti :$$metrics_port 2>/dev/null || true); \
+	if [[ -n "$$existing_pid" ]]; then \
+	  echo "Port $$metrics_port already in use (pid $$existing_pid), killing..."; \
+	  kill "$$existing_pid" 2>/dev/null || true; \
+	  sleep 0.2; \
+	fi; \
 	if [[ "$$bind" == unix://* ]]; then \
 	  sock="$${bind#unix://}"; \
 	  rm -f "$$sock"; \
 	fi; \
 	( $(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind "$$bind" --metrics-bind "$$metrics" --print-stats-every-s 0 >"$$log_file" 2>&1 ) & \
 	infer_pid="$$!"; \
-	trap 'echo ""; echo "Stopping infer-server pid=$$infer_pid"; kill "$$infer_pid" 2>/dev/null || true; wait "$$infer_pid" 2>/dev/null || true; if [[ "$$bind" == unix://* ]]; then rm -f "$${bind#unix://}"; fi' EXIT INT TERM; \
+	trap 'echo ""; echo "Stopping inference server (pid $$infer_pid)"; kill "$$infer_pid" 2>/dev/null || true; wait "$$infer_pid" 2>/dev/null || true; if [[ "$$bind" == unix://* ]]; then rm -f "$${bind#unix://}"; fi' EXIT INT TERM; \
 	if [[ "$$bind" == unix://* ]]; then \
 	  sock="$${bind#unix://}"; \
-	  echo "Waiting for UDS socket $$sock ..."; \
+	  echo "Waiting for socket $$sock ..."; \
 	  for _ in $$(seq 1 100); do \
 	    if [[ -S "$$sock" || -e "$$sock" ]]; then break; fi; \
 	    sleep 0.05; \
 	  done; \
 	  if [[ ! -e "$$sock" ]]; then \
-	    echo "Infer-server did not create socket: $$sock"; \
+	    echo "Server failed to start. Check $$log_file for details."; \
+	    cat "$$log_file" | tail -20; \
 	    exit 1; \
 	  fi; \
 	else \
 	  sleep 0.25; \
 	fi; \
 	echo "Starting TUI ..."; \
+	echo "(Press 'g' on Config screen to start an iteration)"; \
 	cargo run -p yz-cli --bin yz -- tui
 
-.PHONY: infer-server-dummy
-infer-server-dummy:
+.PHONY: infer-server
+infer-server:
 	$(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind $(INFER_BIND) --metrics-bind $(METRICS_BIND) --print-stats-every-s 0
 
 # Convenience wrappers. These assume a run id under ./runs/<id>/.

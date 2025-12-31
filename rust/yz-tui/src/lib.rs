@@ -1225,6 +1225,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         }
                         _ => {}
                     }
+                } else if phase == "idle" {
+                    right_lines.push(Line::from("No iteration running."));
+                    right_lines.push(Line::from(""));
+                    right_lines.push(Line::from("Press Esc → Config → 'g' to start."));
                 } else {
                     right_lines.push(Line::from(format!(
                         "no iteration summary for idx={cur_idx}"
