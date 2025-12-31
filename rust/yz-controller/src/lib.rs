@@ -1076,7 +1076,9 @@ fn run_selfplay(
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
                 completed_games += 1;
-                if completed_games.is_multiple_of(10) || completed_games == games {
+                // Update progress every game (for small runs) or every 10 games (for large runs).
+                let update_every = if games <= 20 { 1 } else { 10 };
+                if completed_games.is_multiple_of(update_every) || completed_games == games {
                     let total = base_total + completed_games as u64;
                     manifest.selfplay_games_completed = total;
                     if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
