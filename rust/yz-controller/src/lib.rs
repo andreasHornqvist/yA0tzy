@@ -371,14 +371,16 @@ pub fn spawn_iteration(
                 let iter_idx = manifest.controller_iteration_idx;
                 begin_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
 
-                ctrl.set_phase(
-                    Phase::Selfplay,
-                    format!(
-                        "starting selfplay (iter {}/{})",
-                        iter_idx + 1,
-                        total_iters
-                    ),
-                )?;
+                // Update in-memory AND on-disk phase to stay in sync.
+                manifest.controller_phase = Some(Phase::Selfplay.as_str().to_string());
+                manifest.controller_status = Some(format!(
+                    "starting selfplay (iter {}/{})",
+                    iter_idx + 1,
+                    total_iters
+                ));
+                manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
+                yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
+
                 // E13.2S4: Hot-reload best model before selfplay.
                 manifest.model_reloads += reload_best_for_selfplay(&run_dir, &cfg)?;
                 run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
@@ -386,10 +388,13 @@ pub fn spawn_iteration(
                     return Err(ControllerError::Cancelled);
                 }
 
-                ctrl.set_phase(
-                    Phase::Train,
-                    format!("starting train (iter {}/{})", iter_idx + 1, total_iters),
-                )?;
+                // Update in-memory AND on-disk phase to stay in sync.
+                manifest.controller_phase = Some(Phase::Train.as_str().to_string());
+                manifest.controller_status =
+                    Some(format!("starting train (iter {}/{})", iter_idx + 1, total_iters));
+                manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
+                yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
+
                 run_train_subprocess(&run_dir, &python_exe, &ctrl, iter_idx)?;
                 if ctrl.cancelled() {
                     return Err(ControllerError::Cancelled);
@@ -397,10 +402,13 @@ pub fn spawn_iteration(
                 // After training completes, pull the latest train stats from run.json (trainer updates it).
                 refresh_train_stats_from_run_json(&run_dir, &mut manifest, iter_idx)?;
 
-                ctrl.set_phase(
-                    Phase::Gate,
-                    format!("starting gate (iter {}/{})", iter_idx + 1, total_iters),
-                )?;
+                // Update in-memory AND on-disk phase to stay in sync.
+                manifest.controller_phase = Some(Phase::Gate.as_str().to_string());
+                manifest.controller_status =
+                    Some(format!("starting gate (iter {}/{})", iter_idx + 1, total_iters));
+                manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
+                yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
+
                 // E13.2S4: Hot-reload best + candidate models before gating.
                 manifest.model_reloads += reload_models_for_gating(&run_dir, &cfg)?;
                 run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
@@ -410,13 +418,14 @@ pub fn spawn_iteration(
                 yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
             }
 
-            ctrl.set_phase(
-                Phase::Done,
-                format!(
-                    "done (completed {}/{})",
-                    manifest.controller_iteration_idx, total_iters
-                ),
-            )?;
+            // Update in-memory AND on-disk phase to stay in sync.
+            manifest.controller_phase = Some(Phase::Done.as_str().to_string());
+            manifest.controller_status = Some(format!(
+                "done (completed {}/{})",
+                manifest.controller_iteration_idx, total_iters
+            ));
+            manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
+            yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
             Ok(())
         })();
 
