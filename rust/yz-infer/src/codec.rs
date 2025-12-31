@@ -28,7 +28,21 @@ pub enum DecodeError {
 }
 
 pub fn encode_request_v1(req: &InferRequestV1) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + req.features.len() * 4 + req.legal_mask.len());
+    let mut out = Vec::with_capacity(encode_request_v1_len(req));
+    encode_request_v1_into(&mut out, req);
+    out
+}
+
+pub fn encode_request_v1_len(req: &InferRequestV1) -> usize {
+    // header: u32 version + u8 kind + u8 flags + u16 reserved = 8 bytes
+    // ids: u64 request_id + u32 model_id + u32 schema_id = 16 bytes
+    // vectors: u32 features_len + f32[...] + u32 legal_len + u8[...] = 8 + features*4 + legal
+    32 + req.features.len() * 4 + req.legal_mask.len()
+}
+
+pub fn encode_request_v1_into(out: &mut Vec<u8>, req: &InferRequestV1) {
+    out.clear();
+    out.reserve(encode_request_v1_len(req));
 
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     out.push(MsgKind::Request as u8);
@@ -48,8 +62,6 @@ pub fn encode_request_v1(req: &InferRequestV1) -> Vec<u8> {
     let legal_len: u32 = req.legal_mask.len() as u32;
     out.extend_from_slice(&legal_len.to_le_bytes());
     out.extend_from_slice(&req.legal_mask);
-
-    out
 }
 
 pub fn decode_request_v1(bytes: &[u8]) -> Result<InferRequestV1, DecodeError> {

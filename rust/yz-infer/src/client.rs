@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::codec::{decode_response_v1, encode_request_v1, DecodeError};
+use crate::codec::{decode_response_v1, encode_request_v1_into, DecodeError};
 use crate::frame::{read_frame, write_frame, FrameError};
 use crate::protocol::{InferRequestV1, InferResponseV1};
 
@@ -159,6 +159,8 @@ pub struct InferenceClient {
     pending: Arc<Mutex<HashMap<u64, PendingEntry>>>,
 
     outbound_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    pool_tx: mpsc::SyncSender<Vec<u8>>,
+    pool_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     shutdown_stream: Stream,
     shutdown: Arc<AtomicBool>,
     reader_handle: Option<JoinHandle<()>>,
@@ -192,6 +194,7 @@ impl InferenceClient {
         let inflight = Arc::new(AtomicUsize::new(0));
 
         let (outbound_tx, outbound_rx) = mpsc::sync_channel::<Vec<u8>>(opts.max_outbound_queue);
+        let (pool_tx, pool_rx) = mpsc::sync_channel::<Vec<u8>>(opts.max_outbound_queue);
 
         let reader_stream = stream.try_clone()?;
         let writer_stream = stream.try_clone()?;
@@ -208,10 +211,12 @@ impl InferenceClient {
         let reader_handle = thread::spawn(move || {
             reader_loop(reader_stream, pending_r, inflight_r, shutdown_r, stats_r);
         });
+        let pool_tx_writer = pool_tx.clone();
         let writer_handle = thread::spawn(move || {
             writer_loop(
                 writer_stream,
                 outbound_rx,
+                pool_tx_writer,
                 pending_w,
                 inflight_w,
                 shutdown_w,
@@ -225,6 +230,8 @@ impl InferenceClient {
             inflight,
             pending,
             outbound_tx: Some(outbound_tx),
+            pool_tx,
+            pool_rx: Mutex::new(pool_rx),
             shutdown_stream: stream,
             shutdown,
             reader_handle: Some(reader_handle),
@@ -258,8 +265,16 @@ impl InferenceClient {
             );
         }
 
+        let (mut payload, reused) = match self.pool_rx.lock().unwrap().try_recv() {
+            Ok(mut b) => {
+                b.clear();
+                (b, true)
+            }
+            Err(_) => (Vec::with_capacity(512), false),
+        };
+
         let t_enc0 = Instant::now();
-        let payload = encode_request_v1(&req);
+        encode_request_v1_into(&mut payload, &req);
         let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
 
         let tx = self.outbound_tx.as_ref().ok_or(ClientError::Disconnected)?;
@@ -278,20 +293,24 @@ impl InferenceClient {
                             "encode_ms": enc_ms,
                             "features_len": req.features.len(),
                             "legal_len": req.legal_mask.len(),
+                            "reused_buf": reused,
                         }),
                     );
                 }
                 // endregion agent log
                 Ok(Ticket { request_id, rx })
             }
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(mpsc::TrySendError::Full(payload)) => {
+                // Return buffer to pool best-effort to avoid allocator churn.
+                let _ = self.pool_tx.try_send(payload);
                 self.remove_pending_with_error(
                     request_id,
                     ClientError::Backpressure("outbound queue full"),
                 );
                 Err(ClientError::Backpressure("outbound queue full"))
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(mpsc::TrySendError::Disconnected(payload)) => {
+                let _ = self.pool_tx.try_send(payload);
                 self.remove_pending_with_error(request_id, ClientError::Disconnected);
                 Err(ClientError::Disconnected)
             }
@@ -436,12 +455,13 @@ fn reader_loop(
 fn writer_loop(
     mut stream: Stream,
     outbound_rx: mpsc::Receiver<Vec<u8>>,
+    pool_tx: mpsc::SyncSender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingEntry>>>,
     inflight: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<Stats>>,
 ) {
-    while let Ok(payload) = outbound_rx.recv() {
+    while let Ok(mut payload) = outbound_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -452,6 +472,8 @@ fn writer_loop(
             fail_all_pending(&pending, &inflight, || ClientError::Disconnected);
             break;
         }
+        payload.clear();
+        let _ = pool_tx.try_send(payload);
     }
 }
 
