@@ -289,6 +289,29 @@ impl Mcts {
         mode: ChanceMode,
         backend: &InferBackend,
     ) -> SearchDriver {
+        // region agent log
+        {
+            use std::io::Write;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let line = format!(
+                "{{\"timestamp\":{ts},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_budget\",\"location\":\"rust/yz-mcts/src/mcts.rs:begin_search_with_backend\",\"message\":\"begin_search\",\"data\":{{\"rerolls_left\":{},\"simulations_cfg\":{}}}}}",
+                root_state.rerolls_left, self.cfg.simulations
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+            {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.write_all(b"\n");
+            }
+        }
+        // endregion agent log
+
         self.reset_tree();
         self.stats = SearchStats::default();
         self.force_uniform_root_pi = false;
