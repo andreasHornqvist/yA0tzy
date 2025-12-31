@@ -139,6 +139,42 @@ class Batcher:
                 pass
             # endregion agent log
 
+            # region agent log
+            # Measure how long the oldest request waited in the queue before being flushed.
+            # This helps confirm whether end-to-end latency is dominated by max_wait_us batching.
+            if len(batch) < self._max_batch:
+                try:
+                    now = time.monotonic()
+                    age_us = int((now - first.t0) * 1_000_000)
+                    with open(
+                        "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                        "a",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(
+                            _json.dumps(
+                                {
+                                    "timestamp": int(time.time() * 1000),
+                                    "sessionId": "debug-session",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "H_wait",
+                                    "location": "python/yatzy_az/server/batcher.py:Batcher.run",
+                                    "message": "batch wait (oldest item age)",
+                                    "data": {
+                                        "batch_len": int(len(batch)),
+                                        "age_us": age_us,
+                                        "max_wait_us": int(self._max_wait_s * 1_000_000),
+                                        "queue_depth_after_form": int(self._q.qsize()),
+                                        "flush_reason": "deadline_or_timeout",
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+            # endregion agent log
+
             self._apply_batch(batch)
 
     def stop(self) -> None:
