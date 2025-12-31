@@ -23,18 +23,20 @@ fn bench_scores_for_dice(c: &mut Criterion) {
     let mut g = c.benchmark_group("yz_core_scoring");
     for &n in &[256usize, 4096usize] {
         let samples = gen_dice_samples(n);
-        g.bench_with_input(BenchmarkId::new("scores_for_dice_batch", n), &samples, |b, s| {
-            b.iter(|| {
-                for &dice in s.iter() {
-                    black_box(yz_core::scores_for_dice(black_box(dice)));
-                }
-            })
-        });
+        g.bench_with_input(
+            BenchmarkId::new("scores_for_dice_batch", n),
+            &samples,
+            |b, s| {
+                b.iter(|| {
+                    for &dice in s.iter() {
+                        black_box(yz_core::scores_for_dice(black_box(dice)));
+                    }
+                })
+            },
+        );
     }
     g.finish();
 }
 
 criterion_group!(benches, bench_scores_for_dice);
 criterion_main!(benches);
-
-

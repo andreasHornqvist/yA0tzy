@@ -53,5 +53,3 @@ fn bench_puct_select(c: &mut Criterion) {
 
 criterion_group!(benches, bench_puct_select);
 criterion_main!(benches);
-
-

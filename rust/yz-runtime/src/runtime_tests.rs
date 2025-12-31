@@ -159,7 +159,8 @@ fn scheduler_writes_ndjson_iteration_and_root_logs() {
     };
 
     for _ in 0..200 {
-        sched.tick_and_write(&backend, &mut writer, Some(&mut loggers))
+        sched
+            .tick_and_write(&backend, &mut writer, Some(&mut loggers))
             .unwrap();
         thread::sleep(Duration::from_millis(1));
         if sched.tasks().iter().any(|t| t.ply > 0) {

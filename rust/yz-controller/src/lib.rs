@@ -78,8 +78,11 @@ impl IterationController {
         self.cancel.load(Ordering::Relaxed)
     }
 
-
-    pub fn set_phase(&self, phase: Phase, status: impl Into<String>) -> Result<(), ControllerError> {
+    pub fn set_phase(
+        &self,
+        phase: Phase,
+        status: impl Into<String>,
+    ) -> Result<(), ControllerError> {
         let run_json = self.run_dir.join("run.json");
         if !run_json.exists() {
             return Err(ControllerError::MissingManifest(run_json));
@@ -185,7 +188,10 @@ fn ensure_run_layout(run_dir: &Path) -> Result<(), ControllerError> {
     Ok(())
 }
 
-fn ensure_manifest(run_dir: &Path, cfg: &yz_core::Config) -> Result<RunManifestV1, ControllerError> {
+fn ensure_manifest(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+) -> Result<RunManifestV1, ControllerError> {
     ensure_run_layout(run_dir)?;
     let run_json = run_dir.join("run.json");
 
@@ -272,7 +278,14 @@ pub fn run_selfplay_then_gate(
     begin_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
     // E13.2S4: Hot-reload best model before selfplay.
     manifest.model_reloads += reload_best_for_selfplay(run_dir, &cfg)?;
-    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
+    run_selfplay(
+        run_dir,
+        &cfg,
+        infer_endpoint,
+        &mut manifest,
+        &ctrl,
+        iter_idx,
+    )?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     // E13.2S4: Hot-reload best + candidate models before gating.
@@ -307,7 +320,14 @@ pub fn run_iteration(
     ctrl.set_phase(Phase::Selfplay, "starting selfplay")?;
     // E13.2S4: Hot-reload best model before selfplay.
     manifest.model_reloads += reload_best_for_selfplay(run_dir, &cfg)?;
-    run_selfplay(run_dir, &cfg, infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
+    run_selfplay(
+        run_dir,
+        &cfg,
+        infer_endpoint,
+        &mut manifest,
+        &ctrl,
+        iter_idx,
+    )?;
 
     ctrl.set_phase(Phase::Train, "starting train")?;
     run_train_subprocess(run_dir, python_exe, &ctrl, iter_idx)?;
@@ -383,15 +403,25 @@ pub fn spawn_iteration(
 
                 // E13.2S4: Hot-reload best model before selfplay.
                 manifest.model_reloads += reload_best_for_selfplay(&run_dir, &cfg)?;
-                run_selfplay(&run_dir, &cfg, &infer_endpoint, &mut manifest, &ctrl, iter_idx)?;
+                run_selfplay(
+                    &run_dir,
+                    &cfg,
+                    &infer_endpoint,
+                    &mut manifest,
+                    &ctrl,
+                    iter_idx,
+                )?;
                 if ctrl.cancelled() {
                     return Err(ControllerError::Cancelled);
                 }
 
                 // Update in-memory AND on-disk phase to stay in sync.
                 manifest.controller_phase = Some(Phase::Train.as_str().to_string());
-                manifest.controller_status =
-                    Some(format!("starting train (iter {}/{})", iter_idx + 1, total_iters));
+                manifest.controller_status = Some(format!(
+                    "starting train (iter {}/{})",
+                    iter_idx + 1,
+                    total_iters
+                ));
                 manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
                 yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
 
@@ -404,8 +434,11 @@ pub fn spawn_iteration(
 
                 // Update in-memory AND on-disk phase to stay in sync.
                 manifest.controller_phase = Some(Phase::Gate.as_str().to_string());
-                manifest.controller_status =
-                    Some(format!("starting gate (iter {}/{})", iter_idx + 1, total_iters));
+                manifest.controller_status = Some(format!(
+                    "starting gate (iter {}/{})",
+                    iter_idx + 1,
+                    total_iters
+                ));
                 manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
                 yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
 
@@ -414,7 +447,8 @@ pub fn spawn_iteration(
                 run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
 
                 finalize_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
-                manifest.controller_iteration_idx = manifest.controller_iteration_idx.saturating_add(1);
+                manifest.controller_iteration_idx =
+                    manifest.controller_iteration_idx.saturating_add(1);
                 yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
             }
 
@@ -532,9 +566,9 @@ fn reload_model(
     let url = format!("http://{}/reload", metrics_bind);
     let body = ReloadRequest {
         model_id,
-        path: checkpoint_path
-            .to_str()
-            .ok_or_else(|| ControllerError::ReloadModel("path contains invalid UTF-8".to_string()))?,
+        path: checkpoint_path.to_str().ok_or_else(|| {
+            ControllerError::ReloadModel("path contains invalid UTF-8".to_string())
+        })?,
     };
 
     let resp = ureq::post(&url)
@@ -550,7 +584,9 @@ fn reload_model(
         Ok(())
     } else {
         Err(ControllerError::ReloadModel(
-            resp_body.error.unwrap_or_else(|| "unknown error".to_string()),
+            resp_body
+                .error
+                .unwrap_or_else(|| "unknown error".to_string()),
         ))
     }
 }
@@ -695,7 +731,10 @@ fn refresh_train_stats_from_run_json(
     Ok(())
 }
 
-fn wait_child_cancellable(mut child: std::process::Child, ctrl: &IterationController) -> Result<(), ControllerError> {
+fn wait_child_cancellable(
+    mut child: std::process::Child,
+    ctrl: &IterationController,
+) -> Result<(), ControllerError> {
     loop {
         if ctrl.cancelled() {
             let _ = child.kill();
@@ -707,9 +746,9 @@ fn wait_child_cancellable(mut child: std::process::Child, ctrl: &IterationContro
                 if status.success() {
                     return Ok(());
                 }
-                return Err(ControllerError::Fs(std::io::Error::other(
-                    format!("train subprocess failed: {status}"),
-                )));
+                return Err(ControllerError::Fs(std::io::Error::other(format!(
+                    "train subprocess failed: {status}"
+                ))));
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -721,13 +760,14 @@ fn tail_file(path: &Path, max_bytes: usize) -> Option<String> {
     let start = bytes.len().saturating_sub(max_bytes);
     let s = String::from_utf8_lossy(&bytes[start..]).to_string();
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
-fn build_train_command(
-    run_dir: &Path,
-    python_exe: &str,
-) -> std::process::Command {
+fn build_train_command(run_dir: &Path, python_exe: &str) -> std::process::Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
     // Fallback: invoke the provided python executable directly.
     let use_uv = std::process::Command::new("uv")
@@ -936,9 +976,7 @@ fn run_train_subprocess(
                 msg.push_str("\n--- train_stderr_tail ---\n");
                 msg.push_str(&t);
             }
-            Err(ControllerError::Fs(std::io::Error::other(
-                msg,
-            )))
+            Err(ControllerError::Fs(std::io::Error::other(msg)))
         }
     }
 }
@@ -1071,8 +1109,7 @@ fn run_selfplay(
     // E13.1S1: replay pruning (optional) + metrics event.
     if let Some(cap) = cfg.replay.capacity_shards {
         if cap > 0 {
-            if let Ok(rep) = yz_replay::prune_shards_by_idx(&run_dir.join("replay"), cap as usize)
-            {
+            if let Ok(rep) = yz_replay::prune_shards_by_idx(&run_dir.join("replay"), cap as usize) {
                 let ev = yz_logging::MetricsReplayPruneV1 {
                     event: "replay_prune",
                     ts_ms: yz_logging::now_ms(),
@@ -1176,8 +1213,7 @@ fn run_gate(
             },
         },
         Some(&mut sink),
-    )
-    ?;
+    )?;
 
     let wr = report.win_rate();
     m.gate_games = Some(report.games as u64);
@@ -1216,48 +1252,56 @@ mod cancel_tests {
         let dir = tempfile::tempdir().unwrap();
         let ctrl = IterationController::new(dir.path());
         // Create a dummy run.json so set_error works if needed.
-        std::fs::write(dir.path().join("run.json"), serde_json::to_string_pretty(&RunManifestV1 {
-            run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
-            run_id: "test".to_string(),
-            created_ts_ms: yz_logging::now_ms(),
-            protocol_version: 1,
-            feature_schema_id: 1,
-            action_space_id: "oracle_keepmask_v1".to_string(),
-            ruleset_id: "swedish_scandinavian_v1".to_string(),
-            git_hash: None,
-            config_hash: None,
-            config_snapshot: None,
-            config_snapshot_hash: None,
-            replay_dir: "replay".to_string(),
-            logs_dir: "logs".to_string(),
-            models_dir: "models".to_string(),
-            selfplay_games_completed: 0,
-            train_step: 0,
-            best_checkpoint: None,
-            candidate_checkpoint: None,
-            train_last_loss_total: None,
-            train_last_loss_policy: None,
-            train_last_loss_value: None,
-            promotion_decision: None,
-            promotion_ts_ms: None,
-            gate_games: None,
-            gate_win_rate: None,
-            gate_draw_rate: None,
-            gate_seeds_hash: None,
-            gate_oracle_match_rate_overall: None,
-            gate_oracle_match_rate_mark: None,
-            gate_oracle_match_rate_reroll: None,
-            gate_oracle_keepall_ignored: None,
-            controller_phase: None,
-            controller_status: None,
-            controller_last_ts_ms: None,
-            controller_error: None,
-            model_reloads: 0,
-            controller_iteration_idx: 0,
-            iterations: Vec::new(),
-        }).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("run.json"),
+            serde_json::to_string_pretty(&RunManifestV1 {
+                run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
+                run_id: "test".to_string(),
+                created_ts_ms: yz_logging::now_ms(),
+                protocol_version: 1,
+                feature_schema_id: 1,
+                action_space_id: "oracle_keepmask_v1".to_string(),
+                ruleset_id: "swedish_scandinavian_v1".to_string(),
+                git_hash: None,
+                config_hash: None,
+                config_snapshot: None,
+                config_snapshot_hash: None,
+                replay_dir: "replay".to_string(),
+                logs_dir: "logs".to_string(),
+                models_dir: "models".to_string(),
+                selfplay_games_completed: 0,
+                train_step: 0,
+                best_checkpoint: None,
+                candidate_checkpoint: None,
+                train_last_loss_total: None,
+                train_last_loss_policy: None,
+                train_last_loss_value: None,
+                promotion_decision: None,
+                promotion_ts_ms: None,
+                gate_games: None,
+                gate_win_rate: None,
+                gate_draw_rate: None,
+                gate_seeds_hash: None,
+                gate_oracle_match_rate_overall: None,
+                gate_oracle_match_rate_mark: None,
+                gate_oracle_match_rate_reroll: None,
+                gate_oracle_keepall_ignored: None,
+                controller_phase: None,
+                controller_status: None,
+                controller_last_ts_ms: None,
+                controller_error: None,
+                model_reloads: 0,
+                controller_iteration_idx: 0,
+                iterations: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
 
-        let child = std::process::Command::new("sleep").arg("10").spawn().unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
         ctrl.request_cancel();
         let res = wait_child_cancellable(child, &ctrl);
         assert!(matches!(res, Err(ControllerError::Cancelled)));
@@ -1383,7 +1427,12 @@ mod cancel_tests {
         std::fs::create_dir_all(run_dir.join("models")).unwrap();
         std::fs::write(run_dir.join("models").join("best.pt"), b"fake").unwrap();
 
-        let h = spawn_iteration(run_dir, cfg, "unix:///tmp/does_not_matter.sock".to_string(), "python".to_string());
+        let h = spawn_iteration(
+            run_dir,
+            cfg,
+            "unix:///tmp/does_not_matter.sock".to_string(),
+            "python".to_string(),
+        );
         let res = h.join();
         assert!(res.is_ok());
 
@@ -1400,10 +1449,17 @@ mod cancel_tests {
         let cmd = build_train_command(run_dir, "python");
 
         // Collect args as strings for easy searching.
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
         // Find --best in args and verify the next element is the expected path.
         let idx = args.iter().position(|a| a == "--best");
-        assert!(idx.is_some(), "command must include --best; got: {:?}", args);
+        assert!(
+            idx.is_some(),
+            "command must include --best; got: {:?}",
+            args
+        );
         let best_path = &args[idx.unwrap() + 1];
         let expected_suffix = run_dir.join("models").join("best.pt");
         assert!(
@@ -1424,11 +1480,18 @@ mod cancel_tests {
         let cmd = build_model_init_command(run_dir, &cfg, "python");
 
         // Collect args as strings for easy searching.
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
 
         // Verify --out
         let out_idx = args.iter().position(|a| a == "--out");
-        assert!(out_idx.is_some(), "command must include --out; got: {:?}", args);
+        assert!(
+            out_idx.is_some(),
+            "command must include --out; got: {:?}",
+            args
+        );
         let out_path = &args[out_idx.unwrap() + 1];
         let expected_out = run_dir.join("models").join("best.pt");
         assert!(
@@ -1438,12 +1501,20 @@ mod cancel_tests {
 
         // Verify --hidden
         let hidden_idx = args.iter().position(|a| a == "--hidden");
-        assert!(hidden_idx.is_some(), "command must include --hidden; got: {:?}", args);
+        assert!(
+            hidden_idx.is_some(),
+            "command must include --hidden; got: {:?}",
+            args
+        );
         assert_eq!(args[hidden_idx.unwrap() + 1], "128");
 
         // Verify --blocks
         let blocks_idx = args.iter().position(|a| a == "--blocks");
-        assert!(blocks_idx.is_some(), "command must include --blocks; got: {:?}", args);
+        assert!(
+            blocks_idx.is_some(),
+            "command must include --blocks; got: {:?}",
+            args
+        );
         assert_eq!(args[blocks_idx.unwrap() + 1], "3");
     }
 
@@ -1545,5 +1616,3 @@ mod cancel_tests {
         assert_eq!(resp.error.as_deref(), Some("file not found"));
     }
 }
-
-

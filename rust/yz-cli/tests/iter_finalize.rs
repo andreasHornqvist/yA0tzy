@@ -161,5 +161,3 @@ fn iter_finalize_reject_does_not_create_best_but_updates_manifest() {
     assert_eq!(got.promotion_decision.as_deref(), Some("reject"));
     assert!(got.promotion_ts_ms.unwrap_or(0) > 0);
 }
-
-

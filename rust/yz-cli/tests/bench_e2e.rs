@@ -21,5 +21,3 @@ fn bench_e2e_help_runs() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("yz-bench-e2e"));
 }
-
-

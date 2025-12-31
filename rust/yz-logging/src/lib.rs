@@ -69,7 +69,7 @@ pub struct RunManifestV1 {
     pub gate_oracle_keepall_ignored: Option<u64>,
 
     // Controller/TUI (optional).
-    pub controller_phase: Option<String>,  // "idle" | "selfplay" | "train" | "gate" | "done" | "error"
+    pub controller_phase: Option<String>, // "idle" | "selfplay" | "train" | "gate" | "done" | "error"
     pub controller_status: Option<String>, // human-readable status
     pub controller_last_ts_ms: Option<u64>,
     pub controller_error: Option<String>,
@@ -165,7 +165,10 @@ pub fn hash_config_bytes(bytes: &[u8]) -> String {
 pub fn try_git_hash() -> Option<String> {
     use std::process::Command;
 
-    let out = Command::new("git").args(["rev-parse", "HEAD"]).output().ok()?;
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -471,10 +474,7 @@ impl NdjsonWriter {
         path: impl AsRef<Path>,
         flush_every_lines: u64,
     ) -> Result<Self, NdjsonError> {
-        let f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let f = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             w: BufWriter::new(f),
             lines_since_flush: 0,

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 use yz_core::{apply_action, initial_state, is_terminal, terminal_winner, TurnContext};
-use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchResult};
 use yz_infer::ClientOptions;
+use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchResult};
 use yz_oracle as oracle_mod;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,12 @@ fn compute_oracle_diag(steps: &[OracleDiagStep]) -> OracleDiagReport {
     let mut keepall_ignored: u64 = 0;
 
     for s in steps {
-        let (oa, _ev) = oracle.best_action(s.avail_mask, s.upper_total_cap, s.dice_sorted, s.rerolls_left);
+        let (oa, _ev) = oracle.best_action(
+            s.avail_mask,
+            s.upper_total_cap,
+            s.dice_sorted,
+            s.rerolls_left,
+        );
         if should_ignore_oracle_action(oa, s.rerolls_left) {
             keepall_ignored += 1;
             continue;
@@ -88,7 +93,11 @@ fn compute_oracle_diag(steps: &[OracleDiagStep]) -> OracleDiagReport {
     }
 
     OracleDiagReport {
-        match_rate_overall: if total == 0 { 0.0 } else { matched as f64 / total as f64 },
+        match_rate_overall: if total == 0 {
+            0.0
+        } else {
+            matched as f64 / total as f64
+        },
         match_rate_mark: if total_mark == 0 {
             0.0
         } else {
@@ -127,7 +136,11 @@ pub struct GameSpec {
 ///
 /// If `paired_swap=true`, then `games` must be even and we generate `games/2` distinct seeds,
 /// each expanded to two games: (swap=false) then (swap=true).
-pub fn gating_schedule(seed0: u64, games: u32, paired_swap: bool) -> Result<Vec<GameSpec>, GateError> {
+pub fn gating_schedule(
+    seed0: u64,
+    games: u32,
+    paired_swap: bool,
+) -> Result<Vec<GameSpec>, GateError> {
     if games == 0 {
         return Err(GateError::InvalidConfig("gating.games must be > 0"));
     }
@@ -229,14 +242,14 @@ fn gating_schedule_from_seed_set(
 
 fn seed_set_path(id: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    dir.join("../../configs/seed_sets").join(format!("{id}.txt"))
+    dir.join("../../configs/seed_sets")
+        .join(format!("{id}.txt"))
 }
 
 fn load_seed_set(id: &str) -> Result<Vec<u64>, GateError> {
     let path = seed_set_path(id);
-    let txt = fs::read_to_string(&path).map_err(|e| {
-        GateError::SeedSet(format!("failed to read {}: {e}", path.display()))
-    })?;
+    let txt = fs::read_to_string(&path)
+        .map_err(|e| GateError::SeedSet(format!("failed to read {}: {e}", path.display())))?;
     let mut out = Vec::new();
     for (lineno, line) in txt.lines().enumerate() {
         let s = line.trim();
@@ -342,7 +355,11 @@ pub fn gate_with_progress(
         let seeds = load_seed_set(id)?;
         gating_schedule_from_seed_set(&seeds, cfg.gating.games, cfg.gating.paired_seed_swap)
     } else {
-        let seeds = derived_seed_list(cfg.gating.seed, cfg.gating.games, cfg.gating.paired_seed_swap)?;
+        let seeds = derived_seed_list(
+            cfg.gating.seed,
+            cfg.gating.games,
+            cfg.gating.paired_seed_swap,
+        )?;
         let schedule = schedule_from_seed_list(&seeds, cfg.gating.paired_seed_swap);
         (schedule, seeds, Vec::new())
     };
@@ -370,8 +387,14 @@ pub fn gate_with_progress(
     let total = report.games;
     let mut completed: u32 = 0;
     for gs in schedule {
-        let (cand_score, best_score, cand_outcome) =
-            run_one_game(cfg, &mut mcts, &best_backend, &cand_backend, gs, &mut oracle_steps)?;
+        let (cand_score, best_score, cand_outcome) = run_one_game(
+            cfg,
+            &mut mcts,
+            &best_backend,
+            &cand_backend,
+            gs,
+            &mut oracle_steps,
+        )?;
         match cand_outcome {
             Outcome::Win => report.cand_wins += 1,
             Outcome::Loss => report.cand_losses += 1,
@@ -396,11 +419,7 @@ pub fn gate_with_progress(
     Ok(report)
 }
 
-fn derived_seed_list(
-    seed0: u64,
-    games: u32,
-    paired_swap: bool,
-) -> Result<Vec<u64>, GateError> {
+fn derived_seed_list(seed0: u64, games: u32, paired_swap: bool) -> Result<Vec<u64>, GateError> {
     if games == 0 {
         return Err(GateError::InvalidConfig("gating.games must be > 0"));
     }
@@ -535,7 +554,8 @@ fn run_one_game(
             });
         }
 
-        let next = apply_action(state, action, &mut ctx).map_err(|_| GateError::IllegalTransition)?;
+        let next =
+            apply_action(state, action, &mut ctx).map_err(|_| GateError::IllegalTransition)?;
         state = next;
     }
 

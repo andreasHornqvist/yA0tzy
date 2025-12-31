@@ -193,5 +193,3 @@ gating:
         "expected gate_summary event in metrics.ndjson"
     );
 }
-
-

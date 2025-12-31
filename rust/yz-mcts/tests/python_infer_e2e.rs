@@ -167,5 +167,3 @@ fn python_infer_server_real_checkpoint_e2e_opt_in() {
     }
     assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
 }
-
-

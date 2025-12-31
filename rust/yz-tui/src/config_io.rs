@@ -30,7 +30,12 @@ pub fn load_cfg_for_run(run_dir: &Path) -> (Config, Option<String>) {
     if s.exists() {
         match Config::load(&s) {
             Ok(cfg) => return (cfg, Some("Loaded config.yaml".to_string())),
-            Err(e) => return (load_default_config(), Some(format!("Failed to load config.yaml: {e}"))),
+            Err(e) => {
+                return (
+                    load_default_config(),
+                    Some(format!("Failed to load config.yaml: {e}")),
+                )
+            }
         }
     }
     // For new runs, try to load from configs/local_cpu.yaml as the default template.
@@ -73,5 +78,3 @@ mod tests {
         assert_eq!(cfg2.selfplay.games_per_iteration, 123);
     }
 }
-
-

@@ -54,7 +54,12 @@ OPTIONS:
                 std::process::exit(0);
             }
             "--seconds" => {
-                seconds = Some(args.get(i + 1).unwrap_or(&"10".to_string()).parse().unwrap());
+                seconds = Some(
+                    args.get(i + 1)
+                        .unwrap_or(&"10".to_string())
+                        .parse()
+                        .unwrap(),
+                );
                 i += 2;
             }
             "--games" => {
@@ -181,7 +186,9 @@ fn main() {
         let mut ctx = yz_core::TurnContext::new_rng(0xC0FFEE ^ i);
         let state = yz_core::initial_state(&mut ctx);
         let per_game_mode = match mode {
-            ChanceMode::Deterministic { .. } => ChanceMode::Deterministic { episode_seed: 123 ^ i },
+            ChanceMode::Deterministic { .. } => ChanceMode::Deterministic {
+                episode_seed: 123 ^ i,
+            },
             ChanceMode::Rng { .. } => ChanceMode::Rng { seed: 123 ^ i },
         };
         tasks.push(GameTask::new(i, state, per_game_mode, mcts_cfg));
@@ -218,8 +225,8 @@ fn main() {
                         executed_moves += 1;
                         mcts_fallbacks += exec.search.fallbacks as u64;
                         mcts_pending_collisions += exec.search.pending_collisions as u64;
-                        mcts_pending_count_max = mcts_pending_count_max
-                            .max(exec.search.pending_count_max as u64);
+                        mcts_pending_count_max =
+                            mcts_pending_count_max.max(exec.search.pending_count_max as u64);
                     }
                     if sr.completed_episode.is_some() {
                         games_completed += 1;
@@ -229,9 +236,9 @@ fn main() {
                         let mut ctx = yz_core::TurnContext::new_rng(0xBADC0DE ^ gid);
                         let s = yz_core::initial_state(&mut ctx);
                         let new_mode = match mode {
-                            ChanceMode::Deterministic { .. } => {
-                                ChanceMode::Deterministic { episode_seed: 123 ^ gid }
-                            }
+                            ChanceMode::Deterministic { .. } => ChanceMode::Deterministic {
+                                episode_seed: 123 ^ gid,
+                            },
                             ChanceMode::Rng { .. } => ChanceMode::Rng { seed: 123 ^ gid },
                         };
                         *t = GameTask::new(gid, s, new_mode, mcts_cfg);
@@ -294,5 +301,3 @@ fn main() {
     drop(backend);
     let _ = server.join();
 }
-
-

@@ -1,7 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use yz_infer::codec::{decode_request_v1, decode_response_v1, encode_request_v1, encode_response_v1};
-use yz_infer::protocol::{InferRequestV1, InferResponseV1, ACTION_SPACE_A, FEATURE_LEN_V1, FEATURE_SCHEMA_ID_V1};
+use yz_infer::codec::{
+    decode_request_v1, decode_response_v1, encode_request_v1, encode_response_v1,
+};
+use yz_infer::protocol::{
+    InferRequestV1, InferResponseV1, ACTION_SPACE_A, FEATURE_LEN_V1, FEATURE_SCHEMA_ID_V1,
+};
 
 fn make_request() -> InferRequestV1 {
     InferRequestV1 {
@@ -47,5 +51,3 @@ fn bench_codec(c: &mut Criterion) {
 
 criterion_group!(benches, bench_codec);
 criterion_main!(benches);
-
-

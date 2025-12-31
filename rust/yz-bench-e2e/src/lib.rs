@@ -63,5 +63,3 @@ mod tests {
         assert_eq!(back.games_completed, 4);
     }
 }
-
-

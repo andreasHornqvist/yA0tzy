@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::{execute, ExecutableCommand};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -119,9 +121,7 @@ impl App {
     }
 
     fn run_dir(&self) -> Option<PathBuf> {
-        self.active_run_id
-            .as_ref()
-            .map(|id| self.runs_dir.join(id))
+        self.active_run_id.as_ref().map(|id| self.runs_dir.join(id))
     }
 
     fn save_config_draft(&mut self) {
@@ -200,7 +200,8 @@ impl App {
         // Snapshot semantics: only allow start if config.yaml does not exist (run-local snapshot).
         let snap = run_dir.join("config.yaml");
         if snap.exists() {
-            self.status = "config.yaml already exists; create a new run to start with a new config".to_string();
+            self.status = "config.yaml already exists; create a new run to start with a new config"
+                .to_string();
             return;
         }
 
@@ -228,7 +229,8 @@ impl App {
         // Spawn controller in background.
         let infer_endpoint = self.cfg.inference.bind.clone();
         let python_exe = "python".to_string();
-        let handle = yz_controller::spawn_iteration(run_dir, self.cfg.clone(), infer_endpoint, python_exe);
+        let handle =
+            yz_controller::spawn_iteration(run_dir, self.cfg.clone(), infer_endpoint, python_exe);
         self.iter = Some(handle);
         self.enter_dashboard();
     }
@@ -408,7 +410,10 @@ fn handle_config_key(app: &mut App, k: crossterm::event::KeyEvent) {
     // Keep status help fresh as mode changes.
     app.status = config_help(&app.form);
 
-    let sel = app.form.selected_idx.min(ALL_FIELDS.len().saturating_sub(1));
+    let sel = app
+        .form
+        .selected_idx
+        .min(ALL_FIELDS.len().saturating_sub(1));
     app.form.selected_idx = sel;
     let field = ALL_FIELDS[sel];
 
@@ -470,7 +475,10 @@ fn handle_config_key(app: &mut App, k: crossterm::event::KeyEvent) {
 }
 
 fn jump_section(app: &mut App, dir: i32) {
-    let sel = app.form.selected_idx.min(ALL_FIELDS.len().saturating_sub(1));
+    let sel = app
+        .form
+        .selected_idx
+        .min(ALL_FIELDS.len().saturating_sub(1));
     let cur = ALL_FIELDS[sel].section();
     let cur_idx = Section::ALL.iter().position(|s| *s == cur).unwrap_or(0) as i32;
     let next_idx = (cur_idx + dir).rem_euclid(Section::ALL.len() as i32) as usize;
@@ -537,11 +545,7 @@ fn commit_field_edit(app: &mut App, field: FieldId) {
     }
 }
 
-fn apply_input_to_cfg(
-    cfg: &mut yz_core::Config,
-    field: FieldId,
-    buf: &str,
-) -> Result<(), String> {
+fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> Result<(), String> {
     match field {
         FieldId::InferBind => {
             cfg.inference.bind = buf.to_string();
@@ -560,7 +564,8 @@ fn apply_input_to_cfg(
             Ok(())
         }
         FieldId::InferMaxWaitUs => {
-            cfg.inference.max_wait_us = buf.parse::<u64>().map_err(|_| "invalid u64".to_string())?;
+            cfg.inference.max_wait_us =
+                buf.parse::<u64>().map_err(|_| "invalid u64".to_string())?;
             Ok(())
         }
 
@@ -582,8 +587,7 @@ fn apply_input_to_cfg(
             Ok(())
         }
         FieldId::MctsDirichletAlpha => {
-            cfg.mcts.dirichlet_alpha =
-                buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
+            cfg.mcts.dirichlet_alpha = buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
             Ok(())
         }
         FieldId::MctsDirichletEpsilon => {
@@ -700,11 +704,15 @@ fn apply_input_to_cfg(
             Ok(())
         }
         FieldId::GatingPairedSeedSwap => {
-            cfg.gating.paired_seed_swap = buf.parse::<bool>().map_err(|_| "invalid bool".to_string())?;
+            cfg.gating.paired_seed_swap = buf
+                .parse::<bool>()
+                .map_err(|_| "invalid bool".to_string())?;
             Ok(())
         }
         FieldId::GatingDeterministicChance => {
-            cfg.gating.deterministic_chance = buf.parse::<bool>().map_err(|_| "invalid bool".to_string())?;
+            cfg.gating.deterministic_chance = buf
+                .parse::<bool>()
+                .map_err(|_| "invalid bool".to_string())?;
             Ok(())
         }
 
@@ -783,11 +791,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
 
         FieldId::GatingGames => cfg.gating.games.to_string(),
         FieldId::GatingSeed => cfg.gating.seed.to_string(),
-        FieldId::GatingSeedSetId => cfg
-            .gating
-            .seed_set_id
-            .clone()
-            .unwrap_or_default(),
+        FieldId::GatingSeedSetId => cfg.gating.seed_set_id.clone().unwrap_or_default(),
         FieldId::GatingWinRateThreshold => format!("{:.4}", cfg.gating.win_rate_threshold),
         FieldId::GatingPairedSeedSwap => cfg.gating.paired_seed_swap.to_string(),
         FieldId::GatingDeterministicChance => cfg.gating.deterministic_chance.to_string(),
@@ -823,7 +827,11 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
             true
         }
         FieldId::InferMaxWaitUs => {
-            let inc = if step == StepSize::Large { 10_000 } else { 1_000 };
+            let inc = if step == StepSize::Large {
+                10_000
+            } else {
+                1_000
+            };
             next.inference.max_wait_us = if dir >= 0 {
                 next.inference.max_wait_us.saturating_add(inc)
             } else {
@@ -865,7 +873,8 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
         }
         FieldId::MctsDirichletAlpha => {
             let inc = if step == StepSize::Large { 0.1 } else { 0.01 };
-            next.mcts.dirichlet_alpha = (next.mcts.dirichlet_alpha as f64 + d * inc).max(0.0) as f32;
+            next.mcts.dirichlet_alpha =
+                (next.mcts.dirichlet_alpha as f64 + d * inc).max(0.0) as f32;
             true
         }
         FieldId::MctsDirichletEpsilon => {
@@ -888,8 +897,7 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
         }
         FieldId::MctsTempT1 => {
             let inc = if step == StepSize::Large { 0.5 } else { 0.1 };
-            if let TemperatureSchedule::Step { t1, .. } = &mut next.mcts.temperature_schedule
-            {
+            if let TemperatureSchedule::Step { t1, .. } = &mut next.mcts.temperature_schedule {
                 *t1 = (*t1 as f64 + d * inc).max(0.0) as f32;
                 true
             } else {
@@ -898,7 +906,8 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
         }
         FieldId::MctsTempCutoffPly => {
             let inc = if step == StepSize::Large { 10 } else { 1 };
-            if let TemperatureSchedule::Step { cutoff_ply, .. } = &mut next.mcts.temperature_schedule
+            if let TemperatureSchedule::Step { cutoff_ply, .. } =
+                &mut next.mcts.temperature_schedule
             {
                 *cutoff_ply = if dir >= 0 {
                     cutoff_ply.saturating_add(inc)
@@ -996,7 +1005,8 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
         }
         FieldId::GatingWinRateThreshold => {
             let inc = if step == StepSize::Large { 0.05 } else { 0.01 };
-            next.gating.win_rate_threshold = (next.gating.win_rate_threshold + d * inc).clamp(0.0, 1.0);
+            next.gating.win_rate_threshold =
+                (next.gating.win_rate_threshold + d * inc).clamp(0.0, 1.0);
             true
         }
         FieldId::ReplayCapacityShards => {
@@ -1089,8 +1099,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Span::raw(format!("run={rid}")),
             ]);
             let body = render_config_lines(app, chunks[0].height.saturating_sub(2) as usize);
-            let p = Paragraph::new(body)
-                .block(Block::default().title(title).borders(Borders::ALL));
+            let p = Paragraph::new(body).block(Block::default().title(title).borders(Borders::ALL));
             f.render_widget(p, chunks[0]);
         }
         Screen::Dashboard => {
@@ -1167,11 +1176,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     left.push(Line::from("(no run selected)"));
                 }
             }
-            let left_p = Paragraph::new(left).block(
-                Block::default()
-                    .title(title.clone())
-                    .borders(Borders::ALL),
-            );
+            let left_p = Paragraph::new(left)
+                .block(Block::default().title(title.clone()).borders(Borders::ALL));
             f.render_widget(left_p, cols[0]);
 
             // Right: live phase view + progress bars.
@@ -1256,7 +1262,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             if let Some((ratio, label)) = gauge {
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(6), Constraint::Length(3), Constraint::Min(0)])
+                    .constraints([
+                        Constraint::Length(6),
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                    ])
                     .split(cols[1]);
                 let p = Paragraph::new(right_lines).block(right_block);
                 f.render_widget(p, rows[0]);
@@ -1292,13 +1302,14 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
         rows.push(Row::Header(sec.title()));
         for f in ALL_FIELDS.iter().copied().filter(|f| f.section() == sec) {
             // Hide step-only fields when not applicable.
-            if matches!(
-                f,
-                FieldId::MctsTempT1 | FieldId::MctsTempCutoffPly
-            )
-                && matches!(app.cfg.mcts.temperature_schedule, TemperatureSchedule::Constant { .. }) {
-                    continue;
-                }
+            if matches!(f, FieldId::MctsTempT1 | FieldId::MctsTempCutoffPly)
+                && matches!(
+                    app.cfg.mcts.temperature_schedule,
+                    TemperatureSchedule::Constant { .. }
+                )
+            {
+                continue;
+            }
             rows.push(Row::Field(f));
         }
         rows.push(Row::Spacer);
@@ -1387,4 +1398,3 @@ mod tests {
         assert!(err.contains("cannot reach metrics server"));
     }
 }
-

@@ -583,7 +583,12 @@ impl Mcts {
 ///
 /// This API is behind the `bench` feature and has **no stability guarantees**.
 #[cfg(feature = "bench")]
-pub fn bench_select_action_v1(cfg: &MctsConfig, node: &Node, legal: &[bool; A], mode: ChanceMode) -> u8 {
+pub fn bench_select_action_v1(
+    cfg: &MctsConfig,
+    node: &Node,
+    legal: &[bool; A],
+    mode: ChanceMode,
+) -> u8 {
     let use_vl = cfg.virtual_loss > 0.0;
     let n_sum_eff = if use_vl {
         node.n_sum.saturating_add(node.vl_sum)

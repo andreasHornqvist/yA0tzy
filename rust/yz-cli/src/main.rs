@@ -195,23 +195,23 @@ OPTIONS:
                 i += 2;
             }
             "--root-log-every" => {
-                root_log_every = args
-                    .get(i + 1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("Invalid --root-log-every value");
-                        process::exit(1);
-                    });
+                root_log_every =
+                    args.get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("Invalid --root-log-every value");
+                            process::exit(1);
+                        });
                 i += 2;
             }
             "--log-flush-every" => {
-                log_flush_every = args
-                    .get(i + 1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("Invalid --log-flush-every value");
-                        process::exit(1);
-                    });
+                log_flush_every =
+                    args.get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("Invalid --log-flush-every value");
+                            process::exit(1);
+                        });
                 i += 2;
             }
             other => {
@@ -617,9 +617,15 @@ OPTIONS:
         "promote"
     };
     if let Some(id) = cfg.gating.seed_set_id.as_deref() {
-        println!("Seed source: seed_set_id={id} requested_games={}", cfg.gating.games);
+        println!(
+            "Seed source: seed_set_id={id} requested_games={}",
+            cfg.gating.games
+        );
     } else {
-        println!("Seed source: seed={} requested_games={}", cfg.gating.seed, cfg.gating.games);
+        println!(
+            "Seed source: seed={} requested_games={}",
+            cfg.gating.seed, cfg.gating.games
+        );
     }
     for w in &report.warnings {
         eprintln!("warning: {w}");
@@ -927,7 +933,10 @@ OPTIONS:
         process::exit(1);
     });
 
-    println!("Finalize complete. decision={decision} run={}", run_dir.display());
+    println!(
+        "Finalize complete. decision={decision} run={}",
+        run_dir.display()
+    );
 }
 
 fn cmd_bench(args: &[String]) {
@@ -997,13 +1006,10 @@ fn spawn_current_exe(args: &[String]) -> process::ExitStatus {
         eprintln!("Failed to locate current executable: {e}");
         process::exit(1);
     });
-    Command::new(exe)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to spawn yz: {e}");
-            process::exit(1);
-        })
+    Command::new(exe).args(args).status().unwrap_or_else(|e| {
+        eprintln!("Failed to spawn yz: {e}");
+        process::exit(1);
+    })
 }
 
 fn cmd_profile(args: &[String]) {

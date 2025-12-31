@@ -41,7 +41,11 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
                 return Err("mcts.temperature_schedule.t0 must be >= 0".to_string());
             }
         }
-        TemperatureSchedule::Step { t0, t1, cutoff_ply: _ } => {
+        TemperatureSchedule::Step {
+            t0,
+            t1,
+            cutoff_ply: _,
+        } => {
             if t0 < 0.0 || t1 < 0.0 {
                 return Err("mcts.temperature_schedule.t0/t1 must be >= 0".to_string());
             }
@@ -102,5 +106,3 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
 
     Ok(())
 }
-
-

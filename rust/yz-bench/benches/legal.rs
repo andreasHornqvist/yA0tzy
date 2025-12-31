@@ -17,21 +17,23 @@ fn bench_legal_action_mask(c: &mut Criterion) {
     let mut g = c.benchmark_group("yz_core_legal");
     for &n in &[256usize, 4096usize] {
         let states = gen_states(n);
-        g.bench_with_input(BenchmarkId::new("legal_action_mask_batch", n), &states, |b, s| {
-            b.iter(|| {
-                for &(avail, rerolls_left) in s.iter() {
-                    black_box(yz_core::legal_action_mask(
-                        black_box(avail),
-                        black_box(rerolls_left),
-                    ));
-                }
-            })
-        });
+        g.bench_with_input(
+            BenchmarkId::new("legal_action_mask_batch", n),
+            &states,
+            |b, s| {
+                b.iter(|| {
+                    for &(avail, rerolls_left) in s.iter() {
+                        black_box(yz_core::legal_action_mask(
+                            black_box(avail),
+                            black_box(rerolls_left),
+                        ));
+                    }
+                })
+            },
+        );
     }
     g.finish();
 }
 
 criterion_group!(benches, bench_legal_action_mask);
 criterion_main!(benches);
-
-

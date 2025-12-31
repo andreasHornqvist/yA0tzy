@@ -30,5 +30,3 @@ fn profile_selfplay_help_fallback_runs() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-
-

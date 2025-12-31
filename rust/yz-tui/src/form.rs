@@ -114,9 +114,9 @@ impl FieldId {
             | FieldId::SelfplayWorkers
             | FieldId::SelfplayThreadsPerWorker => Section::Selfplay,
 
-            FieldId::TrainingBatchSize | FieldId::TrainingLearningRate | FieldId::TrainingEpochs => {
-                Section::Training
-            }
+            FieldId::TrainingBatchSize
+            | FieldId::TrainingLearningRate
+            | FieldId::TrainingEpochs => Section::Training,
             FieldId::TrainingWeightDecay | FieldId::TrainingStepsPerIteration => Section::Training,
 
             FieldId::GatingGames
@@ -177,7 +177,6 @@ impl FieldId {
             FieldId::ModelNumBlocks => "model.num_blocks",
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,5 +271,3 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::ModelHiddenDim,
     FieldId::ModelNumBlocks,
 ];
-
-
