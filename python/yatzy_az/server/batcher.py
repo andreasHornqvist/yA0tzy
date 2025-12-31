@@ -10,6 +10,7 @@ from typing import Final
 
 from .model import Model
 from .protocol_v1 import InferRequestV1, InferResponseV1
+from .debug_log import emit as _dbg_emit
 
 
 @dataclass(slots=True)
@@ -111,30 +112,22 @@ class Batcher:
 
             # region agent log
             try:
-                with open(
-                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(
-                        _json.dumps(
-                            {
-                                "timestamp": int(time.time() * 1000),
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H1",
-                                "location": "python/yatzy_az/server/batcher.py:Batcher.run",
-                                "message": "formed batch",
-                                "data": {
-                                    "batch_len": len(batch),
-                                    "queue_depth_after_form": int(self._q.qsize()),
-                                    "max_batch": int(self._max_batch),
-                                    "max_wait_us": int(self._max_wait_s * 1_000_000),
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
+                _dbg_emit(
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H1",
+                        "location": "python/yatzy_az/server/batcher.py:Batcher.run",
+                        "message": "formed batch",
+                        "data": {
+                            "batch_len": len(batch),
+                            "queue_depth_after_form": int(self._q.qsize()),
+                            "max_batch": int(self._max_batch),
+                            "max_wait_us": int(self._max_wait_s * 1_000_000),
+                        },
+                    }
+                )
             except Exception:
                 pass
             # endregion agent log
@@ -146,31 +139,23 @@ class Batcher:
                 try:
                     now = time.monotonic()
                     age_us = int((now - first.t0) * 1_000_000)
-                    with open(
-                        "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-                        "a",
-                        encoding="utf-8",
-                    ) as f:
-                        f.write(
-                            _json.dumps(
-                                {
-                                    "timestamp": int(time.time() * 1000),
-                                    "sessionId": "debug-session",
-                                    "runId": "pre-fix",
-                                    "hypothesisId": "H_wait",
-                                    "location": "python/yatzy_az/server/batcher.py:Batcher.run",
-                                    "message": "batch wait (oldest item age)",
-                                    "data": {
-                                        "batch_len": int(len(batch)),
-                                        "age_us": age_us,
-                                        "max_wait_us": int(self._max_wait_s * 1_000_000),
-                                        "queue_depth_after_form": int(self._q.qsize()),
-                                        "flush_reason": "deadline_or_timeout",
-                                    },
-                                }
-                            )
-                            + "\n"
-                        )
+                    _dbg_emit(
+                        {
+                            "timestamp": int(time.time() * 1000),
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H_wait",
+                            "location": "python/yatzy_az/server/batcher.py:Batcher.run",
+                            "message": "batch wait (oldest item age)",
+                            "data": {
+                                "batch_len": int(len(batch)),
+                                "age_us": age_us,
+                                "max_wait_us": int(self._max_wait_s * 1_000_000),
+                                "queue_depth_after_form": int(self._q.qsize()),
+                                "flush_reason": "deadline_or_timeout",
+                            },
+                        }
+                    )
                 except Exception:
                     pass
             # endregion agent log
@@ -216,58 +201,23 @@ class Batcher:
 
             # region agent log
             try:
-                _t_log0 = time.monotonic()
-                with open(
-                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(
-                        _json.dumps(
-                            {
-                                "timestamp": int(time.time() * 1000),
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H_latency",
-                                "location": "python/yatzy_az/server/batcher.py:_apply_batch",
-                                "message": "infer_batch timing",
-                                "data": {
-                                    "model_id": int(model_id),
-                                    "items": len(items),
-                                    "dt_ms": dt_ms,
-                                    "dt_per_item_ms": (dt_ms / max(1, len(items))),
-                                    "queue_depth": int(self._q.qsize()),
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
-                _t_log_ms = (time.monotonic() - _t_log0) * 1000.0
-                if _t_log_ms > 5.0:
-                    with open(
-                        "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-                        "a",
-                        encoding="utf-8",
-                    ) as f:
-                        f.write(
-                            _json.dumps(
-                                {
-                                    "timestamp": int(time.time() * 1000),
-                                    "sessionId": "debug-session",
-                                    "runId": "pre-fix",
-                                    "hypothesisId": "H_logio",
-                                    "location": "python/yatzy_az/server/batcher.py:_apply_batch",
-                                    "message": "slow debug.log write",
-                                    "data": {
-                                        "log_write_ms": _t_log_ms,
-                                        "model_id": int(model_id),
-                                        "items": int(len(items)),
-                                        "queue_depth": int(self._q.qsize()),
-                                    },
-                                }
-                            )
-                            + "\n"
-                        )
+                _dbg_emit(
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H_latency",
+                        "location": "python/yatzy_az/server/batcher.py:_apply_batch",
+                        "message": "infer_batch timing",
+                        "data": {
+                            "model_id": int(model_id),
+                            "items": len(items),
+                            "dt_ms": dt_ms,
+                            "dt_per_item_ms": (dt_ms / max(1, len(items))),
+                            "queue_depth": int(self._q.qsize()),
+                        },
+                    }
+                )
             except Exception:
                 pass
             # endregion agent log
