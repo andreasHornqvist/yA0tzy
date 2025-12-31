@@ -508,6 +508,21 @@ pub fn spawn_iteration(
         // Ensure manifest/config snapshot exists even if cancelled early.
         let mut manifest = ensure_manifest(&run_dir, &cfg)?;
 
+        let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
+
+        // Absolute semantics: controller_iteration_idx is the number of completed iterations so far.
+        // If already complete, do a no-op and do NOT start subprocesses (infer-server / model-init).
+        if manifest.controller_iteration_idx >= total_iters {
+            ctrl.set_phase(
+                Phase::Done,
+                format!(
+                    "done (completed {}/{})",
+                    manifest.controller_iteration_idx, total_iters
+                ),
+            )?;
+            return Ok(());
+        }
+
         // Ensure inference server is running (owned by controller for this iteration).
         // If one is already running, we reuse it.
         let _infer_srv = ensure_infer_server(&run_dir, &cfg, &python_exe)?;
@@ -518,20 +533,6 @@ pub fn spawn_iteration(
         let res: Result<(), ControllerError> = (|| {
             if ctrl.cancelled() {
                 return Err(ControllerError::Cancelled);
-            }
-
-            let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
-
-            // Absolute semantics: controller_iteration_idx is the number of completed iterations so far.
-            if manifest.controller_iteration_idx >= total_iters {
-                ctrl.set_phase(
-                    Phase::Done,
-                    format!(
-                        "done (completed {}/{})",
-                        manifest.controller_iteration_idx, total_iters
-                    ),
-                )?;
-                return Ok(());
             }
 
             while manifest.controller_iteration_idx < total_iters {
