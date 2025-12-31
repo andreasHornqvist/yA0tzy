@@ -21,6 +21,12 @@ class InferenceConfig(BaseModel):
     max_wait_us: int = Field(
         description="Maximum wait time (microseconds) before flushing a partial batch"
     )
+    torch_threads: int | None = Field(
+        default=None, description="Optional: torch intra-op threads (CPU perf stability)"
+    )
+    torch_interop_threads: int | None = Field(
+        default=None, description="Optional: torch inter-op threads (CPU perf stability)"
+    )
     metrics_bind: str = Field(
         default="127.0.0.1:18080",
         description="Metrics/control HTTP bind address for hot-reloading models (E13.2S4)",

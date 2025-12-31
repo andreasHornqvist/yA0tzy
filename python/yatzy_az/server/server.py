@@ -61,6 +61,37 @@ def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
     if cfg.torch_interop_threads is not None:
         torch.set_num_interop_threads(int(cfg.torch_interop_threads))
 
+    # region agent log
+    try:
+        import json as _json
+        with open(
+            "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write(
+                _json.dumps(
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H_latency",
+                        "location": "python/yatzy_az/server/server.py:_apply_torch_thread_settings",
+                        "message": "torch thread settings applied",
+                        "data": {
+                            "torch_threads": cfg.torch_threads,
+                            "torch_interop_threads": cfg.torch_interop_threads,
+                            "torch_get_num_threads": int(torch.get_num_threads()),
+                            "torch_get_num_interop_threads": int(torch.get_num_interop_threads()),
+                        },
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # endregion agent log
+
 
 async def _handle_conn(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, batcher: Batcher

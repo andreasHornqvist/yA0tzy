@@ -82,6 +82,12 @@ pub struct InferenceConfig {
     pub max_batch: u32,
     /// Maximum wait time in microseconds before flushing a partial batch.
     pub max_wait_us: u64,
+    /// Optional: torch intra-op threads (Python server CPU perf stability).
+    #[serde(default)]
+    pub torch_threads: Option<u32>,
+    /// Optional: torch inter-op threads (Python server CPU perf stability).
+    #[serde(default)]
+    pub torch_interop_threads: Option<u32>,
     /// Metrics/control HTTP bind address (e.g., "127.0.0.1:18080").
     /// Used for hot-reloading models (E13.2S4).
     #[serde(default = "default_metrics_bind")]
@@ -252,6 +258,8 @@ impl Default for Config {
                 device: "cpu".to_string(),
                 max_batch: 32,
                 max_wait_us: 1000,
+                torch_threads: None,
+                torch_interop_threads: None,
                 metrics_bind: default_metrics_bind(),
             },
             mcts: MctsConfig {

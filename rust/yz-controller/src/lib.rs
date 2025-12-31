@@ -209,6 +209,8 @@ fn build_infer_server_command(
     let device = cfg.inference.device.clone();
     let max_batch = cfg.inference.max_batch.to_string();
     let max_wait_us = cfg.inference.max_wait_us.to_string();
+    let torch_threads = cfg.inference.torch_threads.map(|x| x.to_string());
+    let torch_interop_threads = cfg.inference.torch_interop_threads.map(|x| x.to_string());
 
     if use_uv {
         let mut cmd = Command::new("uv");
@@ -220,6 +222,12 @@ fn build_infer_server_command(
         cmd.args(["--device", &device]);
         cmd.args(["--max-batch", &max_batch]);
         cmd.args(["--max-wait-us", &max_wait_us]);
+        if let Some(v) = torch_threads.as_deref() {
+            cmd.args(["--torch-threads", v]);
+        }
+        if let Some(v) = torch_interop_threads.as_deref() {
+            cmd.args(["--torch-interop-threads", v]);
+        }
         cmd.args(["--print-stats-every-s", "0"]);
         cmd
     } else {
@@ -232,6 +240,12 @@ fn build_infer_server_command(
         cmd.args(["--device", &device]);
         cmd.args(["--max-batch", &max_batch]);
         cmd.args(["--max-wait-us", &max_wait_us]);
+        if let Some(v) = torch_threads.as_deref() {
+            cmd.args(["--torch-threads", v]);
+        }
+        if let Some(v) = torch_interop_threads.as_deref() {
+            cmd.args(["--torch-interop-threads", v]);
+        }
         cmd.args(["--print-stats-every-s", "0"]);
         cmd
     }
