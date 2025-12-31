@@ -174,7 +174,40 @@ class Batcher:
 
             feats = [it.req.features for it in items]
             masks = [it.req.legal_mask for it in items]
+            t0 = time.monotonic()
             outs = model.infer_batch(feats, masks)
+            dt_ms = (time.monotonic() - t0) * 1000.0
+
+            # region agent log
+            try:
+                with open(
+                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        _json.dumps(
+                            {
+                                "timestamp": int(time.time() * 1000),
+                                "sessionId": "debug-session",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H_latency",
+                                "location": "python/yatzy_az/server/batcher.py:_apply_batch",
+                                "message": "infer_batch timing",
+                                "data": {
+                                    "model_id": int(model_id),
+                                    "items": len(items),
+                                    "dt_ms": dt_ms,
+                                    "dt_per_item_ms": (dt_ms / max(1, len(items))),
+                                    "queue_depth": int(self._q.qsize()),
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # endregion agent log
             if len(outs) != len(items):
                 for item in items:
                     if not item.fut.cancelled():

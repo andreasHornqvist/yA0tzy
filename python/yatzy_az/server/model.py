@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time as _time
+import json as _json
 
 from .checkpoint import load_checkpoint
 from .protocol_v1 import ACTION_SPACE_A
@@ -68,16 +70,20 @@ class TorchModel(Model):
         if len(features_batch) == 0:
             return []
 
+        t0 = _time.monotonic()
         # One conversion per batch. For GPU, do a single host->device transfer per batch.
         x = torch.as_tensor(features_batch, dtype=torch.float32)
+        t_as_tensor = _time.monotonic()
         if x.ndim != 2:
             raise RuntimeError(f"bad features tensor rank: {x.ndim} (expected 2)")
         if self._device.type != "cpu":
             x = x.to(self._device)
+        t_to_dev = _time.monotonic()
         x = x.contiguous()
 
         with torch.inference_mode():
             logits, v = self._model(x)
+        t_fwd = _time.monotonic()
 
         if logits.ndim != 2 or logits.shape[0] != x.shape[0] or logits.shape[1] != ACTION_SPACE_A:
             raise RuntimeError(f"bad logits shape: {tuple(logits.shape)} (expected [B,{ACTION_SPACE_A}])")
@@ -86,8 +92,44 @@ class TorchModel(Model):
 
         logits_cpu = logits.detach().to("cpu")
         v_cpu = v.detach().to("cpu")
+        t_to_cpu = _time.monotonic()
         logits_list: list[list[float]] = logits_cpu.tolist()
         v_list: list[float] = v_cpu.tolist()
+        t_tolist = _time.monotonic()
+
+        # region agent log
+        try:
+            with open(
+                "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                "a",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    _json.dumps(
+                        {
+                            "timestamp": int(_time.time() * 1000),
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H_latency",
+                            "location": "python/yatzy_az/server/model.py:TorchModel.infer_batch",
+                            "message": "torch timings",
+                            "data": {
+                                "device": str(self._device),
+                                "batch": len(features_batch),
+                                "as_tensor_ms": (t_as_tensor - t0) * 1000.0,
+                                "to_device_ms": (t_to_dev - t_as_tensor) * 1000.0,
+                                "forward_ms": (t_fwd - t_to_dev) * 1000.0,
+                                "to_cpu_ms": (t_to_cpu - t_fwd) * 1000.0,
+                                "tolist_ms": (t_tolist - t_to_cpu) * 1000.0,
+                                "total_ms": (t_tolist - t0) * 1000.0,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # endregion agent log
 
         out: list[InferOutput] = []
         for ls, vv in zip(logits_list, v_list, strict=True):
