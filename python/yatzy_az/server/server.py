@@ -10,6 +10,7 @@ import pathlib
 import signal
 import time
 from dataclasses import dataclass
+import json as _json
 
 from .batcher import Batcher
 from .metrics import MetricsSnapshot, now_s
@@ -64,6 +65,59 @@ def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
 async def _handle_conn(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, batcher: Batcher
 ) -> None:
+    # Allow pipelining multiple in-flight requests per connection.
+    # The Rust client can have many concurrent tickets; if we await each response here,
+    # we serialize the entire connection and the batcher will never form batches > 1.
+    inflight_limit = 4096
+    inflight_sem = asyncio.Semaphore(inflight_limit)
+    out_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=inflight_limit)
+    pending: set[asyncio.Task[None]] = set()
+
+    async def _writer_loop() -> None:
+        while True:
+            payload = await out_q.get()
+            if payload == b"":
+                return
+            await write_frame(writer, payload)
+
+    async def _handle_one(req) -> None:
+        try:
+            resp: InferResponseV1 = await batcher.enqueue(req)
+
+            # region agent log
+            try:
+                with open(
+                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        _json.dumps(
+                            {
+                                "timestamp": int(time.time() * 1000),
+                                "sessionId": "debug-session",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H1",
+                                "location": "python/yatzy_az/server/server.py:_handle_conn",
+                                "message": "enqueue completed; queueing response for writer loop",
+                                "data": {
+                                    "request_id": int(resp.request_id),
+                                    "queue_depth": int(batcher.queue_depth),
+                                    "out_q": int(out_q.qsize()),
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # endregion agent log
+
+            await out_q.put(encode_response_v1(resp))
+        finally:
+            inflight_sem.release()
+
+    writer_task = asyncio.create_task(_writer_loop())
     try:
         while True:
             payload = await read_frame(reader)
@@ -74,13 +128,55 @@ async def _handle_conn(
                 # Protocol violation: close the connection.
                 break
 
-            resp: InferResponseV1 = await batcher.enqueue(req)
-            out_payload = encode_response_v1(resp)
-            await write_frame(writer, out_payload)
+            # region agent log
+            try:
+                with open(
+                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        _json.dumps(
+                            {
+                                "timestamp": int(time.time() * 1000),
+                                "sessionId": "debug-session",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H1",
+                                "location": "python/yatzy_az/server/server.py:_handle_conn",
+                                "message": "decoded request; scheduling enqueue task (pipelined)",
+                                "data": {
+                                    "request_id": int(req.request_id),
+                                    "model_id": int(req.model_id),
+                                    "features_len": len(req.features),
+                                    "legal_len": len(req.legal_mask),
+                                    "queue_depth": int(batcher.queue_depth),
+                                    "pending_tasks": len(pending),
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # endregion agent log
+
+            await inflight_sem.acquire()
+            t = asyncio.create_task(_handle_one(req))
+            pending.add(t)
+            t.add_done_callback(lambda tt: pending.discard(tt))
     except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
         pass
     finally:
         try:
+            for t in list(pending):
+                t.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*pending)
+            with contextlib.suppress(Exception):
+                await out_q.put(b"")
+            writer_task.cancel()
+            with contextlib.suppress(Exception):
+                await writer_task
             writer.close()
             await writer.wait_closed()
         except Exception:

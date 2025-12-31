@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import json as _json
 from dataclasses import dataclass
 from typing import Final
 
@@ -107,6 +108,36 @@ class Batcher:
                     batch.append(await asyncio.wait_for(self._q.get(), timeout=remaining))
                 except TimeoutError:
                     break
+
+            # region agent log
+            try:
+                with open(
+                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        _json.dumps(
+                            {
+                                "timestamp": int(time.time() * 1000),
+                                "sessionId": "debug-session",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H1",
+                                "location": "python/yatzy_az/server/batcher.py:Batcher.run",
+                                "message": "formed batch",
+                                "data": {
+                                    "batch_len": len(batch),
+                                    "queue_depth_after_form": int(self._q.qsize()),
+                                    "max_batch": int(self._max_batch),
+                                    "max_wait_us": int(self._max_wait_s * 1_000_000),
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # endregion agent log
 
             self._apply_batch(batch)
 
