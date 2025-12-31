@@ -1165,7 +1165,10 @@ fn run_selfplay(
         config_hash: manifest.config_hash.clone(),
     })?;
 
-    let parallel = cfg.selfplay.threads_per_worker.max(1) as usize;
+    // Number of concurrent game tasks. In v1 runtime we don't spawn OS processes; instead we run
+    // multiple game state machines in a single scheduler. To preserve the intent of the config,
+    // interpret (workers * threads_per_worker) as total parallel game slots.
+    let parallel = (cfg.selfplay.workers.max(1) as usize) * (cfg.selfplay.threads_per_worker.max(1) as usize);
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
         simulations: cfg.mcts.budget_mark.max(1),
@@ -1224,7 +1227,17 @@ fn run_selfplay(
         if ctrl.cancelled() {
             return Err(ControllerError::Cancelled);
         }
+        // Avoid busy-spinning when all tasks are waiting on inference.
+        // If there was no progress (no steps/terminals) this tick, sleep briefly to reduce CPU
+        // contention with the Python server and to reduce log volume from tick-based stats.
+        let before_steps = sched.stats().steps;
+        let before_terminal = sched.stats().terminal;
         sched.tick_and_write(&backend, &mut writer, Some(&mut loggers))?;
+        let after_steps = sched.stats().steps;
+        let after_terminal = sched.stats().terminal;
+        if after_steps == before_steps && after_terminal == before_terminal {
+            std::thread::sleep(Duration::from_micros(200));
+        }
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
                 completed_games += 1;
