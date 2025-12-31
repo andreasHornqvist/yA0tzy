@@ -47,6 +47,8 @@ pub enum FieldId {
     InferDevice,
     InferMaxBatch,
     InferMaxWaitUs,
+    InferTorchThreads,
+    InferTorchInteropThreads,
 
     // mcts
     MctsCPuct,
@@ -97,7 +99,9 @@ impl FieldId {
             FieldId::InferBind
             | FieldId::InferDevice
             | FieldId::InferMaxBatch
-            | FieldId::InferMaxWaitUs => Section::Inference,
+            | FieldId::InferMaxWaitUs
+            | FieldId::InferTorchThreads
+            | FieldId::InferTorchInteropThreads => Section::Inference,
 
             FieldId::MctsCPuct
             | FieldId::MctsBudgetReroll
@@ -140,6 +144,8 @@ impl FieldId {
             FieldId::InferDevice => "inference.device",
             FieldId::InferMaxBatch => "inference.max_batch",
             FieldId::InferMaxWaitUs => "inference.max_wait_us",
+            FieldId::InferTorchThreads => "inference.torch_threads",
+            FieldId::InferTorchInteropThreads => "inference.torch_interop_threads",
 
             FieldId::MctsCPuct => "mcts.c_puct",
             FieldId::MctsBudgetReroll => "mcts.budget_reroll",
@@ -235,6 +241,8 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::InferDevice,
     FieldId::InferMaxBatch,
     FieldId::InferMaxWaitUs,
+    FieldId::InferTorchThreads,
+    FieldId::InferTorchInteropThreads,
     // mcts
     FieldId::MctsCPuct,
     FieldId::MctsBudgetReroll,

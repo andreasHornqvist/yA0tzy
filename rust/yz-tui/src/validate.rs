@@ -15,6 +15,16 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if cfg.inference.max_wait_us < 1 {
         return Err("inference.max_wait_us must be >= 1".to_string());
     }
+    if let Some(n) = cfg.inference.torch_threads {
+        if n < 1 {
+            return Err("inference.torch_threads must be >= 1 when set".to_string());
+        }
+    }
+    if let Some(n) = cfg.inference.torch_interop_threads {
+        if n < 1 {
+            return Err("inference.torch_interop_threads must be >= 1 when set".to_string());
+        }
+    }
 
     // mcts
     if cfg.mcts.c_puct <= 0.0 {

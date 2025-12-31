@@ -521,6 +521,22 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 buf.parse::<u64>().map_err(|_| "invalid u64".to_string())?;
             Ok(())
         }
+        FieldId::InferTorchThreads => {
+            cfg.inference.torch_threads = if buf.trim().is_empty() {
+                None
+            } else {
+                Some(buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?)
+            };
+            Ok(())
+        }
+        FieldId::InferTorchInteropThreads => {
+            cfg.inference.torch_interop_threads = if buf.trim().is_empty() {
+                None
+            } else {
+                Some(buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?)
+            };
+            Ok(())
+        }
 
         FieldId::MctsCPuct => {
             cfg.mcts.c_puct = buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
@@ -704,6 +720,16 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::InferDevice => cfg.inference.device.clone(),
         FieldId::InferMaxBatch => cfg.inference.max_batch.to_string(),
         FieldId::InferMaxWaitUs => cfg.inference.max_wait_us.to_string(),
+        FieldId::InferTorchThreads => cfg
+            .inference
+            .torch_threads
+            .map(|x| x.to_string())
+            .unwrap_or_default(),
+        FieldId::InferTorchInteropThreads => cfg
+            .inference
+            .torch_interop_threads
+            .map(|x| x.to_string())
+            .unwrap_or_default(),
 
         FieldId::MctsCPuct => format!("{:.4}", cfg.mcts.c_puct),
         FieldId::MctsBudgetReroll => cfg.mcts.budget_reroll.to_string(),
