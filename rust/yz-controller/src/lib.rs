@@ -364,30 +364,6 @@ impl IterationHandle {
     }
 }
 
-fn connect_infer_backend(endpoint: &str) -> Result<yz_mcts::InferBackend, ControllerError> {
-    // Use bounded inflight to prevent flooding the inference server.
-    // With N workers, system-wide max = N * 64. Server healthy capacity ~50-150.
-    let opts = yz_infer::ClientOptions {
-        max_inflight_total: 64,
-        max_outbound_queue: 256,
-        request_id_start: 1,
-    };
-    if let Some(rest) = endpoint.strip_prefix("unix://") {
-        #[cfg(unix)]
-        {
-            return Ok(yz_mcts::InferBackend::connect_uds(rest, 0, opts)?);
-        }
-        #[cfg(not(unix))]
-        {
-            panic!("unix:// endpoints are only supported on unix");
-        }
-    }
-    if let Some(rest) = endpoint.strip_prefix("tcp://") {
-        return Ok(yz_mcts::InferBackend::connect_tcp(rest, 0, opts)?);
-    }
-    panic!("Unsupported infer endpoint: {endpoint}");
-}
-
 fn ensure_run_layout(run_dir: &Path) -> Result<(), ControllerError> {
     std::fs::create_dir_all(run_dir.join("logs"))?;
     std::fs::create_dir_all(run_dir.join("models"))?;
