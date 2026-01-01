@@ -8,11 +8,12 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::Write as _;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,38 @@ use crate::frame::{read_frame, write_frame, FrameError};
 use crate::protocol::{InferRequestV1, InferResponseV1};
 
 // region agent log
+static DBG_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+
+fn dbg_start_writer_thread() -> Option<mpsc::Sender<String>> {
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::Builder::new()
+        .name("yz-infer-debuglog".to_string())
+        .spawn(move || {
+            let path = std::path::Path::new("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log");
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path);
+            // Buffer + periodic flush: reduces per-log syscalls dramatically.
+            let mut buf = f.as_mut().ok().map(|ff| std::io::BufWriter::new(ff));
+            let mut n_since_flush: u32 = 0;
+            let mut last_flush = Instant::now();
+            while let Ok(line) = rx.recv() {
+                if let Some(bw) = buf.as_mut() {
+                    let _ = bw.write_all(line.as_bytes());
+                    let _ = bw.write_all(b"\n");
+                    n_since_flush += 1;
+                    if n_since_flush >= 1024 || last_flush.elapsed() >= Duration::from_millis(250) {
+                        let _ = bw.flush();
+                        n_since_flush = 0;
+                        last_flush = Instant::now();
+                    }
+                } else {
+                    // If opening failed earlier, keep dropping logs silently.
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
 fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
     let payload = serde_json::json!({
         "timestamp": (std::time::SystemTime::now()
@@ -37,17 +70,21 @@ fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json:
         "data": data,
     });
     if let Ok(line) = serde_json::to_string(&payload) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
-        {
-            let _ = std::io::Write::write_all(&mut f, line.as_bytes());
-            let _ = std::io::Write::write_all(&mut f, b"\n");
-        }
+        let tx = DBG_TX
+            .get_or_init(|| dbg_start_writer_thread().unwrap_or_else(|| tx_dropper()))
+            .clone();
+        let _ = tx.send(line);
     }
 }
+
+fn tx_dropper() -> mpsc::Sender<String> {
+    // If we cannot spawn/open the writer, keep a sender that drops everything.
+    let (tx, _rx) = mpsc::channel::<String>();
+    tx
+}
 static CLIENT_SUBMIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Sample mask for very hot-path logs (1/1024).
+static DBG_SAMPLE_MASK: u64 = 0x3FF;
 // endregion agent log
 
 #[derive(Debug, Error)]
@@ -79,8 +116,12 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
-            max_inflight_total: 4096,
-            max_outbound_queue: 4096,
+            // Reduced from 4096 to prevent flooding the inference server.
+            // With N workers, total system inflight = N * max_inflight_total.
+            // Server healthy capacity is ~50-150 requests at target RTT.
+            // Default 64 means 10 workers = 640 max system inflight (reasonable headroom).
+            max_inflight_total: 64,
+            max_outbound_queue: 256,
             request_id_start: 1,
         }
     }
@@ -480,11 +521,41 @@ fn reader_loop(
             }
         };
 
-        let entry = { pending.lock().unwrap().remove(&resp.request_id) };
+        let (entry, pending_len_after) = {
+            let mut g = pending.lock().unwrap();
+            let e = g.remove(&resp.request_id);
+            let len = g.len();
+            (e, len)
+        };
         if let Some(e) = entry {
             let dt = e.start.elapsed();
             stats.lock().unwrap().on_received(dt);
             inflight.fetch_sub(1, Ordering::SeqCst);
+            // region agent log
+            // RTT log (very hot): sample heavily + keep only extreme outliers.
+            // This measures *submit->response dispatch* on the Rust side.
+            let dt_ms = dt.as_secs_f64() * 1000.0;
+            let rid = resp.request_id;
+            let sampled = (rid & DBG_SAMPLE_MASK) == 0;
+            // NOTE: Logging itself has previously been a bottleneck. Keep volume low:
+            // - always log only extreme tails
+            // - otherwise log only sampled requests
+            if dt_ms >= 200.0 || sampled {
+                dbg_log(
+                    "H_rtt",
+                    "rust/yz-infer/src/client.rs:reader_loop",
+                    "slow request rtt",
+                    serde_json::json!({
+                        "request_id": rid,
+                        "rtt_ms": dt_ms,
+                        "sampled": sampled,
+                        "pending_len_after": pending_len_after,
+                        "inflight": inflight.load(Ordering::Relaxed),
+                        "payload_len": payload.len(),
+                    }),
+                );
+            }
+            // endregion agent log
             let _ = e.tx.send(Ok(resp));
         } else {
             // Unknown request_id; ignore but count as error for observability.
@@ -506,6 +577,7 @@ fn writer_loop(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        let t0 = Instant::now();
         if let Err(e) = write_frame(&mut stream_as_write(&mut stream), &payload) {
             stats.lock().unwrap().on_error();
             stream.shutdown();
@@ -513,6 +585,25 @@ fn writer_loop(
             fail_all_pending(&pending, &inflight, || ClientError::Disconnected);
             break;
         }
+        // region agent log
+        // Write log (hot): sample heavily + keep true outliers.
+        let write_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let sampled = (CLIENT_SUBMIT_COUNTER.load(Ordering::Relaxed) & DBG_SAMPLE_MASK) == 0;
+        if write_ms >= 10.0 || sampled {
+            dbg_log(
+                "H_write_frame",
+                "rust/yz-infer/src/client.rs:writer_loop",
+                "slow write_frame",
+                serde_json::json!({
+                    "write_ms": write_ms,
+                    "sampled": sampled,
+                    "payload_len": payload.len(),
+                    "pending_len": pending.lock().unwrap().len(),
+                    "inflight": inflight.load(Ordering::Relaxed),
+                }),
+            );
+        }
+        // endregion agent log
         payload.clear();
         let _ = pool_tx.try_send(payload);
     }

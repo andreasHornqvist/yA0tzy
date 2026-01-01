@@ -9,8 +9,11 @@ inference:
   # Device: "cpu" or "cuda"
   device: "cpu"
   # Maximum batch size before flushing inference requests
+  # Default: 32 (better tail latency on CPU than 64 in our measurements).
   max_batch: 32
   # Maximum wait time (microseconds) before flushing a partial batch
+  # Default 1000us: keeps good throughput at low/medium load while still keeping latency reasonable.
+  # Note: observed `H_wait.age_us` includes queue/backlog time, not just this batching window.
   max_wait_us: 1000
   # Metrics/control HTTP server bind address (used for hot-reload and Prometheus metrics)
   metrics_bind: "127.0.0.1:18080"
@@ -33,11 +36,11 @@ mcts:
   # PUCT exploration constant
   c_puct: 1.5
   # Simulation budget for reroll decisions
-  budget_reroll: 100
+  budget_reroll: 400
   # Simulation budget for mark (category selection) decisions
-  budget_mark: 200
+  budget_mark: 400
   # Maximum in-flight inference requests per game
-  max_inflight_per_game: 4
+  max_inflight_per_game: 8
   # Dirichlet noise alpha (self-play only, not used in gating)
   dirichlet_alpha: 0.3
   # Dirichlet noise epsilon - fraction of noise mixed into priors (self-play only)

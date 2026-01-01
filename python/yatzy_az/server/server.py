@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import json as _json
 
 from .batcher import Batcher
+from .debug_log import emit as _dbg_emit
 from .metrics import MetricsSnapshot, now_s
 from .metrics_server import ReloadResult, start_metrics_server
 from .model import build_model
@@ -24,6 +25,13 @@ from .protocol_v1 import (
     read_frame,
     write_frame,
 )
+
+# Debug-mode log sampling (keep evidence while avoiding log-volume perf cliffs).
+# We sample hot-path per-request logs by request_id bitmask.
+_DBG_REQ_SAMPLE_MASK = 0x3FF  # 1 / 1024
+
+def _dbg_sample_req(request_id: int) -> bool:
+    return (int(request_id) & _DBG_REQ_SAMPLE_MASK) == 0
 
 
 def _parse_bind(bind: str) -> tuple[str, str]:
@@ -63,31 +71,22 @@ def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
 
     # region agent log
     try:
-        import json as _json
-        with open(
-            "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-            "a",
-            encoding="utf-8",
-        ) as f:
-            f.write(
-                _json.dumps(
-                    {
-                        "timestamp": int(time.time() * 1000),
-                        "sessionId": "debug-session",
-                        "runId": "pre-fix",
-                        "hypothesisId": "H_latency",
-                        "location": "python/yatzy_az/server/server.py:_apply_torch_thread_settings",
-                        "message": "torch thread settings applied",
-                        "data": {
-                            "torch_threads": cfg.torch_threads,
-                            "torch_interop_threads": cfg.torch_interop_threads,
-                            "torch_get_num_threads": int(torch.get_num_threads()),
-                            "torch_get_num_interop_threads": int(torch.get_num_interop_threads()),
-                        },
-                    }
-                )
-                + "\n"
-            )
+        _dbg_emit(
+            {
+                "timestamp": int(time.time() * 1000),
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H_latency",
+                "location": "python/yatzy_az/server/server.py:_apply_torch_thread_settings",
+                "message": "torch thread settings applied",
+                "data": {
+                    "torch_threads": cfg.torch_threads,
+                    "torch_interop_threads": cfg.torch_interop_threads,
+                    "torch_get_num_threads": int(torch.get_num_threads()),
+                    "torch_get_num_interop_threads": int(torch.get_num_interop_threads()),
+                },
+            }
+        )
     except Exception:
         pass
     # endregion agent log
@@ -96,13 +95,24 @@ def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
 async def _handle_conn(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, batcher: Batcher
 ) -> None:
-    # Allow pipelining multiple in-flight requests per connection.
-    # The Rust client can have many concurrent tickets; if we await each response here,
-    # we serialize the entire connection and the batcher will never form batches > 1.
-    inflight_limit = 4096
-    inflight_sem = asyncio.Semaphore(inflight_limit)
-    out_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=inflight_limit)
-    pending: set[asyncio.Task[None]] = set()
+    # Bounded inflight to prevent queueing tail explosions.
+    # Must match Rust-side global inflight budget (64 per client * ~10 workers = 640 max).
+    # We use a tighter bound per-connection to enable backpressure.
+    INGRESS_MAX = 128
+    inflight_sem = asyncio.Semaphore(INGRESS_MAX)
+    out_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=INGRESS_MAX)
+
+    # Avoid per-request task churn: use a fixed worker pool that awaits `batcher.enqueue`.
+    # Reduced from 256 to 32 to lower scheduling overhead and contention.
+    WORKER_COUNT = 32
+    req_q: asyncio.Queue[object] = asyncio.Queue(maxsize=INGRESS_MAX)
+    worker_tasks: list[asyncio.Task[None]] = []
+
+    # region agent log
+    # Sampled per-request timing: decode->worker_start and decode->enqueue_done.
+    # Keep extremely low-volume (1/1024 by request_id) to avoid perturbing perf.
+    t_dec_by_id: dict[int, float] = {}
+    # endregion agent log
 
     async def _writer_loop() -> None:
         while True:
@@ -111,44 +121,83 @@ async def _handle_conn(
                 return
             await write_frame(writer, payload)
 
-    async def _handle_one(req) -> None:
-        try:
-            resp: InferResponseV1 = await batcher.enqueue(req)
-
-            # region agent log
+    async def _worker_loop(worker_id: int) -> None:
+        while True:
+            item = await req_q.get()
+            if item is None:
+                return
+            req = item
+            assert isinstance(req, object)
             try:
-                with open(
-                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(
-                        _json.dumps(
+                # region agent log
+                try:
+                    rid = int(req.request_id)  # type: ignore[attr-defined]
+                    t_dec = t_dec_by_id.pop(rid, None)
+                    if t_dec is not None:
+                        dt_to_worker_ms = (time.monotonic() - t_dec) * 1000.0
+                        _dbg_emit(
                             {
                                 "timestamp": int(time.time() * 1000),
                                 "sessionId": "debug-session",
                                 "runId": "pre-fix",
-                                "hypothesisId": "H1",
-                                "location": "python/yatzy_az/server/server.py:_handle_conn",
-                                "message": "enqueue completed; queueing response for writer loop",
+                                "hypothesisId": "H_conn_sched",
+                                "location": "python/yatzy_az/server/server.py:_worker_loop",
+                                "message": "worker picked request",
                                 "data": {
-                                    "request_id": int(resp.request_id),
+                                    "request_id": rid,
+                                    "worker_id": int(worker_id),
+                                    "dt_decode_to_worker_ms": dt_to_worker_ms,
                                     "queue_depth": int(batcher.queue_depth),
+                                    "req_q": int(req_q.qsize()),
                                     "out_q": int(out_q.qsize()),
                                 },
                             }
                         )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            # endregion agent log
+                        # put back the decode timestamp so we can also log decode->enqueue_done below
+                        t_dec_by_id[rid] = t_dec
+                except Exception:
+                    pass
+                # endregion agent log
 
-            await out_q.put(encode_response_v1(resp))
-        finally:
-            inflight_sem.release()
+                resp: InferResponseV1 = await batcher.enqueue(req)  # type: ignore[arg-type]
+
+                # region agent log
+                try:
+                    rid = int(resp.request_id)
+                    t_dec = t_dec_by_id.pop(rid, None)
+                    if t_dec is not None:
+                        dt_to_done_ms = (time.monotonic() - t_dec) * 1000.0
+                        _dbg_emit(
+                            {
+                                "timestamp": int(time.time() * 1000),
+                                "sessionId": "debug-session",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H_conn_sched",
+                                "location": "python/yatzy_az/server/server.py:_worker_loop",
+                                "message": "enqueue completed",
+                                "data": {
+                                    "request_id": rid,
+                                    "worker_id": int(worker_id),
+                                    "dt_decode_to_enqueue_done_ms": dt_to_done_ms,
+                                    "queue_depth": int(batcher.queue_depth),
+                                    "req_q": int(req_q.qsize()),
+                                    "out_q": int(out_q.qsize()),
+                                },
+                            }
+                        )
+                except Exception:
+                    pass
+                # endregion agent log
+
+                await out_q.put(encode_response_v1(resp))
+            finally:
+                inflight_sem.release()
 
     writer_task = asyncio.create_task(_writer_loop())
+    # Spawn a bounded number of workers; concurrency is still limited by `inflight_sem`.
+    # Reduced from 256 to WORKER_COUNT (32) to lower asyncio task scheduling overhead.
+    for wid in range(WORKER_COUNT):
+        worker_tasks.append(asyncio.create_task(_worker_loop(wid)))
     try:
         while True:
             payload = await read_frame(reader)
@@ -161,48 +210,45 @@ async def _handle_conn(
 
             # region agent log
             try:
-                with open(
-                    "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log",
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(
-                        _json.dumps(
-                            {
-                                "timestamp": int(time.time() * 1000),
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H1",
-                                "location": "python/yatzy_az/server/server.py:_handle_conn",
-                                "message": "decoded request; scheduling enqueue task (pipelined)",
-                                "data": {
-                                    "request_id": int(req.request_id),
-                                    "model_id": int(req.model_id),
-                                    "features_len": len(req.features),
-                                    "legal_len": len(req.legal_mask),
-                                    "queue_depth": int(batcher.queue_depth),
-                                    "pending_tasks": len(pending),
-                                },
-                            }
-                        )
-                        + "\n"
+                if _dbg_sample_req(int(req.request_id)):
+                    # Record decode time for sampled requests (used by worker timing logs).
+                    t_dec_by_id[int(req.request_id)] = time.monotonic()
+                    _dbg_emit(
+                        {
+                            "timestamp": int(time.time() * 1000),
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H1",
+                            "location": "python/yatzy_az/server/server.py:_handle_conn",
+                            "message": "decoded request; enqueued to worker pool (pipelined)",
+                            "data": {
+                                "request_id": int(req.request_id),
+                                "model_id": int(req.model_id),
+                                "features_len": len(req.features),
+                                "legal_len": len(req.legal_mask),
+                                "queue_depth": int(batcher.queue_depth),
+                                "req_q": int(req_q.qsize()),
+                            },
+                        }
                     )
             except Exception:
                 pass
             # endregion agent log
 
             await inflight_sem.acquire()
-            t = asyncio.create_task(_handle_one(req))
-            pending.add(t)
-            t.add_done_callback(lambda tt: pending.discard(tt))
+            await req_q.put(req)
     except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
         pass
     finally:
         try:
-            for t in list(pending):
+            # Stop workers.
+            for _ in worker_tasks:
+                with contextlib.suppress(Exception):
+                    await req_q.put(None)
+            for t in worker_tasks:
                 t.cancel()
             with contextlib.suppress(Exception):
-                await asyncio.gather(*pending)
+                await asyncio.gather(*worker_tasks)
             with contextlib.suppress(Exception):
                 await out_q.put(b"")
             writer_task.cancel()

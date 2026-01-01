@@ -24,7 +24,36 @@ def _writer_loop(fd: int) -> None:
     while True:
         line = _q.get()
         try:
-            os.write(fd, line.encode("utf-8"))
+            # Batch up as many queued lines as we can to reduce syscall + file contention.
+            # (Important: multiple processes append to the same file; fewer writes helps a lot.)
+            parts = [line]
+            for _ in range(1023):
+                try:
+                    parts.append(_q.get_nowait())
+                except Exception:
+                    break
+
+            payload_bytes = "".join(parts).encode("utf-8")
+            t0 = time.perf_counter()
+            os.write(fd, payload_bytes)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            # If debug log I/O itself is slow, record it (rare) from the writer thread
+            # without involving the asyncio event loop.
+            if dt_ms >= 5.0:
+                try:
+                    payload = {
+                        "timestamp": int(time.time() * 1000),
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H_py_logio",
+                        "location": "python/yatzy_az/server/debug_log.py:_writer_loop",
+                        "message": "slow debug.log os.write",
+                        "data": {"dt_ms": dt_ms, "bytes": len(payload_bytes)},
+                    }
+                    # Enqueue (do NOT immediately write again; that can amplify stalls).
+                    _q.put(json.dumps(payload) + "\n")
+                except Exception:
+                    pass
         except Exception:
             # Best-effort only; never crash the server due to debug logging.
             pass
@@ -53,5 +82,6 @@ def emit(payload: dict[str, Any]) -> None:
         _q.put(json.dumps(payload) + "\n")
     except Exception:
         pass
+
 
 

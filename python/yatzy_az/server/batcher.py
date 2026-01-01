@@ -60,6 +60,8 @@ class Batcher:
         self._stats = BatcherStats()
         self._stop = asyncio.Event()
         self._reloads_total: int = 0
+        # Debug log sampling counter (avoid huge log volume affecting perf).
+        self._dbg_batch_ctr: int = 0
 
     @property
     def stats(self) -> BatcherStats:
@@ -110,32 +112,36 @@ class Batcher:
                 except TimeoutError:
                     break
 
+            self._dbg_batch_ctr += 1
+            sample = (self._dbg_batch_ctr & 0x3F) == 0  # 1 / 64 batches
+
             # region agent log
-            try:
-                _dbg_emit(
-                    {
-                        "timestamp": int(time.time() * 1000),
-                        "sessionId": "debug-session",
-                        "runId": "pre-fix",
-                        "hypothesisId": "H1",
-                        "location": "python/yatzy_az/server/batcher.py:Batcher.run",
-                        "message": "formed batch",
-                        "data": {
-                            "batch_len": len(batch),
-                            "queue_depth_after_form": int(self._q.qsize()),
-                            "max_batch": int(self._max_batch),
-                            "max_wait_us": int(self._max_wait_s * 1_000_000),
-                        },
-                    }
-                )
-            except Exception:
-                pass
+            if sample:
+                try:
+                    _dbg_emit(
+                        {
+                            "timestamp": int(time.time() * 1000),
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H1",
+                            "location": "python/yatzy_az/server/batcher.py:Batcher.run",
+                            "message": "formed batch",
+                            "data": {
+                                "batch_len": len(batch),
+                                "queue_depth_after_form": int(self._q.qsize()),
+                                "max_batch": int(self._max_batch),
+                                "max_wait_us": int(self._max_wait_s * 1_000_000),
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
             # endregion agent log
 
             # region agent log
             # Measure how long the oldest request waited in the queue before being flushed.
             # This helps confirm whether end-to-end latency is dominated by max_wait_us batching.
-            if len(batch) < self._max_batch:
+            if sample and len(batch) < self._max_batch:
                 try:
                     now = time.monotonic()
                     age_us = int((now - first.t0) * 1_000_000)
