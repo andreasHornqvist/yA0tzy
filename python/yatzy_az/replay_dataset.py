@@ -254,8 +254,6 @@ class ReplayIterableDataset(_TorchIterableDataset):  # type: ignore[misc]
             legal_t = torch.from_numpy(legal.astype(np.uint8, copy=False))
             pi_t = torch.from_numpy(pi.astype(np.float32, copy=False))
             z_t = torch.tensor(float(z), dtype=torch.float32)
-            if z_margin is None:
-                yield x, legal_t, pi_t, z_t, None
-            else:
-                zm_t = torch.tensor(float(z_margin), dtype=torch.float32)
-                yield x, legal_t, pi_t, z_t, zm_t
+            # Use 0.0 as placeholder when z_margin is not present (avoids None in batch collate)
+            zm_t = torch.tensor(0.0 if z_margin is None else float(z_margin), dtype=torch.float32)
+            yield x, legal_t, pi_t, z_t, zm_t
