@@ -112,6 +112,7 @@ COMMANDS:
     oracle expected     Print oracle expected score (~248.44)
     oracle sim          Run oracle solitaire simulation
     selfplay            Run self-play with MCTS + inference
+    selfplay-worker     Internal: run one self-play worker process (spawned by controller)
     gate                Gate candidate vs best model (paired seed + side swap)
     oracle-eval         Evaluate models against oracle baseline
     bench               Run Criterion micro-benchmarks (wrapper around cargo bench)
@@ -125,6 +126,378 @@ OPTIONS:
 For more information, see the PRD or run `yz <COMMAND> --help`.
 "#
     );
+}
+
+fn cmd_selfplay_worker(args: &[String]) {
+    let mut run_dir: Option<String> = None;
+    let mut infer: Option<String> = None;
+    let mut worker_id: u32 = 0;
+    let mut num_workers: u32 = 1;
+    let mut games: u32 = 1;
+    let mut seed_base: u64 = 0xC0FFEE;
+    let mut max_samples_per_shard: usize = 8192;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz selfplay-worker
+
+USAGE:
+    yz selfplay-worker --run-dir runs/<id> --infer unix:///tmp/yatzy_infer.sock --worker-id W --num-workers N --games G [--seed-base S] [--max-samples-per-shard N]
+
+OPTIONS:
+    --run-dir DIR               Run directory (contains run.json + config.yaml) (required)
+    --infer ENDPOINT            Inference endpoint (unix:///... or tcp://host:port) (required)
+    --worker-id W               Worker id in [0, N) (required)
+    --num-workers N             Total worker processes (required)
+    --games G                   Games to complete in this worker (required)
+    --seed-base S               Seed base for deterministic uniqueness (default: 0xC0FFEE)
+    --max-samples-per-shard N   Samples per replay shard (default: 8192)
+"#
+                );
+                return;
+            }
+            "--run-dir" => {
+                run_dir = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--infer" => {
+                infer = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--worker-id" => {
+                worker_id = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --worker-id value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--num-workers" => {
+                num_workers = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --num-workers value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--games" => {
+                games = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --games value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--seed-base" => {
+                seed_base = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --seed-base value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--max-samples-per-shard" => {
+                max_samples_per_shard = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --max-samples-per-shard value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz selfplay-worker`: {other}");
+                eprintln!("Run `yz selfplay-worker --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let run_dir = run_dir.unwrap_or_else(|| {
+        eprintln!("Missing --run-dir");
+        process::exit(1);
+    });
+    let infer = infer.unwrap_or_else(|| {
+        eprintln!("Missing --infer");
+        process::exit(1);
+    });
+    if num_workers < 1 {
+        eprintln!("--num-workers must be >= 1");
+        process::exit(1);
+    }
+    if worker_id >= num_workers {
+        eprintln!("--worker-id must be in [0, num_workers)");
+        process::exit(1);
+    }
+    if games < 1 {
+        eprintln!("--games must be >= 1");
+        process::exit(1);
+    }
+
+    let run_dir = PathBuf::from(run_dir);
+    let cfg_path = run_dir.join("config.yaml");
+    let cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config at {}: {e}", cfg_path.display());
+        process::exit(1);
+    });
+
+    let backend = connect_infer_backend(&infer);
+
+    let mcts_cfg = yz_mcts::MctsConfig {
+        c_puct: cfg.mcts.c_puct,
+        simulations_mark: cfg.mcts.budget_mark.max(1),
+        simulations_reroll: cfg.mcts.budget_reroll.max(1),
+        dirichlet_alpha: cfg.mcts.dirichlet_alpha,
+        dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
+        max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
+        virtual_loss: 1.0,
+    };
+
+    // Replay output is worker-local to avoid collisions.
+    let replay_dir = run_dir
+        .join("replay_workers")
+        .join(format!("worker_{worker_id:03}"));
+    let manifest_path = run_dir.join("run.json");
+    let manifest = yz_logging::read_manifest(&manifest_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read manifest at {}: {e}", manifest_path.display());
+        process::exit(1);
+    });
+
+    let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
+        out_dir: replay_dir.clone(),
+        max_samples_per_shard,
+        git_hash: manifest.git_hash.clone(),
+        config_hash: manifest.config_hash.clone(),
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to create shard writer at {}: {e}", replay_dir.display());
+        process::exit(1);
+    });
+
+    // Worker stats log (per-process).
+    let logs_dir = run_dir
+        .join("logs_workers")
+        .join(format!("worker_{worker_id:03}"));
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let mut worker_log =
+        yz_logging::NdjsonWriter::open_append_with_flush(logs_dir.join("worker_stats.ndjson"), 50)
+            .ok();
+    let progress_path = logs_dir.join("progress.json");
+
+    #[derive(serde::Serialize)]
+    struct WorkerStatsEvent<'a> {
+        event: &'a str,
+        ts_ms: u64,
+        worker_id: u32,
+        num_workers: u32,
+        games_target: u32,
+        games_completed: u32,
+        wall_ms: u64,
+    }
+
+    let t_start = std::time::Instant::now();
+    if let Some(w) = worker_log.as_mut() {
+        let _ = w.write_event(&WorkerStatsEvent {
+            event: "selfplay_worker_start",
+            ts_ms: yz_logging::now_ms(),
+            worker_id,
+            num_workers,
+            games_target: games,
+            games_completed: 0,
+            wall_ms: 0,
+        });
+        // Ensure the start event is visible even if the worker is cancelled early.
+        let _ = w.flush();
+    }
+    // Write initial progress atomically (for controller/TUI live progress).
+    #[derive(serde::Serialize)]
+    struct WorkerProgress {
+        worker_id: u32,
+        num_workers: u32,
+        games_target: u32,
+        games_completed: u32,
+        pid: u32,
+        sched_ticks: u64,
+        sched_steps: u64,
+        sched_would_block: u64,
+        sched_terminal: u64,
+        ts_ms: u64,
+    }
+    fn write_progress_atomic(path: &PathBuf, p: &WorkerProgress) {
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(p) {
+            let _ = std::fs::write(&tmp, &bytes);
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+    write_progress_atomic(
+        &progress_path,
+        &WorkerProgress {
+            worker_id,
+            num_workers,
+            games_target: games,
+            games_completed: 0,
+            pid: std::process::id(),
+            sched_ticks: 0,
+            sched_steps: 0,
+            sched_would_block: 0,
+            sched_terminal: 0,
+            ts_ms: yz_logging::now_ms(),
+        },
+    );
+
+    // Each process runs `threads_per_worker` concurrent game tasks.
+    let parallel_games = cfg.selfplay.threads_per_worker.max(1) as usize;
+    let num_workers_u64 = num_workers as u64;
+    let worker_id_u64 = worker_id as u64;
+
+    let mut tasks = Vec::with_capacity(parallel_games);
+    for slot in 0..parallel_games {
+        let game_id = worker_id_u64 + (slot as u64) * num_workers_u64;
+        let mut ctx = yz_core::TurnContext::new_rng(seed_base ^ (0xC0FFEE ^ game_id));
+        let s = yz_core::initial_state(&mut ctx);
+        tasks.push(yz_runtime::GameTask::new(
+            game_id,
+            s,
+            yz_mcts::ChanceMode::Rng {
+                seed: seed_base ^ (0xBADC0DE ^ game_id),
+            },
+            mcts_cfg,
+        ));
+    }
+    let mut sched = yz_runtime::Scheduler::new(tasks, 64);
+
+    let mut completed_games: u32 = 0;
+    let mut next_seq: u64 = parallel_games as u64;
+    let mut last_progress_write = std::time::Instant::now();
+    while completed_games < games {
+        let before_steps = sched.stats().steps;
+        let before_terminal = sched.stats().terminal;
+        sched.tick_and_write(&backend, &mut writer, None)
+            .unwrap_or_else(|e| {
+                eprintln!("worker {worker_id}: scheduler failed: {e}");
+                process::exit(1);
+            });
+        let after_steps = sched.stats().steps;
+        let after_terminal = sched.stats().terminal;
+        // Avoid busy-spinning when all tasks are waiting on inference.
+        // This yields CPU to the Python inference server and improves throughput.
+        if after_steps == before_steps && after_terminal == before_terminal {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+
+        // Heartbeat progress even before games complete, so we can prove workers are running.
+        // Rate-limit to avoid excessive filesystem churn.
+        if last_progress_write.elapsed() >= std::time::Duration::from_millis(500) {
+            let s = sched.stats();
+            write_progress_atomic(
+                &progress_path,
+                &WorkerProgress {
+                    worker_id,
+                    num_workers,
+                    games_target: games,
+                    games_completed: completed_games,
+                    pid: std::process::id(),
+                    sched_ticks: s.ticks,
+                    sched_steps: s.steps,
+                    sched_would_block: s.would_block,
+                    sched_terminal: s.terminal,
+                    ts_ms: yz_logging::now_ms(),
+                },
+            );
+            last_progress_write = std::time::Instant::now();
+        }
+
+        for t in sched.tasks_mut() {
+            if yz_core::is_terminal(&t.state) {
+                completed_games += 1;
+                // Progress update: cheap atomic write. Rate-limit a bit.
+                if completed_games == games || (completed_games % 5 == 0) {
+                    write_progress_atomic(
+                        &progress_path,
+                        &WorkerProgress {
+                            worker_id,
+                            num_workers,
+                            games_target: games,
+                            games_completed: completed_games,
+                            pid: std::process::id(),
+                            // Note: we can't borrow `sched` here because we already hold a mutable
+                            // borrow from `tasks_mut()`. These fields will be updated by the
+                            // periodic heartbeat above.
+                            sched_ticks: 0,
+                            sched_steps: 0,
+                            sched_would_block: 0,
+                            sched_terminal: 0,
+                            ts_ms: yz_logging::now_ms(),
+                        },
+                    );
+                }
+                if completed_games >= games {
+                    break;
+                }
+                // Reset task for next game; ensure unique game_id across processes.
+                let game_id = worker_id_u64 + next_seq * num_workers_u64;
+                next_seq += 1;
+                let mut ctx = yz_core::TurnContext::new_rng(seed_base ^ (0xC0FFEE ^ game_id));
+                let s = yz_core::initial_state(&mut ctx);
+                *t = yz_runtime::GameTask::new(
+                    game_id,
+                    s,
+                    yz_mcts::ChanceMode::Rng {
+                        seed: seed_base ^ (0xBADC0DE ^ game_id),
+                    },
+                    mcts_cfg,
+                );
+            }
+        }
+    }
+
+    writer.finish().unwrap_or_else(|e| {
+        eprintln!("worker {worker_id}: failed to finish replay writer: {e}");
+        process::exit(1);
+    });
+    // Final progress.
+    let s = sched.stats();
+    write_progress_atomic(
+        &progress_path,
+        &WorkerProgress {
+            worker_id,
+            num_workers,
+            games_target: games,
+            games_completed: completed_games,
+            pid: std::process::id(),
+            sched_ticks: s.ticks,
+            sched_steps: s.steps,
+            sched_would_block: s.would_block,
+            sched_terminal: s.terminal,
+            ts_ms: yz_logging::now_ms(),
+        },
+    );
+
+    if let Some(w) = worker_log.as_mut() {
+        let _ = w.write_event(&WorkerStatsEvent {
+            event: "selfplay_worker_done",
+            ts_ms: yz_logging::now_ms(),
+            worker_id,
+            num_workers,
+            games_target: games,
+            games_completed: completed_games,
+            wall_ms: t_start.elapsed().as_millis() as u64,
+        });
+        let _ = w.flush();
+    }
 }
 
 fn print_version() {
@@ -581,9 +954,11 @@ OPTIONS:
 
     let infer_ep = infer.unwrap_or_else(|| cfg.inference.bind.clone());
 
+    // Use bounded inflight to prevent flooding the inference server.
+    // With N workers, system-wide max = N * 64. Server healthy capacity ~50-150.
     let client_opts = yz_infer::ClientOptions {
-        max_inflight_total: 8192,
-        max_outbound_queue: 8192,
+        max_inflight_total: 64,
+        max_outbound_queue: 256,
         request_id_start: 1,
     };
 
@@ -784,9 +1159,10 @@ fn write_gate_report_atomic(path: &PathBuf, report: &GateReportJson) -> std::io:
 }
 
 fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
+    // Use bounded inflight to prevent flooding the inference server.
     let opts = yz_infer::ClientOptions {
-        max_inflight_total: 8192,
-        max_outbound_queue: 8192,
+        max_inflight_total: 64,
+        max_outbound_queue: 256,
         request_id_start: 1,
     };
     if let Some(rest) = endpoint.strip_prefix("unix://") {
@@ -1151,6 +1527,9 @@ fn main() {
         }
         "selfplay" => {
             cmd_selfplay(&args[2..]);
+        }
+        "selfplay-worker" => {
+            cmd_selfplay_worker(&args[2..]);
         }
         "iter" => {
             if args.len() < 3 {

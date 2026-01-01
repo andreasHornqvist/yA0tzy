@@ -365,9 +365,11 @@ impl IterationHandle {
 }
 
 fn connect_infer_backend(endpoint: &str) -> Result<yz_mcts::InferBackend, ControllerError> {
+    // Use bounded inflight to prevent flooding the inference server.
+    // With N workers, system-wide max = N * 64. Server healthy capacity ~50-150.
     let opts = yz_infer::ClientOptions {
-        max_inflight_total: 8192,
-        max_outbound_queue: 8192,
+        max_inflight_total: 64,
+        max_outbound_queue: 256,
         request_id_start: 1,
     };
     if let Some(rest) = endpoint.strip_prefix("unix://") {
@@ -1200,7 +1202,9 @@ fn run_selfplay(
     iter_idx: u32,
 ) -> Result<(), ControllerError> {
     let replay_dir = run_dir.join("replay");
+    let replay_workers_dir = run_dir.join("replay_workers");
     let logs_dir = run_dir.join("logs");
+    let logs_workers_dir = run_dir.join("logs_workers");
     let run_json = run_dir.join("run.json");
 
     // Record per-iteration phase start (best-effort).
@@ -1215,161 +1219,225 @@ fn run_selfplay(
         let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
     }
 
-    let backend = connect_infer_backend(infer_endpoint)?;
-    let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
-        out_dir: replay_dir,
-        max_samples_per_shard: 8192,
-        git_hash: manifest.git_hash.clone(),
-        config_hash: manifest.config_hash.clone(),
-    })?;
+    std::fs::create_dir_all(&replay_dir)?;
+    std::fs::create_dir_all(&replay_workers_dir)?;
+    std::fs::create_dir_all(&logs_dir)?;
+    std::fs::create_dir_all(&logs_workers_dir)?;
 
-    // Number of concurrent game tasks. In v1 runtime we don't spawn OS processes; instead we run
-    // multiple game state machines in a single scheduler. To preserve the intent of the config,
-    // interpret (workers * threads_per_worker) as total parallel game slots.
-    let parallel = (cfg.selfplay.workers.max(1) as usize) * (cfg.selfplay.threads_per_worker.max(1) as usize);
-    let mcts_cfg = yz_mcts::MctsConfig {
-        c_puct: cfg.mcts.c_puct,
-        simulations_mark: cfg.mcts.budget_mark.max(1),
-        simulations_reroll: cfg.mcts.budget_reroll.max(1),
-        dirichlet_alpha: cfg.mcts.dirichlet_alpha,
-        dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
-        max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
-        virtual_loss: 1.0,
-    };
-
-    let mut tasks = Vec::new();
-    for gid in 0..parallel as u64 {
-        let mut ctx = yz_core::TurnContext::new_rng(0xC0FFEE ^ gid);
-        let s = yz_core::initial_state(&mut ctx);
-        tasks.push(yz_runtime::GameTask::new(
-            gid,
-            s,
-            yz_mcts::ChanceMode::Rng {
-                seed: 0xBADC0DE ^ gid,
-            },
-            mcts_cfg,
-        ));
-    }
-    let mut sched = yz_runtime::Scheduler::new(tasks, 64);
-
-    let v = yz_logging::VersionInfoV1 {
-        protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
-        feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-        action_space_id: "oracle_keepmask_v1",
-        ruleset_id: "swedish_scandinavian_v1",
-    };
-    let mut loggers = yz_runtime::RunLoggers {
-        run_id: manifest.run_id.clone(),
-        v,
-        git_hash: manifest.git_hash.clone(),
-        config_snapshot: manifest.config_snapshot.clone(),
-        root_log_every_n: 50,
-        iter: yz_logging::NdjsonWriter::open_append_with_flush(
-            logs_dir.join("iteration_stats.ndjson"),
-            100,
-        )?,
-        roots: yz_logging::NdjsonWriter::open_append_with_flush(
-            logs_dir.join("mcts_roots.ndjson"),
-            100,
-        )?,
-        metrics: yz_logging::NdjsonWriter::open_append_with_flush(
-            logs_dir.join("metrics.ndjson"),
-            100,
-        )?,
-    };
-
-    let games = cfg.selfplay.games_per_iteration.max(1);
+    // Spawn OS processes for true CPU parallelism.
+    let num_workers = cfg.selfplay.workers.max(1);
+    let games_total = cfg.selfplay.games_per_iteration.max(1);
     let base_total = manifest.selfplay_games_completed;
-    let mut completed_games: u32 = 0;
-    let mut next_game_id: u64 = parallel as u64;
-    while completed_games < games {
+    let seed_base = manifest.created_ts_ms ^ 0xC0FFEEu64;
+
+    // Partition games across workers.
+    let base = games_total / num_workers;
+    let rem = games_total % num_workers;
+
+    let exe = std::env::current_exe().map_err(ControllerError::Fs)?;
+    let mut children: Vec<(u32, u32, Child)> = Vec::new(); // (wid, games_for_worker, child)
+    for wid in 0..num_workers {
+        let games_for = base + if wid < rem { 1 } else { 0 };
+        if games_for == 0 {
+            continue;
+        }
+        let mut cmd = Command::new(&exe);
+        cmd.arg("selfplay-worker");
+        cmd.arg("--run-dir").arg(run_dir);
+        cmd.arg("--infer").arg(infer_endpoint);
+        cmd.arg("--worker-id").arg(wid.to_string());
+        cmd.arg("--num-workers").arg(num_workers.to_string());
+        cmd.arg("--games").arg(games_for.to_string());
+        cmd.arg("--seed-base").arg(seed_base.to_string());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        let child = cmd.spawn().map_err(ControllerError::Fs)?;
+        children.push((wid, games_for, child));
+    }
+
+    fn read_worker_progress_sum(logs_workers_dir: &Path) -> u32 {
+        #[derive(serde::Deserialize)]
+        struct P {
+            games_completed: u32,
+        }
+        let mut sum = 0u32;
+        if let Ok(rd) = std::fs::read_dir(logs_workers_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let f = p.join("progress.json");
+                if let Ok(bytes) = std::fs::read(&f) {
+                    if let Ok(pp) = serde_json::from_slice::<P>(&bytes) {
+                        sum = sum.saturating_add(pp.games_completed);
+                    }
+                }
+            }
+        }
+        sum
+    }
+
+    let mut completed_games: u32;
+    let mut last_manifest_ts = std::time::Instant::now();
+    // Poll loop so cancellation can be honored without blocking in wait().
+    while !children.is_empty() {
         if ctrl.cancelled() {
+            for (_, _, mut c) in children {
+                let _ = c.kill();
+            }
             return Err(ControllerError::Cancelled);
         }
-        // Avoid busy-spinning when all tasks are waiting on inference.
-        // If there was no progress (no steps/terminals) this tick, sleep briefly to reduce CPU
-        // contention with the Python server and to reduce log volume from tick-based stats.
-        let before_steps = sched.stats().steps;
-        let before_terminal = sched.stats().terminal;
-        sched.tick_and_write(&backend, &mut writer, Some(&mut loggers))?;
-        let after_steps = sched.stats().steps;
-        let after_terminal = sched.stats().terminal;
-        if after_steps == before_steps && after_terminal == before_terminal {
-            std::thread::sleep(Duration::from_micros(200));
-        }
-        for t in sched.tasks_mut() {
-            if yz_core::is_terminal(&t.state) {
-                completed_games += 1;
-                // Update progress every game (for small runs) or every 10 games (for large runs).
-                let update_every = if games <= 20 { 1 } else { 10 };
-                if completed_games.is_multiple_of(update_every) || completed_games == games {
-                    let total = base_total + completed_games as u64;
-                    manifest.selfplay_games_completed = total;
-                    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
-                        it.selfplay.games_completed = completed_games as u64;
-                        it.selfplay.games_target = games as u64;
-                    }
-                    let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
-                }
-                if completed_games >= games {
+
+        let mut failure: Option<String> = None;
+        let mut i = 0usize;
+        while i < children.len() {
+            let (wid, _games_for, child) = &mut children[i];
+            if let Some(status) = child.try_wait().map_err(ControllerError::Fs)? {
+                if !status.success() {
+                    failure = Some(format!("selfplay-worker {wid} failed with status {status}"));
                     break;
                 }
-                // Reset task for next game.
-                let mut ctx = yz_core::TurnContext::new_rng(0xC0FFEE ^ next_game_id);
-                let s = yz_core::initial_state(&mut ctx);
-                *t = yz_runtime::GameTask::new(
-                    next_game_id,
-                    s,
-                    yz_mcts::ChanceMode::Rng {
-                        seed: 0xBADC0DE ^ next_game_id,
-                    },
-                    mcts_cfg,
-                );
-                next_game_id += 1;
+                // Progress is driven by reading per-worker progress files, not by exit events.
+                children.remove(i);
+                continue;
             }
+            i += 1;
         }
+        if let Some(msg) = failure {
+            // Kill all remaining workers best-effort.
+            for (_, _, mut c) in children {
+                let _ = c.kill();
+            }
+            return Err(ControllerError::Fs(std::io::Error::other(msg)));
+        }
+
+        // Live progress: periodically sum worker progress files and update run.json for the TUI.
+        if last_manifest_ts.elapsed() >= Duration::from_millis(250) {
+            completed_games = read_worker_progress_sum(&logs_workers_dir).min(games_total);
+            let total = base_total + completed_games as u64;
+            manifest.selfplay_games_completed = total;
+            if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+                it.selfplay.games_completed = completed_games as u64;
+                it.selfplay.games_target = games_total as u64;
+            }
+            let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
+            last_manifest_ts = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 
-    writer.finish()?;
+    // Final progress update (workers are done; ensure we report completion).
+    completed_games = games_total;
+    manifest.selfplay_games_completed = base_total + completed_games as u64;
+    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+        it.selfplay.games_completed = completed_games as u64;
+        it.selfplay.games_target = games_total as u64;
+    }
+    let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
 
-    // E13.1S1: replay pruning (optional) + metrics event.
+    // Merge replay shards from worker dirs into the canonical run replay dir.
+    merge_replay_workers(&replay_workers_dir, &replay_dir)?;
+
+    // E13.1S1: replay pruning (optional).
     if let Some(cap) = cfg.replay.capacity_shards {
         if cap > 0 {
-            if let Ok(rep) = yz_replay::prune_shards_by_idx(&run_dir.join("replay"), cap as usize) {
-                let ev = yz_logging::MetricsReplayPruneV1 {
-                    event: "replay_prune",
-                    ts_ms: yz_logging::now_ms(),
-                    v: loggers.v.clone(),
-                    run_id: loggers.run_id.clone(),
-                    git_hash: loggers.git_hash.clone(),
-                    config_snapshot: loggers.config_snapshot.clone(),
-                    capacity_shards: cap,
-                    before_shards: rep.before_shards as u32,
-                    after_shards: rep.after_shards as u32,
-                    deleted_shards: rep.deleted_shards as u32,
-                    deleted_min_idx: rep.deleted_min_idx,
-                    deleted_max_idx: rep.deleted_max_idx,
-                };
-                let _ = loggers.metrics.write_event(&ev);
-            }
+            let _ = yz_replay::prune_shards_by_idx(&run_dir.join("replay"), cap as usize);
         }
     }
-    let _ = loggers.iter.flush();
-    let _ = loggers.roots.flush();
-    let _ = loggers.metrics.flush();
 
     // Record per-iteration phase end (best-effort).
     if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
         it.selfplay.ended_ts_ms = Some(yz_logging::now_ms());
     }
 
-    let total = base_total + completed_games as u64;
-    manifest.selfplay_games_completed = total;
-    if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
-        it.selfplay.games_completed = completed_games as u64;
-        it.selfplay.games_target = games as u64;
+    // (already written above)
+    Ok(())
+}
+
+fn parse_shard_idx_from_name(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("shard_")?;
+    let digits = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
     }
-    let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
+    digits.parse::<u64>().ok()
+}
+
+fn next_shard_idx(dir: &Path) -> Result<u64, ControllerError> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut max_idx: Option<u64> = None;
+    for entry in std::fs::read_dir(dir).map_err(ControllerError::Fs)? {
+        let e = entry.map_err(ControllerError::Fs)?;
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with(".safetensors") || name.ends_with(".meta.json")) {
+            continue;
+        }
+        if let Some(idx) = parse_shard_idx_from_name(name) {
+            max_idx = Some(max_idx.map(|m| m.max(idx)).unwrap_or(idx));
+        }
+    }
+    Ok(max_idx.map(|m| m.saturating_add(1)).unwrap_or(0))
+}
+
+fn merge_replay_workers(replay_workers_dir: &Path, replay_dir: &Path) -> Result<(), ControllerError> {
+    std::fs::create_dir_all(replay_dir).map_err(ControllerError::Fs)?;
+    let mut out_idx = next_shard_idx(replay_dir)?;
+
+    if !replay_workers_dir.exists() {
+        return Ok(());
+    }
+
+    // Process worker dirs in sorted order for determinism.
+    let mut worker_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(replay_workers_dir).map_err(ControllerError::Fs)? {
+        let e = entry.map_err(ControllerError::Fs)?;
+        if e.path().is_dir() {
+            worker_dirs.push(e.path());
+        }
+    }
+    worker_dirs.sort();
+
+    for wdir in worker_dirs {
+        // Collect shard indices in this worker dir.
+        let mut idxs: Vec<u64> = Vec::new();
+        for entry in std::fs::read_dir(&wdir).map_err(ControllerError::Fs)? {
+            let e = entry.map_err(ControllerError::Fs)?;
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !(name.ends_with(".safetensors") || name.ends_with(".meta.json")) {
+                continue;
+            }
+            if let Some(idx) = parse_shard_idx_from_name(name) {
+                idxs.push(idx);
+            }
+        }
+        idxs.sort();
+        idxs.dedup();
+
+        for idx in idxs {
+            let st_src = wdir.join(format!("shard_{idx:06}.safetensors"));
+            let meta_src = wdir.join(format!("shard_{idx:06}.meta.json"));
+            if !(st_src.exists() && meta_src.exists()) {
+                continue;
+            }
+            let st_dst = replay_dir.join(format!("shard_{out_idx:06}.safetensors"));
+            let meta_dst = replay_dir.join(format!("shard_{out_idx:06}.meta.json"));
+            std::fs::rename(&st_src, &st_dst).map_err(ControllerError::Fs)?;
+            std::fs::rename(&meta_src, &meta_dst).map_err(ControllerError::Fs)?;
+            out_idx += 1;
+        }
+    }
     Ok(())
 }
 
@@ -1425,8 +1493,8 @@ fn run_gate(
             best_model_id: 0,
             cand_model_id: 1,
             client_opts: yz_infer::ClientOptions {
-                max_inflight_total: 8192,
-                max_outbound_queue: 8192,
+                max_inflight_total: 64,
+                max_outbound_queue: 256,
                 request_id_start: 1,
             },
             mcts_cfg: yz_mcts::MctsConfig {
@@ -1472,6 +1540,7 @@ fn run_gate(
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn cancel_kills_child_process() {
@@ -1556,6 +1625,58 @@ mod cancel_tests {
         assert_eq!(it.gate.games_completed, 0);
         assert_eq!(it.train.steps_target, Some(123));
         assert_eq!(it.train.steps_completed, None);
+    }
+
+    #[test]
+    fn merge_replay_workers_renumbers_shards_without_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let replay_workers = run_dir.join("replay_workers");
+        let replay = run_dir.join("replay");
+        fs::create_dir_all(replay_workers.join("worker_000")).unwrap();
+        fs::create_dir_all(replay_workers.join("worker_001")).unwrap();
+        fs::create_dir_all(&replay).unwrap();
+
+        // Create one shard per worker (both idx=0 in their local dirs).
+        fs::write(
+            replay_workers.join("worker_000").join("shard_000000.safetensors"),
+            b"st0",
+        )
+        .unwrap();
+        fs::write(
+            replay_workers.join("worker_000").join("shard_000000.meta.json"),
+            b"meta0",
+        )
+        .unwrap();
+
+        fs::write(
+            replay_workers.join("worker_001").join("shard_000000.safetensors"),
+            b"st1",
+        )
+        .unwrap();
+        fs::write(
+            replay_workers.join("worker_001").join("shard_000000.meta.json"),
+            b"meta1",
+        )
+        .unwrap();
+
+        merge_replay_workers(&replay_workers, &replay).unwrap();
+
+        // Expect two shards in the merged dir: idx 0 and 1.
+        assert!(replay.join("shard_000000.safetensors").exists());
+        assert!(replay.join("shard_000000.meta.json").exists());
+        assert!(replay.join("shard_000001.safetensors").exists());
+        assert!(replay.join("shard_000001.meta.json").exists());
+
+        // Worker dirs should no longer contain those files (renamed/moved).
+        assert!(!replay_workers
+            .join("worker_000")
+            .join("shard_000000.safetensors")
+            .exists());
+        assert!(!replay_workers
+            .join("worker_001")
+            .join("shard_000000.safetensors")
+            .exists());
     }
 
     #[test]

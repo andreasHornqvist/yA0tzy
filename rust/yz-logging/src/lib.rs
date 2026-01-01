@@ -5,6 +5,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Instant;
 
@@ -479,7 +481,8 @@ impl NdjsonWriter {
         let p = path.as_ref().to_path_buf();
         let f = OpenOptions::new().create(true).append(true).open(&p)?;
         Ok(Self {
-            w: BufWriter::new(f),
+            // Large buffer: reduces kernel write pressure and helps avoid long-tail stalls.
+            w: BufWriter::with_capacity(1 << 20, f),
             lines_since_flush: 0,
             flush_every_lines,
             path: Some(p),
@@ -555,13 +558,52 @@ fn log_debug_outlier(
         }
     });
     let line = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
+    dbg_outlier_send(line);
     Ok(())
+}
+// endregion agent log
+
+// region agent log
+static DBG_OUTLIER_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+
+fn dbg_outlier_send(line: String) {
+    let tx = DBG_OUTLIER_TX.get_or_init(|| dbg_outlier_start().unwrap_or_else(dbg_outlier_drop));
+    let _ = tx.send(line);
+}
+
+fn dbg_outlier_drop() -> mpsc::Sender<String> {
+    let (tx, _rx) = mpsc::channel::<String>();
+    tx
+}
+
+fn dbg_outlier_start() -> Option<mpsc::Sender<String>> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("yz-logging-debuglog".to_string())
+        .spawn(move || {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+                .ok();
+            let mut bw = f.as_mut().map(|ff| BufWriter::with_capacity(1 << 20, ff));
+            let mut n: u32 = 0;
+            let mut last = Instant::now();
+            while let Ok(line) = rx.recv() {
+                if let Some(w) = bw.as_mut() {
+                    let _ = w.write_all(line.as_bytes());
+                    let _ = w.write_all(b"\n");
+                    n += 1;
+                    if n >= 1024 || last.elapsed().as_millis() >= 250 {
+                        let _ = w.flush();
+                        n = 0;
+                        last = Instant::now();
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
 }
 // endregion agent log
 
