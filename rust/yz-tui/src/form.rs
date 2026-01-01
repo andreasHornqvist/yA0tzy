@@ -4,38 +4,29 @@ use crossterm::event::KeyModifiers;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    Inference,
-    Mcts,
-    Selfplay,
-    Training,
-    Gating,
-    Replay,
-    Controller,
-    Model,
+    System,   // Inference server settings
+    Search,   // MCTS algorithm params
+    Pipeline, // Controller (iterations) + Self-play + Gating
+    Learning, // Training + Model
+    Data,     // Replay
 }
 
 impl Section {
-    pub const ALL: [Section; 8] = [
-        Section::Inference,
-        Section::Mcts,
-        Section::Selfplay,
-        Section::Training,
-        Section::Gating,
-        Section::Replay,
-        Section::Controller,
-        Section::Model,
+    pub const ALL: [Section; 5] = [
+        Section::System,
+        Section::Search,
+        Section::Pipeline,
+        Section::Learning,
+        Section::Data,
     ];
 
     pub fn title(&self) -> &'static str {
         match self {
-            Section::Inference => "Inference",
-            Section::Mcts => "MCTS",
-            Section::Selfplay => "Self-play",
-            Section::Training => "Training",
-            Section::Gating => "Gating",
-            Section::Replay => "Replay",
-            Section::Controller => "Controller",
-            Section::Model => "Model",
+            Section::System => "System",
+            Section::Search => "Search",
+            Section::Pipeline => "Pipeline",
+            Section::Learning => "Learning",
+            Section::Data => "Data",
         }
     }
 }
@@ -68,6 +59,7 @@ pub enum FieldId {
     SelfplayThreadsPerWorker,
 
     // training
+    TrainingMode, // Toggle between epochs and steps mode
     TrainingBatchSize,
     TrainingLearningRate,
     TrainingEpochs,
@@ -96,13 +88,15 @@ pub enum FieldId {
 impl FieldId {
     pub fn section(&self) -> Section {
         match self {
+            // System: Inference server settings
             FieldId::InferBind
             | FieldId::InferDevice
             | FieldId::InferMaxBatch
             | FieldId::InferMaxWaitUs
             | FieldId::InferTorchThreads
-            | FieldId::InferTorchInteropThreads => Section::Inference,
+            | FieldId::InferTorchInteropThreads => Section::System,
 
+            // Search: MCTS algorithm params
             FieldId::MctsCPuct
             | FieldId::MctsBudgetReroll
             | FieldId::MctsBudgetMark
@@ -112,29 +106,32 @@ impl FieldId {
             | FieldId::MctsTempKind
             | FieldId::MctsTempT0
             | FieldId::MctsTempT1
-            | FieldId::MctsTempCutoffPly => Section::Mcts,
+            | FieldId::MctsTempCutoffPly => Section::Search,
 
-            FieldId::SelfplayGamesPerIteration
+            // Pipeline: Controller (iterations) + Self-play + Gating
+            FieldId::ControllerTotalIterations
+            | FieldId::SelfplayGamesPerIteration
             | FieldId::SelfplayWorkers
-            | FieldId::SelfplayThreadsPerWorker => Section::Selfplay,
-
-            FieldId::TrainingBatchSize
-            | FieldId::TrainingLearningRate
-            | FieldId::TrainingEpochs => Section::Training,
-            FieldId::TrainingWeightDecay | FieldId::TrainingStepsPerIteration => Section::Training,
-
-            FieldId::GatingGames
+            | FieldId::SelfplayThreadsPerWorker
+            | FieldId::GatingGames
             | FieldId::GatingSeed
             | FieldId::GatingSeedSetId
             | FieldId::GatingWinRateThreshold
             | FieldId::GatingPairedSeedSwap
-            | FieldId::GatingDeterministicChance => Section::Gating,
+            | FieldId::GatingDeterministicChance => Section::Pipeline,
 
-            FieldId::ReplayCapacityShards => Section::Replay,
+            // Learning: Training + Model
+            FieldId::TrainingMode
+            | FieldId::TrainingBatchSize
+            | FieldId::TrainingLearningRate
+            | FieldId::TrainingEpochs
+            | FieldId::TrainingWeightDecay
+            | FieldId::TrainingStepsPerIteration
+            | FieldId::ModelHiddenDim
+            | FieldId::ModelNumBlocks => Section::Learning,
 
-            FieldId::ControllerTotalIterations => Section::Controller,
-
-            FieldId::ModelHiddenDim | FieldId::ModelNumBlocks => Section::Model,
+            // Data: Replay
+            FieldId::ReplayCapacityShards => Section::Data,
         }
     }
 
@@ -162,6 +159,7 @@ impl FieldId {
             FieldId::SelfplayWorkers => "selfplay.workers",
             FieldId::SelfplayThreadsPerWorker => "selfplay.threads_per_worker",
 
+            FieldId::TrainingMode => "training.mode",
             FieldId::TrainingBatchSize => "training.batch_size",
             FieldId::TrainingLearningRate => "training.learning_rate",
             FieldId::TrainingEpochs => "training.epochs",
@@ -236,14 +234,14 @@ impl fmt::Display for StepSize {
 }
 
 pub const ALL_FIELDS: &[FieldId] = &[
-    // inference
+    // System: Inference server settings
     FieldId::InferBind,
     FieldId::InferDevice,
     FieldId::InferMaxBatch,
     FieldId::InferMaxWaitUs,
     FieldId::InferTorchThreads,
     FieldId::InferTorchInteropThreads,
-    // mcts
+    // Search: MCTS algorithm params
     FieldId::MctsCPuct,
     FieldId::MctsBudgetReroll,
     FieldId::MctsBudgetMark,
@@ -254,28 +252,26 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::MctsTempT0,
     FieldId::MctsTempT1,
     FieldId::MctsTempCutoffPly,
-    // selfplay
+    // Pipeline: Controller (iterations) + Self-play + Gating
+    FieldId::ControllerTotalIterations,
     FieldId::SelfplayGamesPerIteration,
     FieldId::SelfplayWorkers,
     FieldId::SelfplayThreadsPerWorker,
-    // training
-    FieldId::TrainingBatchSize,
-    FieldId::TrainingLearningRate,
-    FieldId::TrainingEpochs,
-    FieldId::TrainingWeightDecay,
-    FieldId::TrainingStepsPerIteration,
-    // gating
     FieldId::GatingGames,
     FieldId::GatingSeed,
     FieldId::GatingSeedSetId,
     FieldId::GatingWinRateThreshold,
     FieldId::GatingPairedSeedSwap,
     FieldId::GatingDeterministicChance,
-    // replay
-    FieldId::ReplayCapacityShards,
-    // controller
-    FieldId::ControllerTotalIterations,
-    // model
+    // Learning: Training + Model
+    FieldId::TrainingMode,
+    FieldId::TrainingBatchSize,
+    FieldId::TrainingLearningRate,
+    FieldId::TrainingEpochs,
+    FieldId::TrainingWeightDecay,
+    FieldId::TrainingStepsPerIteration,
     FieldId::ModelHiddenDim,
     FieldId::ModelNumBlocks,
+    // Data: Replay
+    FieldId::ReplayCapacityShards,
 ];

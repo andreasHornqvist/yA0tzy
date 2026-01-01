@@ -264,9 +264,11 @@ impl Default for Config {
             },
             mcts: MctsConfig {
                 c_puct: 1.5,
-                budget_reroll: 100,
-                budget_mark: 100,
-                max_inflight_per_game: 4,
+                // Perf default: 400 sims for both decision types (matches common benchmarking target).
+                budget_reroll: 400,
+                budget_mark: 400,
+                // Per-game leaf eval concurrency cap (keeps “leaf batching per game” <= 8).
+                max_inflight_per_game: 8,
                 dirichlet_alpha: default_dirichlet_alpha(),
                 dirichlet_epsilon: default_dirichlet_epsilon(),
                 temperature_schedule: TemperatureSchedule::default(),
@@ -311,7 +313,7 @@ mod tests {
         // Verify some expected values
         assert_eq!(config.inference.device, "cpu");
         assert_eq!(config.inference.max_batch, 32);
-        assert_eq!(config.mcts.budget_reroll, 100);
+        assert_eq!(config.mcts.budget_reroll, 400);
         assert_eq!(config.selfplay.workers, 4);
         assert_eq!(config.training.batch_size, 256);
         assert!((config.training.weight_decay - 0.0001).abs() < 1e-9);

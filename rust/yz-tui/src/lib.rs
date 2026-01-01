@@ -19,7 +19,7 @@ use crossterm::terminal::{
 use crossterm::{execute, ExecutableCommand};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use ratatui::Terminal;
@@ -31,6 +31,7 @@ use yz_logging::RunManifestV1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Home,
+    NamingRun, // Input mode for naming a new run
     Config,
     Dashboard,
 }
@@ -51,6 +52,9 @@ struct App {
     dashboard_err: Option<String>,
 
     iter: Option<yz_controller::IterationHandle>,
+
+    /// Input buffer for naming a new run.
+    naming_input: String,
 }
 
 impl App {
@@ -62,11 +66,12 @@ impl App {
             runs: Vec::new(),
             selected: 0,
             active_run_id: None,
-            cfg: yz_core::Config::default(),
+            cfg: crate::config_io::default_cfg_for_new_run(),
             form: FormState::default(),
             dashboard_manifest: None,
             dashboard_err: None,
             iter: None,
+            naming_input: String::new(),
         }
     }
 
@@ -85,17 +90,39 @@ impl App {
         }
     }
 
-    fn create_run(&mut self) -> io::Result<()> {
+    fn create_run_with_name(&mut self, name: &str) -> io::Result<()> {
         std::fs::create_dir_all(&self.runs_dir)?;
-        let ts = yz_logging::now_ms();
-        let id = format!("run_{ts}");
-        let dir = self.runs_dir.join(&id);
+        // Sanitize name for filesystem: replace invalid chars with underscore
+        let sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        // Use sanitized name if non-empty, otherwise fallback to timestamp
+        let id = if sanitized.is_empty() {
+            let ts = yz_logging::now_ms();
+            format!("run_{ts}")
+        } else {
+            sanitized
+        };
+        // Ensure unique name by appending timestamp if directory exists
+        let mut final_id = id.clone();
+        if self.runs_dir.join(&final_id).exists() {
+            let ts = yz_logging::now_ms();
+            final_id = format!("{id}_{ts}");
+        }
+        let dir = self.runs_dir.join(&final_id);
         std::fs::create_dir_all(dir.join("logs"))?;
         std::fs::create_dir_all(dir.join("models"))?;
         std::fs::create_dir_all(dir.join("replay"))?;
-        self.status = format!("Created {id}");
+        self.status = format!("Created {final_id}");
         self.refresh_runs();
-        self.selected = self.runs.iter().position(|r| r == &id).unwrap_or(0);
+        self.selected = self.runs.iter().position(|r| r == &final_id).unwrap_or(0);
         Ok(())
     }
 
@@ -177,7 +204,7 @@ impl App {
         }
         self.refresh_dashboard();
         self.screen = Screen::Dashboard;
-        self.status = "Dashboard: r refresh | x cancel | Esc back | q quit".to_string();
+        self.status = "r refresh | x cancel | Esc back | q quit".to_string();
     }
 
     fn start_iteration(&mut self) {
@@ -230,10 +257,10 @@ impl App {
 fn config_help(form: &FormState) -> String {
     match form.edit_mode {
         EditMode::View => {
-            "Config: ↑/↓ select | Enter edit | ←/→ step | Shift+←/→ big step | Space toggle/cycle | Tab section | s save draft | g start | d dashboard | Esc back | q quit"
+            "↑/↓ select | Enter edit | ←/→ step | Shift+←/→ big step | Space toggle | Tab section | s save | g start | d dashboard | Esc back | q quit"
                 .to_string()
         }
-        EditMode::Editing => "Editing: type | Backspace | Enter commit | Esc cancel".to_string(),
+        EditMode::Editing => "type | Backspace | Enter commit | Esc cancel".to_string(),
     }
 }
 
@@ -286,9 +313,9 @@ pub fn run() -> io::Result<()> {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('r') => app.refresh_runs(),
                         KeyCode::Char('n') => {
-                            if let Err(e) = app.create_run() {
-                                app.status = format!("create failed: {e}");
-                            }
+                            app.naming_input.clear();
+                            app.screen = Screen::NamingRun;
+                            app.status = "Enter run name (Enter to confirm, Esc to cancel)".to_string();
                         }
                         KeyCode::Enter => app.enter_selected_run(),
                         KeyCode::Up => {
@@ -299,6 +326,30 @@ pub fn run() -> io::Result<()> {
                         KeyCode::Down => {
                             if app.selected + 1 < app.runs.len() {
                                 app.selected += 1;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Screen::NamingRun => match k.code {
+                        KeyCode::Esc => {
+                            app.screen = Screen::Home;
+                            app.naming_input.clear();
+                            app.refresh_runs();
+                        }
+                        KeyCode::Enter => {
+                            let name = app.naming_input.clone();
+                            app.screen = Screen::Home;
+                            if let Err(e) = app.create_run_with_name(&name) {
+                                app.status = format!("create failed: {e}");
+                            }
+                            app.naming_input.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.naming_input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            if !c.is_control() {
+                                app.naming_input.push(c);
                             }
                         }
                         _ => {}
@@ -336,10 +387,17 @@ pub fn run() -> io::Result<()> {
                     let h = app.iter.take().unwrap();
                     match h.join() {
                         Ok(()) => {
-                            app.status = "iteration completed".to_string();
+                            app.status =
+                                "Completed | r refresh | g start | Esc back | q quit".to_string();
                         }
                         Err(e) => {
-                            app.status = format!("iteration failed: {}", e);
+                            let msg = if matches!(e, yz_controller::ControllerError::Cancelled) {
+                                "Cancelled"
+                            } else {
+                                "Failed"
+                            };
+                            app.status =
+                                format!("{msg} | r refresh | g start | Esc back | q quit");
                         }
                     }
                     app.refresh_dashboard();
@@ -469,6 +527,17 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 },
                 TemperatureSchedule::Step { .. } => TemperatureSchedule::Constant { t0 },
             };
+        }
+        FieldId::TrainingMode => {
+            // Toggle between epochs mode (steps_per_iteration=None) and steps mode
+            if app.cfg.training.steps_per_iteration.is_some() {
+                // Currently in steps mode → switch to epochs mode
+                app.cfg.training.steps_per_iteration = None;
+            } else {
+                // Currently in epochs mode → switch to steps mode
+                // Default to 500 steps if not set
+                app.cfg.training.steps_per_iteration = Some(500);
+            }
         }
         _ => {}
     }
@@ -624,6 +693,21 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
             Ok(())
         }
 
+        FieldId::TrainingMode => {
+            match buf.trim().to_lowercase().as_str() {
+                "epochs" => {
+                    cfg.training.steps_per_iteration = None;
+                    Ok(())
+                }
+                "steps" => {
+                    if cfg.training.steps_per_iteration.is_none() {
+                        cfg.training.steps_per_iteration = Some(500);
+                    }
+                    Ok(())
+                }
+                _ => Err("expected 'epochs' or 'steps'".to_string()),
+            }
+        }
         FieldId::TrainingBatchSize => {
             cfg.training.batch_size = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
             Ok(())
@@ -758,6 +842,13 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::SelfplayWorkers => cfg.selfplay.workers.to_string(),
         FieldId::SelfplayThreadsPerWorker => cfg.selfplay.threads_per_worker.to_string(),
 
+        FieldId::TrainingMode => {
+            if cfg.training.steps_per_iteration.is_some() {
+                "steps".to_string()
+            } else {
+                "epochs".to_string()
+            }
+        }
         FieldId::TrainingBatchSize => cfg.training.batch_size.to_string(),
         FieldId::TrainingLearningRate => format!("{:.6}", cfg.training.learning_rate),
         FieldId::TrainingEpochs => cfg.training.epochs.to_string(),
@@ -925,6 +1016,15 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
             };
             true
         }
+        FieldId::TrainingMode => {
+            // Toggle between epochs and steps mode on left/right
+            if next.training.steps_per_iteration.is_some() {
+                next.training.steps_per_iteration = None;
+            } else {
+                next.training.steps_per_iteration = Some(500);
+            }
+            true
+        }
         FieldId::TrainingBatchSize => {
             let inc = if step == StepSize::Large { 256 } else { 32 };
             next.training.batch_size = if dir >= 0 {
@@ -1070,6 +1170,38 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             let list = List::new(items).block(Block::default().title(title).borders(Borders::ALL));
             f.render_widget(list, chunks[0]);
         }
+        Screen::NamingRun => {
+            let title = Line::from(vec![
+                Span::styled("New Run", Style::default().add_modifier(Modifier::BOLD)),
+            ]);
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Enter a name for the new run:"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  ▸ "),
+                Span::styled(
+                    if app.naming_input.is_empty() {
+                        "(leave empty for auto-generated name)".to_string()
+                    } else {
+                        app.naming_input.clone()
+                    },
+                    if app.naming_input.is_empty() {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Enter to confirm, Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let p = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
+            f.render_widget(p, chunks[0]);
+        }
         Screen::Config => {
             let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
             let title = Line::from(vec![
@@ -1084,9 +1216,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::Dashboard => {
             let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
             let title = Line::from(vec![
-                Span::styled("Dashboard", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("Performance", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
-                Span::raw(format!("run={rid}")),
+                Span::raw(rid.to_string()),
             ]);
 
             let cols = Layout::default()
@@ -1094,19 +1226,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(chunks[0]);
 
-            // Left: iteration history (across iterations).
+            // Left: iteration history table.
             let mut left: Vec<Line> = Vec::new();
             match (&app.dashboard_manifest, &app.dashboard_err) {
                 (Some(m), _) => {
-                    left.push(Line::from("Across iterations"));
-                    left.push(Line::from(""));
+                    // Header row
+                    left.push(Line::from(Span::styled(
+                        " Iter   Decision   WinRate   Oracle    Loss (t/p/v)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
 
                     let cur_idx = m.controller_iteration_idx;
                     if m.iterations.is_empty() {
-                        left.push(Line::from("(no iterations yet)"));
+                        left.push(Line::from(""));
+                        left.push(Line::from(" (no iterations yet)"));
                     } else {
                         for it in &m.iterations {
-                            let marker = if it.idx == cur_idx { ">" } else { " " };
+                            let marker = if it.idx == cur_idx { "▸" } else { " " };
                             let promo = it
                                 .promoted
                                 .map(|p| if p { "promote" } else { "reject" })
@@ -1137,73 +1273,148 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                                 .map(|x| format!("{x:.3}"))
                                 .unwrap_or_else(|| "-".to_string());
 
-                            left.push(Line::from(format!(
-                                "{marker} iter {:>3} | {promo:>7} | wr {wr:>6} | oracle {oracle:>6} | loss t/p/v {lt:>6}/{lp:>6}/{lv:>6}",
-                                it.idx
+                            let row_style = if it.idx == cur_idx {
+                                Style::default().fg(Color::Cyan)
+                            } else {
+                                Style::default()
+                            };
+                            left.push(Line::from(Span::styled(
+                                format!(
+                                    "{marker} {:>3}   {promo:>7}   {wr:>6}   {oracle:>6}   {lt:>5}/{lp:>5}/{lv:>5}",
+                                    it.idx
+                                ),
+                                row_style,
                             )));
                         }
                     }
                 }
                 (_, Some(e)) => {
-                    left.push(Line::from("Across iterations"));
-                    left.push(Line::from(""));
-                    left.push(Line::from(format!("(dashboard unavailable: {e})")));
+                    left.push(Line::from(format!(" (unavailable: {e})")));
                 }
                 _ => {
-                    left.push(Line::from("Across iterations"));
-                    left.push(Line::from(""));
-                    left.push(Line::from("(no run selected)"));
+                    left.push(Line::from(" (no run selected)"));
                 }
             }
             let left_p = Paragraph::new(left)
                 .block(Block::default().title(title.clone()).borders(Borders::ALL));
             f.render_widget(left_p, cols[0]);
 
-            // Right: live phase view + progress bars.
+            // Right: phase view + progress bars.
             let mut right_lines: Vec<Line> = Vec::new();
             let mut gauge: Option<(f64, String)> = None;
+            let mut phase_title = "Phase".to_string();
             if let Some(m) = &app.dashboard_manifest {
                 let phase = m.controller_phase.as_deref().unwrap_or("?");
                 let status = m.controller_status.as_deref().unwrap_or("");
-                right_lines.push(Line::from(format!("Live ({phase})")));
-                if !status.is_empty() {
-                    right_lines.push(Line::from(format!("status: {status}")));
-                }
-                if let Some(e) = m.controller_error.as_deref() {
-                    if !e.is_empty() {
-                        right_lines.push(Line::from(format!("error: {e}")));
+                let is_cancelled = status == "cancelled"
+                    || m.controller_error.as_deref() == Some("cancelled");
+                // Set phase title for block
+                phase_title = match phase {
+                    "selfplay" => "Phase: Self-play".to_string(),
+                    "train" => "Phase: Training".to_string(),
+                    "gate" => "Phase: Gating".to_string(),
+                    "idle" => "Phase: Idle".to_string(),
+                    "error" if is_cancelled => "Phase: Cancelled".to_string(),
+                    "error" => "Phase: Error".to_string(),
+                    other => format!("Phase: {other}"),
+                };
+                // Show status/error message, but avoid duplicating "cancelled"
+                if is_cancelled {
+                    right_lines.push(Line::from("Run was cancelled."));
+                } else {
+                    if !status.is_empty() {
+                        right_lines.push(Line::from(format!("{status}")));
+                    }
+                    if let Some(e) = m.controller_error.as_deref() {
+                        if !e.is_empty() {
+                            right_lines.push(Line::from(format!("error: {e}")));
+                        }
                     }
                 }
-                // E13.2S5: Show model reload count.
-                if m.model_reloads > 0 {
-                    right_lines.push(Line::from(format!("model_reloads: {}", m.model_reloads)));
+                if !right_lines.is_empty() {
+                    right_lines.push(Line::from(""));
                 }
-                right_lines.push(Line::from(""));
 
                 let cur_idx = m.controller_iteration_idx;
                 let cur = m.iterations.iter().find(|it| it.idx == cur_idx);
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
                 if let Some(it) = cur {
                     match phase {
                         "selfplay" => {
                             let done = it.selfplay.games_completed;
                             let tot = it.selfplay.games_target.max(1);
-                            gauge = Some((done as f64 / tot as f64, format!("{done}/{tot} games")));
+                            right_lines.push(Line::from(format!("{done} / {tot} games")));
+                            gauge = Some((done as f64 / tot as f64, String::new()));
+
+                            // Timing stats
+                            if let Some(started) = it.selfplay.started_ts_ms {
+                                let elapsed_ms = now_ms.saturating_sub(started);
+                                if done > 0 {
+                                    let avg_ms = elapsed_ms / done as u64;
+                                    let remaining = tot.saturating_sub(done);
+                                    let eta_ms = avg_ms * remaining as u64;
+                                    let avg_s = avg_ms as f64 / 1000.0;
+                                    let eta_s = eta_ms / 1000;
+                                    let eta_m = eta_s / 60;
+                                    let eta_s_rem = eta_s % 60;
+                                    right_lines.push(Line::from(format!(
+                                        "avg: {avg_s:.1}s/game  ETA: {eta_m}m {eta_s_rem}s"
+                                    )));
+                                }
+                            }
                         }
                         "gate" => {
                             let done = it.gate.games_completed;
                             let tot = it.gate.games_target.max(1);
-                            gauge = Some((done as f64 / tot as f64, format!("{done}/{tot} games")));
+                            right_lines.push(Line::from(format!("{done} / {tot} games")));
+                            gauge = Some((done as f64 / tot as f64, String::new()));
+
+                            // Timing stats
+                            if let Some(started) = it.gate.started_ts_ms {
+                                let elapsed_ms = now_ms.saturating_sub(started);
+                                if done > 0 {
+                                    let avg_ms = elapsed_ms / done as u64;
+                                    let remaining = tot.saturating_sub(done);
+                                    let eta_ms = avg_ms * remaining as u64;
+                                    let avg_s = avg_ms as f64 / 1000.0;
+                                    let eta_s = eta_ms / 1000;
+                                    let eta_m = eta_s / 60;
+                                    let eta_s_rem = eta_s % 60;
+                                    right_lines.push(Line::from(format!(
+                                        "avg: {avg_s:.1}s/game  ETA: {eta_m}m {eta_s_rem}s"
+                                    )));
+                                }
+                            }
                         }
                         "train" => {
                             if let Some(tot) = it.train.steps_target {
                                 let done = it.train.steps_completed.unwrap_or(0);
                                 let tot = tot.max(1);
-                                gauge =
-                                    Some((done as f64 / tot as f64, format!("{done}/{tot} steps")));
+                                right_lines.push(Line::from(format!("{done} / {tot} steps")));
+                                gauge = Some((done as f64 / tot as f64, String::new()));
+
+                                // Timing stats
+                                if let Some(started) = it.train.started_ts_ms {
+                                    let elapsed_ms = now_ms.saturating_sub(started);
+                                    if done > 0 {
+                                        let avg_ms = elapsed_ms / done as u64;
+                                        let remaining = tot.saturating_sub(done);
+                                        let eta_ms = avg_ms * remaining as u64;
+                                        let avg_s = avg_ms as f64 / 1000.0;
+                                        let eta_s = eta_ms / 1000;
+                                        let eta_m = eta_s / 60;
+                                        let eta_s_rem = eta_s % 60;
+                                        right_lines.push(Line::from(format!(
+                                            "avg: {avg_s:.1}s/step  ETA: {eta_m}m {eta_s_rem}s"
+                                        )));
+                                    }
+                                }
                             } else if let Some(done) = it.train.steps_completed {
-                                right_lines.push(Line::from(format!("train_step: {done}")));
-                            } else {
-                                right_lines.push(Line::from("train_step: -"));
+                                right_lines.push(Line::from(format!("step: {done}")));
                             }
 
                             if let Some(v) = it.train.last_loss_total {
@@ -1220,39 +1431,33 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     }
                 } else if phase == "idle" {
                     right_lines.push(Line::from("No iteration running."));
-                    right_lines.push(Line::from(""));
-                    right_lines.push(Line::from("Press Esc → Config → 'g' to start."));
                 } else {
                     right_lines.push(Line::from(format!(
                         "no iteration summary for idx={cur_idx}"
                     )));
                 }
             } else if let Some(e) = &app.dashboard_err {
-                right_lines.push(Line::from("Live"));
-                right_lines.push(Line::from(""));
-                right_lines.push(Line::from(format!("(dashboard unavailable: {e})")));
+                right_lines.push(Line::from(format!("(unavailable: {e})")));
             } else {
-                right_lines.push(Line::from("Live"));
-                right_lines.push(Line::from(""));
                 right_lines.push(Line::from("(no data)"));
             }
 
-            let right_block = Block::default().title("Live").borders(Borders::ALL);
-            if let Some((ratio, label)) = gauge {
+            let right_block = Block::default().title(phase_title).borders(Borders::ALL);
+            if let Some((ratio, _label)) = gauge {
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(6),
+                        Constraint::Min(5),
                         Constraint::Length(3),
-                        Constraint::Min(0),
                     ])
                     .split(cols[1]);
                 let p = Paragraph::new(right_lines).block(right_block);
                 f.render_widget(p, rows[0]);
+                // Progress bar without label overlay - label is shown as text above
                 let g = Gauge::default()
-                    .block(Block::default().title("Progress").borders(Borders::ALL))
+                    .block(Block::default().borders(Borders::ALL))
                     .ratio(ratio.clamp(0.0, 1.0))
-                    .label(label);
+                    .gauge_style(Style::default().fg(Color::Cyan));
                 f.render_widget(g, rows[1]);
             } else {
                 let p = Paragraph::new(right_lines).block(right_block);
@@ -1262,7 +1467,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 
     let help = Paragraph::new(app.status.clone())
-        .block(Block::default().title("Status").borders(Borders::ALL));
+        .block(Block::default().title("Commands").borders(Borders::ALL));
     f.render_widget(help, chunks[1]);
 }
 
@@ -1289,6 +1494,14 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
             {
                 continue;
             }
+            // Hide epochs field when in steps mode.
+            if f == FieldId::TrainingEpochs && app.cfg.training.steps_per_iteration.is_some() {
+                continue;
+            }
+            // Hide steps_per_iteration field when in epochs mode.
+            if f == FieldId::TrainingStepsPerIteration && app.cfg.training.steps_per_iteration.is_none() {
+                continue;
+            }
             rows.push(Row::Field(f));
         }
         rows.push(Row::Spacer);
@@ -1311,20 +1524,40 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
     }
 
     // Scroll to keep selection visible.
+    // Ensure the selected row is always within the visible window.
     let height = view_height.max(1);
-    let start = selected_row.saturating_sub(height / 2);
+    let start = if selected_row < height {
+        0
+    } else {
+        // Keep selected row in the lower third of the view for better context
+        selected_row.saturating_sub(height * 2 / 3)
+    };
     let end = (start + height).min(rows.len());
+    // Adjust start if we're near the end to fill the view
+    let start = if end == rows.len() && rows.len() > height {
+        rows.len().saturating_sub(height)
+    } else {
+        start
+    };
     let slice = &rows[start..end];
 
     let mut out: Vec<Line<'static>> = Vec::new();
     for r in slice {
         match r {
-            Row::Header(t) => out.push(Line::from(vec![Span::styled(
-                *t,
-                Style::default().add_modifier(Modifier::BOLD),
-            )])),
+            Row::Header(t) => {
+                // Section headers in dimmed gray with bold
+                out.push(Line::from(vec![Span::styled(
+                    format!("─── {t} ───"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+            }
             Row::Spacer => out.push(Line::from("")),
-            Row::Error(e) => out.push(Line::from(e.clone())),
+            Row::Error(e) => out.push(Line::from(vec![Span::styled(
+                e.clone(),
+                Style::default().fg(Color::Red),
+            )])),
             Row::Field(f) => {
                 let is_sel = *f == selected_field;
                 let label = f.label();
@@ -1333,15 +1566,34 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
                 } else {
                     field_value_string(&app.cfg, *f)
                 };
-                let prefix = if is_sel { "> " } else { "  " };
-                let line = format!("{prefix}{label} = {v}");
+                let prefix = if is_sel { "▸ " } else { "  " };
                 if is_sel {
-                    out.push(Line::from(vec![Span::styled(
-                        line,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )]));
+                    // Selected field: cyan with bold
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            format!("{prefix}{label}"),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " = ",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            v,
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
                 } else {
-                    out.push(Line::from(line));
+                    // Non-selected field: dimmer styling
+                    out.push(Line::from(vec![
+                        Span::raw(format!("{prefix}{label}")),
+                        Span::styled(" = ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(v, Style::default().fg(Color::Gray)),
+                    ]));
                 }
             }
         }

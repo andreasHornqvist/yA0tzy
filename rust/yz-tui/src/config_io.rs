@@ -5,6 +5,45 @@ use yz_core::Config;
 pub const CONFIG_DRAFT_NAME: &str = "config.draft.yaml";
 pub const DEFAULT_CONFIG_PATH: &str = "configs/local_cpu.yaml";
 
+pub fn default_cfg_for_new_run() -> Config {
+    let mut cfg = load_default_config();
+
+    // Sane perf defaults for the local machine (TUI convenience).
+    // - Use multiple OS worker processes (controller now spawns processes)
+    // - Keep per-game inflight <= 8 (user preference)
+    // - Default to 400 sims for both mark + reroll
+    cfg.mcts.budget_reroll = 400;
+    cfg.mcts.budget_mark = 400;
+    cfg.mcts.max_inflight_per_game = 8;
+
+    // Use most cores, but leave some headroom for the Python inference server + OS.
+    // On this machine `available_parallelism()` is reliable and cross-platform.
+    if let Ok(n) = std::thread::available_parallelism() {
+        let logical = n.get() as u32;
+        let workers = logical.saturating_sub(2).max(1);
+        cfg.selfplay.workers = workers;
+        // Start with a small number of concurrent games per worker process.
+        cfg.selfplay.threads_per_worker = if logical >= 8 { 2 } else { 1 };
+        // Sane torch thread defaults: estimate physical cores (~logical/2), min 4.
+        // torch_interop_threads = 2 is generally a good default for inference.
+        if cfg.inference.torch_threads.is_none() {
+            cfg.inference.torch_threads = Some((logical / 2).max(4));
+        }
+        if cfg.inference.torch_interop_threads.is_none() {
+            cfg.inference.torch_interop_threads = Some(2);
+        }
+    } else {
+        // Fallback if parallelism detection fails.
+        if cfg.inference.torch_threads.is_none() {
+            cfg.inference.torch_threads = Some(4);
+        }
+        if cfg.inference.torch_interop_threads.is_none() {
+            cfg.inference.torch_interop_threads = Some(2);
+        }
+    }
+    cfg
+}
+
 pub fn draft_path(run_dir: &Path) -> PathBuf {
     run_dir.join(CONFIG_DRAFT_NAME)
 }
@@ -39,7 +78,7 @@ pub fn load_cfg_for_run(run_dir: &Path) -> (Config, Option<String>) {
         }
     }
     // For new runs, try to load from configs/local_cpu.yaml as the default template.
-    let default_cfg = load_default_config();
+    let default_cfg = default_cfg_for_new_run();
     let msg = if Path::new(DEFAULT_CONFIG_PATH).exists() {
         format!("Loaded {}", DEFAULT_CONFIG_PATH)
     } else {
