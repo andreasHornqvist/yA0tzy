@@ -474,6 +474,9 @@ pub fn run_selfplay_then_gate(
     // E13.2S4: Hot-reload best + candidate models before gating.
     manifest.model_reloads += reload_models_for_gating(run_dir, &cfg)?;
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
+    // IMPORTANT: run_gate writes progress + final gate metrics into run.json using its own manifest.
+    // Refresh the in-memory manifest before finalize_iteration to avoid clobbering gate results.
+    manifest = yz_logging::read_manifest(run_dir.join("run.json"))?;
     finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
     ctrl.set_phase(Phase::Done, "done")?;
@@ -520,6 +523,8 @@ pub fn run_iteration(
     // E13.2S4: Hot-reload best + candidate models before gating.
     manifest.model_reloads += reload_models_for_gating(run_dir, &cfg)?;
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
+    // Refresh manifest after run_gate to avoid overwriting gate fields when finalizing.
+    manifest = yz_logging::read_manifest(run_dir.join("run.json"))?;
     finalize_iteration(run_dir, &cfg, &mut manifest, iter_idx)?;
 
     ctrl.set_phase(Phase::Done, "done")?;
@@ -634,6 +639,8 @@ pub fn spawn_iteration(
                 manifest.model_reloads += reload_models_for_gating(&run_dir, &cfg)?;
                 run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
 
+                // Refresh manifest after run_gate to avoid overwriting gate results in finalize_iteration.
+                manifest = yz_logging::read_manifest(run_dir.join("run.json"))?;
                 finalize_iteration(&run_dir, &cfg, &mut manifest, iter_idx)?;
                 manifest.controller_iteration_idx =
                     manifest.controller_iteration_idx.saturating_add(1);
