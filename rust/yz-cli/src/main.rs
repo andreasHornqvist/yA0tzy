@@ -1076,6 +1076,9 @@ OPTIONS:
         worker_id: u32,
         num_workers: u32,
         games_target: u32,
+        worker_stats: Option<yz_logging::NdjsonWriter>,
+        t_start: std::time::Instant,
+        first_done_logged: bool,
     }
     impl yz_eval::GateProgress for ProgressSink {
         fn on_game_completed(&mut self, completed: u32, _total: u32) {
@@ -1090,7 +1093,75 @@ OPTIONS:
                     ts_ms: yz_logging::now_ms(),
                 },
             );
+
+            if !self.first_done_logged && completed >= 1 {
+                if let Some(w) = self.worker_stats.as_mut() {
+                    let _ = w.write_event(&GateWorkerStatsEvent {
+                        event: "gate_worker_first_game_done",
+                        ts_ms: yz_logging::now_ms(),
+                        worker_id: self.worker_id,
+                        num_workers: self.num_workers,
+                        games_target: self.games_target,
+                        wall_ms: self.t_start.elapsed().as_millis() as u64,
+                    });
+                    let _ = w.flush();
+                }
+                self.first_done_logged = true;
+            }
         }
+    }
+
+    // Oracle diag log (ndjson, best-effort).
+    let mut oracle_log =
+        yz_logging::NdjsonWriter::open_append_with_flush(logs_dir.join("oracle_diag.ndjson"), 200)
+            .ok();
+    // Worker timing stats (ndjson, best-effort).
+    let mut worker_stats =
+        yz_logging::NdjsonWriter::open_append_with_flush(logs_dir.join("worker_stats.ndjson"), 50)
+            .ok();
+    #[derive(serde::Serialize)]
+    struct GateWorkerStatsEvent<'a> {
+        event: &'a str,
+        ts_ms: u64,
+        worker_id: u32,
+        num_workers: u32,
+        games_target: u32,
+        wall_ms: u64,
+    }
+    let t_start = std::time::Instant::now();
+    if let Some(w) = worker_stats.as_mut() {
+        let _ = w.write_event(&GateWorkerStatsEvent {
+            event: "gate_worker_start",
+            ts_ms: yz_logging::now_ms(),
+            worker_id,
+            num_workers,
+            games_target,
+            wall_ms: 0,
+        });
+        let _ = w.flush();
+    }
+
+    struct OracleSink<'a> {
+        w: &'a mut yz_logging::NdjsonWriter,
+    }
+    impl yz_eval::OracleDiagSink for OracleSink<'_> {
+        fn on_step(&mut self, ev: &yz_eval::OracleDiagEvent) {
+            // Best-effort; don't crash worker for logging.
+            let _ = self.w.write_event(ev);
+        }
+    }
+    let mut oracle_sink = oracle_log.as_mut().map(|w| OracleSink { w });
+
+    if let Some(w) = worker_stats.as_mut() {
+        let _ = w.write_event(&GateWorkerStatsEvent {
+            event: "gate_worker_first_game_start",
+            ts_ms: yz_logging::now_ms(),
+            worker_id,
+            num_workers,
+            games_target,
+            wall_ms: t_start.elapsed().as_millis() as u64,
+        });
+        let _ = w.flush();
     }
 
     let mut sink = ProgressSink {
@@ -1098,6 +1169,9 @@ OPTIONS:
         worker_id,
         num_workers,
         games_target,
+        worker_stats,
+        t_start,
+        first_done_logged: false,
     };
 
     let partial = yz_eval::gate_schedule_subset(
@@ -1111,6 +1185,9 @@ OPTIONS:
         },
         &schedule,
         Some(&mut sink),
+        oracle_sink
+            .as_mut()
+            .map(|s| s as &mut dyn yz_eval::OracleDiagSink),
     )
     .unwrap_or_else(|e| {
         eprintln!("gate-worker failed: {e}");
@@ -1130,6 +1207,18 @@ OPTIONS:
         },
     );
 
+    if let Some(w) = sink.worker_stats.as_mut() {
+        let _ = w.write_event(&GateWorkerStatsEvent {
+            event: "gate_worker_done",
+            ts_ms: yz_logging::now_ms(),
+            worker_id,
+            num_workers,
+            games_target,
+            wall_ms: t_start.elapsed().as_millis() as u64,
+        });
+        let _ = w.flush();
+    }
+
     #[derive(serde::Serialize, serde::Deserialize)]
     struct GateWorkerResult {
         worker_id: u32,
@@ -1139,13 +1228,6 @@ OPTIONS:
         draws: u32,
         cand_score_diff_sum: i64,
         cand_score_diff_sumsq: f64,
-        oracle_total: u64,
-        oracle_matched: u64,
-        oracle_total_mark: u64,
-        oracle_matched_mark: u64,
-        oracle_total_reroll: u64,
-        oracle_matched_reroll: u64,
-        oracle_keepall_ignored: u64,
     }
 
     let out_path = PathBuf::from(out_path);
@@ -1158,13 +1240,6 @@ OPTIONS:
         draws: partial.draws,
         cand_score_diff_sum: partial.cand_score_diff_sum,
         cand_score_diff_sumsq: partial.cand_score_diff_sumsq,
-        oracle_total: partial.oracle.total,
-        oracle_matched: partial.oracle.matched,
-        oracle_total_mark: partial.oracle.total_mark,
-        oracle_matched_mark: partial.oracle.matched_mark,
-        oracle_total_reroll: partial.oracle.total_reroll,
-        oracle_matched_reroll: partial.oracle.matched_reroll,
-        oracle_keepall_ignored: partial.oracle.oracle_keepall_ignored,
     };
     let bytes = serde_json::to_vec(&res).expect("serialize gate worker result");
     std::fs::write(&tmp, bytes).unwrap_or_else(|e| {
