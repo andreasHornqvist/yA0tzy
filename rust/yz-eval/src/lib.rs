@@ -23,11 +23,27 @@ struct OracleDiagStep {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct OracleDiagReport {
-    match_rate_overall: f64,
-    match_rate_mark: f64,
-    match_rate_reroll: f64,
-    oracle_keepall_ignored: u64,
+pub struct OracleDiagCounts {
+    pub total: u64,
+    pub matched: u64,
+    pub total_mark: u64,
+    pub matched_mark: u64,
+    pub total_reroll: u64,
+    pub matched_reroll: u64,
+    pub oracle_keepall_ignored: u64,
+}
+
+impl OracleDiagCounts {
+    pub fn merge(&mut self, other: &OracleDiagCounts) {
+        self.total = self.total.saturating_add(other.total);
+        self.matched = self.matched.saturating_add(other.matched);
+        self.total_mark = self.total_mark.saturating_add(other.total_mark);
+        self.matched_mark = self.matched_mark.saturating_add(other.matched_mark);
+        self.total_reroll = self.total_reroll.saturating_add(other.total_reroll);
+        self.matched_reroll = self.matched_reroll.saturating_add(other.matched_reroll);
+        self.oracle_keepall_ignored =
+            self.oracle_keepall_ignored.saturating_add(other.oracle_keepall_ignored);
+    }
 }
 
 fn should_ignore_oracle_action(a: oracle_mod::Action, rerolls_left: u8) -> bool {
@@ -37,79 +53,58 @@ fn should_ignore_oracle_action(a: oracle_mod::Action, rerolls_left: u8) -> bool 
     }
 }
 
-fn compute_oracle_diag(steps: &[OracleDiagStep]) -> OracleDiagReport {
-    // Hot loop avoidance: do one pass after all games complete.
+fn oracle_diag_update_counts(
+    oracle: &oracle_mod::YatzyDP,
+    s: &OracleDiagStep,
+    counts: &mut OracleDiagCounts,
+) {
+    let (oa, _ev) = oracle.best_action(
+        s.avail_mask,
+        s.upper_total_cap,
+        s.dice_sorted,
+        s.rerolls_left,
+    );
+    if should_ignore_oracle_action(oa, s.rerolls_left) {
+        counts.oracle_keepall_ignored += 1;
+        return;
+    }
+
+    let expected: yz_core::Action = match oa {
+        oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
+        oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
+    };
+
+    let is_match = expected == s.chosen_action;
+
+    counts.total += 1;
+    if is_match {
+        counts.matched += 1;
+    }
+
+    match s.chosen_action {
+        yz_core::Action::Mark(_) => {
+            counts.total_mark += 1;
+            if is_match {
+                counts.matched_mark += 1;
+            }
+        }
+        yz_core::Action::KeepMask(_) => {
+            counts.total_reroll += 1;
+            if is_match {
+                counts.matched_reroll += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn compute_oracle_diag_counts(steps: &[OracleDiagStep]) -> OracleDiagCounts {
     let oracle = oracle_mod::oracle();
-
-    let mut total: u64 = 0;
-    let mut matched: u64 = 0;
-
-    let mut total_mark: u64 = 0;
-    let mut matched_mark: u64 = 0;
-
-    let mut total_reroll: u64 = 0;
-    let mut matched_reroll: u64 = 0;
-
-    let mut keepall_ignored: u64 = 0;
-
+    let mut c = OracleDiagCounts::default();
     for s in steps {
-        let (oa, _ev) = oracle.best_action(
-            s.avail_mask,
-            s.upper_total_cap,
-            s.dice_sorted,
-            s.rerolls_left,
-        );
-        if should_ignore_oracle_action(oa, s.rerolls_left) {
-            keepall_ignored += 1;
-            continue;
-        }
-
-        let expected: yz_core::Action = match oa {
-            oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
-            oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
-        };
-
-        let is_match = expected == s.chosen_action;
-
-        total += 1;
-        if is_match {
-            matched += 1;
-        }
-
-        match s.chosen_action {
-            yz_core::Action::Mark(_) => {
-                total_mark += 1;
-                if is_match {
-                    matched_mark += 1;
-                }
-            }
-            yz_core::Action::KeepMask(_) => {
-                total_reroll += 1;
-                if is_match {
-                    matched_reroll += 1;
-                }
-            }
-        }
+        oracle_diag_update_counts(oracle, s, &mut c);
     }
-
-    OracleDiagReport {
-        match_rate_overall: if total == 0 {
-            0.0
-        } else {
-            matched as f64 / total as f64
-        },
-        match_rate_mark: if total_mark == 0 {
-            0.0
-        } else {
-            matched_mark as f64 / total_mark as f64
-        },
-        match_rate_reroll: if total_reroll == 0 {
-            0.0
-        } else {
-            matched_reroll as f64 / total_reroll as f64
-        },
-        oracle_keepall_ignored: keepall_ignored,
-    }
+    c
 }
 
 #[derive(Debug, Error)]
@@ -298,6 +293,103 @@ pub trait GateProgress {
     fn on_game_completed(&mut self, completed: u32, total: u32);
 }
 
+#[derive(Debug, Clone)]
+pub struct GatePlan {
+    pub schedule: Vec<GameSpec>,
+    pub seeds: Vec<u64>,
+    pub seeds_hash: String,
+    pub warnings: Vec<String>,
+}
+
+pub fn gate_plan(cfg: &yz_core::Config) -> Result<GatePlan, GateError> {
+    let (schedule, seeds, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
+        if cfg.gating.paired_seed_swap && !cfg.gating.games.is_multiple_of(2) {
+            return Err(GateError::InvalidConfig(
+                "gating.games must be even when gating.paired_seed_swap=true",
+            ));
+        }
+        let seeds = load_seed_set(id)?;
+        gating_schedule_from_seed_set(&seeds, cfg.gating.games, cfg.gating.paired_seed_swap)
+    } else {
+        let seeds = derived_seed_list(
+            cfg.gating.seed,
+            cfg.gating.games,
+            cfg.gating.paired_seed_swap,
+        )?;
+        let schedule = schedule_from_seed_list(&seeds, cfg.gating.paired_seed_swap);
+        (schedule, seeds, Vec::new())
+    };
+
+    Ok(GatePlan {
+        seeds_hash: hash_seeds(&seeds),
+        schedule,
+        seeds,
+        warnings,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GatePartial {
+    pub games: u32,
+    pub cand_wins: u32,
+    pub cand_losses: u32,
+    pub draws: u32,
+    pub cand_score_diff_sum: i64,
+    pub cand_score_diff_sumsq: f64, // sum of (diff^2)
+    pub oracle: OracleDiagCounts,
+}
+
+impl GatePartial {
+    pub fn merge(&mut self, other: &GatePartial) {
+        self.games = self.games.saturating_add(other.games);
+        self.cand_wins = self.cand_wins.saturating_add(other.cand_wins);
+        self.cand_losses = self.cand_losses.saturating_add(other.cand_losses);
+        self.draws = self.draws.saturating_add(other.draws);
+        self.cand_score_diff_sum = self.cand_score_diff_sum.saturating_add(other.cand_score_diff_sum);
+        self.cand_score_diff_sumsq += other.cand_score_diff_sumsq;
+        self.oracle.merge(&other.oracle);
+    }
+
+    pub fn into_report(self, plan: GatePlan) -> GateReport {
+        let mut report = GateReport::default();
+        report.games = self.games;
+        report.cand_wins = self.cand_wins;
+        report.cand_losses = self.cand_losses;
+        report.draws = self.draws;
+        report.cand_score_diff_sum = self.cand_score_diff_sum;
+        report.seeds = plan.seeds;
+        report.seeds_hash = plan.seeds_hash;
+        report.warnings = plan.warnings;
+
+        compute_score_diff_stats_from_moments(
+            self.cand_score_diff_sum,
+            self.cand_score_diff_sumsq,
+            self.games as u64,
+            &mut report,
+        );
+
+        // Oracle diag rates from counts
+        report.oracle_match_rate_overall = if self.oracle.total == 0 {
+            0.0
+        } else {
+            self.oracle.matched as f64 / self.oracle.total as f64
+        };
+        report.oracle_match_rate_mark = if self.oracle.total_mark == 0 {
+            0.0
+        } else {
+            self.oracle.matched_mark as f64 / self.oracle.total_mark as f64
+        };
+        report.oracle_match_rate_reroll = if self.oracle.total_reroll == 0 {
+            0.0
+        } else {
+            self.oracle.matched_reroll as f64 / self.oracle.total_reroll as f64
+        };
+        report.oracle_keepall_ignored = self.oracle.oracle_keepall_ignored;
+
+        report
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GateReport {
     pub games: u32,
@@ -344,25 +436,9 @@ pub fn gate(cfg: &yz_core::Config, opts: GateOptions) -> Result<GateReport, Gate
 pub fn gate_with_progress(
     cfg: &yz_core::Config,
     opts: GateOptions,
-    mut progress: Option<&mut dyn GateProgress>,
+    progress: Option<&mut dyn GateProgress>,
 ) -> Result<GateReport, GateError> {
-    let (schedule, seeds, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
-        if cfg.gating.paired_seed_swap && !cfg.gating.games.is_multiple_of(2) {
-            return Err(GateError::InvalidConfig(
-                "gating.games must be even when gating.paired_seed_swap=true",
-            ));
-        }
-        let seeds = load_seed_set(id)?;
-        gating_schedule_from_seed_set(&seeds, cfg.gating.games, cfg.gating.paired_seed_swap)
-    } else {
-        let seeds = derived_seed_list(
-            cfg.gating.seed,
-            cfg.gating.games,
-            cfg.gating.paired_seed_swap,
-        )?;
-        let schedule = schedule_from_seed_list(&seeds, cfg.gating.paired_seed_swap);
-        (schedule, seeds, Vec::new())
-    };
+    let plan = gate_plan(cfg)?;
 
     let (best_backend, cand_backend) = connect_two_backends(
         &opts.infer_endpoint,
@@ -371,52 +447,88 @@ pub fn gate_with_progress(
         &opts.client_opts,
     )?;
 
-    let mut report = GateReport::default();
-    report.games = schedule.len() as u32;
-    report.warnings = warnings;
-    report.seeds = seeds;
-    report.seeds_hash = hash_seeds(&report.seeds);
+    let partial = gate_schedule_subset_with_backends(
+        cfg,
+        opts.mcts_cfg,
+        &best_backend,
+        &cand_backend,
+        &plan.schedule,
+        progress,
+    )?;
+
+    Ok(partial.into_report(plan))
+}
+
+/// Run gating for a subset of games (used by multi-process gate workers).
+///
+/// This does **not** build the schedule; caller provides the schedule slice.
+pub fn gate_schedule_subset(
+    cfg: &yz_core::Config,
+    opts: GateOptions,
+    schedule: &[GameSpec],
+    progress: Option<&mut dyn GateProgress>,
+) -> Result<GatePartial, GateError> {
+    let (best_backend, cand_backend) = connect_two_backends(
+        &opts.infer_endpoint,
+        opts.best_model_id,
+        opts.cand_model_id,
+        &opts.client_opts,
+    )?;
+    gate_schedule_subset_with_backends(
+        cfg,
+        opts.mcts_cfg,
+        &best_backend,
+        &cand_backend,
+        schedule,
+        progress,
+    )
+}
+
+fn gate_schedule_subset_with_backends(
+    cfg: &yz_core::Config,
+    mut mcts_cfg: MctsConfig,
+    best_backend: &InferBackend,
+    cand_backend: &InferBackend,
+    schedule: &[GameSpec],
+    mut progress: Option<&mut dyn GateProgress>,
+) -> Result<GatePartial, GateError> {
+    let total = schedule.len() as u32;
 
     // Always disable root Dirichlet noise in gating/eval.
-    let mut mcts_cfg = opts.mcts_cfg;
     mcts_cfg.dirichlet_epsilon = 0.0;
     let mut mcts = Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
 
-    let mut diffs: Vec<i32> = Vec::with_capacity(schedule.len());
-    let mut oracle_steps: Vec<OracleDiagStep> = Vec::new();
-    let total = report.games;
+    let oracle = oracle_mod::oracle();
+    let mut partial = GatePartial::default();
+    partial.games = total;
+
     let mut completed: u32 = 0;
-    for gs in schedule {
+    for gs in schedule.iter().copied() {
         let (cand_score, best_score, cand_outcome) = run_one_game(
             cfg,
             &mut mcts,
-            &best_backend,
-            &cand_backend,
+            best_backend,
+            cand_backend,
             gs,
-            &mut oracle_steps,
+            oracle,
+            &mut partial.oracle,
         )?;
         match cand_outcome {
-            Outcome::Win => report.cand_wins += 1,
-            Outcome::Loss => report.cand_losses += 1,
-            Outcome::Draw => report.draws += 1,
+            Outcome::Win => partial.cand_wins += 1,
+            Outcome::Loss => partial.cand_losses += 1,
+            Outcome::Draw => partial.draws += 1,
         }
         let d = cand_score - best_score;
-        diffs.push(d);
-        report.cand_score_diff_sum += d as i64;
+        partial.cand_score_diff_sum += d as i64;
+        let x = d as f64;
+        partial.cand_score_diff_sumsq += x * x;
 
         completed += 1;
         if let Some(p) = progress.as_deref_mut() {
             p.on_game_completed(completed, total);
         }
     }
-
-    compute_score_diff_stats(&diffs, &mut report);
-    let od = compute_oracle_diag(&oracle_steps);
-    report.oracle_match_rate_overall = od.match_rate_overall;
-    report.oracle_match_rate_mark = od.match_rate_mark;
-    report.oracle_match_rate_reroll = od.match_rate_reroll;
-    report.oracle_keepall_ignored = od.oracle_keepall_ignored;
-    Ok(report)
+    Ok(partial)
 }
 
 fn derived_seed_list(seed0: u64, games: u32, paired_swap: bool) -> Result<Vec<u64>, GateError> {
@@ -470,8 +582,12 @@ fn hash_seeds(seeds: &[u64]) -> String {
     blake3::hash(&buf).to_hex().to_string()
 }
 
-fn compute_score_diff_stats(diffs: &[i32], report: &mut GateReport) {
-    let n = diffs.len();
+fn compute_score_diff_stats_from_moments(
+    diff_sum: i64,
+    diff_sumsq: f64,
+    n: u64,
+    report: &mut GateReport,
+) {
     if n == 0 {
         report.score_diff_std = 0.0;
         report.score_diff_se = 0.0;
@@ -480,17 +596,20 @@ fn compute_score_diff_stats(diffs: &[i32], report: &mut GateReport) {
         report.draw_rate = 0.0;
         return;
     }
+
     let n_f = n as f64;
-    let mean = (report.cand_score_diff_sum as f64) / n_f;
-    let mut sumsq = 0.0f64;
-    for &d in diffs {
-        let x = d as f64;
-        sumsq += (x - mean) * (x - mean);
-    }
-    let var = if n > 1 { sumsq / (n_f - 1.0) } else { 0.0 };
-    let std = var.max(0.0).sqrt();
-    let se = if n > 0 { std / n_f.sqrt() } else { 0.0 };
+    let mean = (diff_sum as f64) / n_f;
+    // Sample variance from moments: var = (Σx² - (Σx)²/n)/(n-1)
+    let var = if n > 1 {
+        let ss = diff_sumsq - (diff_sum as f64) * (diff_sum as f64) / n_f;
+        (ss / (n_f - 1.0)).max(0.0)
+    } else {
+        0.0
+    };
+    let std = var.sqrt();
+    let se = std / n_f.sqrt();
     let ci = 1.96 * se;
+
     report.score_diff_std = std;
     report.score_diff_se = se;
     report.score_diff_ci95_low = mean - ci;
@@ -511,7 +630,8 @@ fn run_one_game(
     best_backend: &InferBackend,
     cand_backend: &InferBackend,
     gs: GameSpec,
-    oracle_steps_out: &mut Vec<OracleDiagStep>,
+    oracle: &oracle_mod::YatzyDP,
+    oracle_counts: &mut OracleDiagCounts,
 ) -> Result<(i32, i32, Outcome), GateError> {
     // Initialize state using the same chance mode policy as the game loop.
     let mut ctx = if cfg.gating.deterministic_chance {
@@ -545,13 +665,14 @@ fn run_one_game(
 
         if is_cand_turn {
             let ps = &state.players[state.player_to_move as usize];
-            oracle_steps_out.push(OracleDiagStep {
+            let step = OracleDiagStep {
                 avail_mask: ps.avail_mask,
                 upper_total_cap: ps.upper_total_cap,
                 dice_sorted: state.dice_sorted,
                 rerolls_left: state.rerolls_left,
                 chosen_action: action,
-            });
+            };
+            oracle_diag_update_counts(oracle, &step, oracle_counts);
         }
 
         let next =
@@ -837,11 +958,14 @@ gating:
             rerolls_left: 2,
             chosen_action: yz_core::Action::KeepMask(0),
         }];
-        let a = compute_oracle_diag(&steps);
-        let b = compute_oracle_diag(&steps);
+        let a = compute_oracle_diag_counts(&steps);
+        let b = compute_oracle_diag_counts(&steps);
         assert_eq!(a.oracle_keepall_ignored, b.oracle_keepall_ignored);
-        assert!((a.match_rate_overall - b.match_rate_overall).abs() < 1e-12);
-        assert!((a.match_rate_mark - b.match_rate_mark).abs() < 1e-12);
-        assert!((a.match_rate_reroll - b.match_rate_reroll).abs() < 1e-12);
+        assert_eq!(a.total, b.total);
+        assert_eq!(a.matched, b.matched);
+        assert_eq!(a.total_mark, b.total_mark);
+        assert_eq!(a.matched_mark, b.matched_mark);
+        assert_eq!(a.total_reroll, b.total_reroll);
+        assert_eq!(a.matched_reroll, b.matched_reroll);
     }
 }
