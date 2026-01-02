@@ -1741,6 +1741,49 @@ fn run_gate(
     m.gate_oracle_match_rate_reroll = Some(oracle_reroll);
     m.gate_oracle_keepall_ignored = Some(oracle_keepall_ignored);
 
+    // Emit gate_summary metrics event (best-effort).
+    {
+        let decision = if wr + 1e-12 < cfg.gating.win_rate_threshold {
+            "reject"
+        } else {
+            "promote"
+        };
+        let metrics_path = run_dir.join("logs").join("metrics.ndjson");
+        if let Ok(mut metrics) = yz_logging::NdjsonWriter::open_append_with_flush(&metrics_path, 1)
+        {
+            let ev = yz_logging::MetricsGateSummaryV1 {
+                event: "gate_summary",
+                ts_ms: yz_logging::now_ms(),
+                v: yz_logging::VersionInfoV1 {
+                    protocol_version: m.protocol_version,
+                    feature_schema_id: m.feature_schema_id,
+                    action_space_id: "oracle_keepmask_v1",
+                    ruleset_id: "swedish_scandinavian_v1",
+                },
+                run_id: m.run_id.clone(),
+                git_hash: m.git_hash.clone(),
+                config_snapshot: m.config_snapshot.clone(),
+                decision: decision.to_string(),
+                games: report.games,
+                wins: report.cand_wins,
+                losses: report.cand_losses,
+                draws: report.draws,
+                win_rate: wr,
+                mean_score_diff: report.mean_score_diff(),
+                score_diff_se: report.score_diff_se,
+                score_diff_ci95_low: report.score_diff_ci95_low,
+                score_diff_ci95_high: report.score_diff_ci95_high,
+                seeds_hash: report.seeds_hash.clone(),
+                oracle_match_rate_overall: oracle_overall,
+                oracle_match_rate_mark: oracle_mark,
+                oracle_match_rate_reroll: oracle_reroll,
+                oracle_keepall_ignored: oracle_keepall_ignored,
+            };
+            let _ = metrics.write_event(&ev);
+            let _ = metrics.flush();
+        }
+    }
+
     // Also update current iteration entry (final values).
     if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
         it.gate.games_target = report.games as u64;
