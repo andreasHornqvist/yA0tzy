@@ -1619,13 +1619,6 @@ fn run_gate(
         draws: u32,
         cand_score_diff_sum: i64,
         cand_score_diff_sumsq: f64,
-        oracle_total: u64,
-        oracle_matched: u64,
-        oracle_total_mark: u64,
-        oracle_matched_mark: u64,
-        oracle_total_reroll: u64,
-        oracle_matched_reroll: u64,
-        oracle_keepall_ignored: u64,
     }
 
     let mut partial = yz_eval::GatePartial::default();
@@ -1641,13 +1634,6 @@ fn run_gate(
         p.draws = r.draws;
         p.cand_score_diff_sum = r.cand_score_diff_sum;
         p.cand_score_diff_sumsq = r.cand_score_diff_sumsq;
-        p.oracle.total = r.oracle_total;
-        p.oracle.matched = r.oracle_matched;
-        p.oracle.total_mark = r.oracle_total_mark;
-        p.oracle.matched_mark = r.oracle_matched_mark;
-        p.oracle.total_reroll = r.oracle_total_reroll;
-        p.oracle.matched_reroll = r.oracle_matched_reroll;
-        p.oracle.oracle_keepall_ignored = r.oracle_keepall_ignored;
         partial.merge(&p);
     }
 
@@ -1658,15 +1644,95 @@ fn run_gate(
         warnings: plan.warnings,
     });
 
+    // Oracle diagnostics: compute once in controller after workers finish.
+    // This avoids building the oracle DP table in every gate-worker process.
+    let (oracle_overall, oracle_mark, oracle_reroll, oracle_keepall_ignored) = {
+        let oracle = yz_oracle::oracle();
+        let mut total: u64 = 0;
+        let mut matched: u64 = 0;
+        let mut total_mark: u64 = 0;
+        let mut matched_mark: u64 = 0;
+        let mut total_reroll: u64 = 0;
+        let mut matched_reroll: u64 = 0;
+        let mut keepall_ignored: u64 = 0;
+
+        fn should_ignore(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
+            matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
+        }
+        fn oracle_action_to_core(oa: yz_oracle::Action) -> yz_core::Action {
+            match oa {
+                yz_oracle::Action::Mark { cat } => yz_core::Action::Mark(cat),
+                yz_oracle::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
+            }
+        }
+
+        for (wid, _) in &per_worker {
+            let p = logs_gate_workers_dir
+                .join(format!("worker_{wid:03}"))
+                .join("oracle_diag.ndjson");
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
+            for line in bytes.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_slice::<yz_eval::OracleDiagEvent>(line) else {
+                    continue;
+                };
+                let chosen = yz_core::index_to_action(ev.chosen_action_idx);
+                let (oa, _ev) =
+                    oracle.best_action(ev.avail_mask, ev.upper_total_cap, ev.dice_sorted, ev.rerolls_left);
+                if should_ignore(oa, ev.rerolls_left) {
+                    keepall_ignored += 1;
+                    continue;
+                }
+                let expected = oracle_action_to_core(oa);
+                let is_match = expected == chosen;
+                total += 1;
+                if is_match {
+                    matched += 1;
+                }
+                match chosen {
+                    yz_core::Action::Mark(_) => {
+                        total_mark += 1;
+                        if is_match {
+                            matched_mark += 1;
+                        }
+                    }
+                    yz_core::Action::KeepMask(_) => {
+                        total_reroll += 1;
+                        if is_match {
+                            matched_reroll += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let overall = if total == 0 { 0.0 } else { matched as f64 / total as f64 };
+        let mark = if total_mark == 0 {
+            0.0
+        } else {
+            matched_mark as f64 / total_mark as f64
+        };
+        let reroll = if total_reroll == 0 {
+            0.0
+        } else {
+            matched_reroll as f64 / total_reroll as f64
+        };
+        (overall, mark, reroll, keepall_ignored)
+    };
+
     let wr = report.win_rate();
     m.gate_games = Some(report.games as u64);
     m.gate_win_rate = Some(wr);
     m.gate_draw_rate = Some(report.draw_rate);
     m.gate_seeds_hash = Some(report.seeds_hash.clone());
-    m.gate_oracle_match_rate_overall = Some(report.oracle_match_rate_overall);
-    m.gate_oracle_match_rate_mark = Some(report.oracle_match_rate_mark);
-    m.gate_oracle_match_rate_reroll = Some(report.oracle_match_rate_reroll);
-    m.gate_oracle_keepall_ignored = Some(report.oracle_keepall_ignored);
+    m.gate_oracle_match_rate_overall = Some(oracle_overall);
+    m.gate_oracle_match_rate_mark = Some(oracle_mark);
+    m.gate_oracle_match_rate_reroll = Some(oracle_reroll);
+    m.gate_oracle_keepall_ignored = Some(oracle_keepall_ignored);
 
     // Also update current iteration entry (final values).
     if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
@@ -1675,10 +1741,10 @@ fn run_gate(
         it.gate.win_rate = Some(wr);
         it.gate.draw_rate = Some(report.draw_rate);
         it.gate.ended_ts_ms = Some(yz_logging::now_ms());
-        it.oracle.match_rate_overall = Some(report.oracle_match_rate_overall);
-        it.oracle.match_rate_mark = Some(report.oracle_match_rate_mark);
-        it.oracle.match_rate_reroll = Some(report.oracle_match_rate_reroll);
-        it.oracle.keepall_ignored = Some(report.oracle_keepall_ignored);
+        it.oracle.match_rate_overall = Some(oracle_overall);
+        it.oracle.match_rate_mark = Some(oracle_mark);
+        it.oracle.match_rate_reroll = Some(oracle_reroll);
+        it.oracle.keepall_ignored = Some(oracle_keepall_ignored);
     }
     yz_logging::write_manifest_atomic(&run_json, &m)?;
 
