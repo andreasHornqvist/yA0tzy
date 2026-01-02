@@ -1439,52 +1439,224 @@ fn run_gate(
     }
     let _ = yz_logging::write_manifest_atomic(&run_json, &m);
 
-    struct ProgressSink {
-        run_json: PathBuf,
-        iter_idx: u32,
-    }
-    impl yz_eval::GateProgress for ProgressSink {
-        fn on_game_completed(&mut self, completed: u32, total: u32) {
-            let Ok(mut m) = yz_logging::read_manifest(&self.run_json) else {
-                return;
-            };
-            if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == self.iter_idx) {
-                it.gate.games_completed = completed as u64;
-                // Prefer the actual schedule length discovered by yz-eval.
-                it.gate.games_target = total as u64;
+    // Plan schedule (paired seed swap, deterministic chance, argmax policy are handled in yz-eval).
+    let plan = yz_eval::gate_plan(cfg)?;
+    let total_games = plan.schedule.len().max(1) as u32;
+
+    // Spawn OS processes (like self-play) for parallel gating.
+    let gate_workers_dir = run_dir.join("gate_workers");
+    let logs_gate_workers_dir = run_dir.join("logs_gate_workers");
+    std::fs::create_dir_all(&gate_workers_dir)?;
+    std::fs::create_dir_all(&logs_gate_workers_dir)?;
+
+    // Partition schedule across workers.
+    let num_workers = cfg.selfplay.workers.max(1) as usize;
+
+    let mut per_worker: Vec<Vec<yz_eval::GameSpec>> = vec![Vec::new(); num_workers];
+    if cfg.gating.paired_seed_swap {
+        // Keep swap pairs together (2 games per seed) for nicer locality.
+        let pairs: Vec<[yz_eval::GameSpec; 2]> = plan
+            .schedule
+            .chunks_exact(2)
+            .map(|c| [c[0], c[1]])
+            .collect();
+        let pairs_total = pairs.len();
+        let base = pairs_total / num_workers;
+        let rem = pairs_total % num_workers;
+        let mut idx = 0usize;
+        for wid in 0..num_workers {
+            let take = base + if wid < rem { 1 } else { 0 };
+            for _ in 0..take {
+                if idx >= pairs_total {
+                    break;
+                }
+                per_worker[wid].push(pairs[idx][0]);
+                per_worker[wid].push(pairs[idx][1]);
+                idx += 1;
             }
-            let _ = yz_logging::write_manifest_atomic(&self.run_json, &m);
+        }
+    } else {
+        let games_total = plan.schedule.len();
+        let base = games_total / num_workers;
+        let rem = games_total % num_workers;
+        let mut idx = 0usize;
+        for wid in 0..num_workers {
+            let take = base + if wid < rem { 1 } else { 0 };
+            for _ in 0..take {
+                if idx >= games_total {
+                    break;
+                }
+                per_worker[wid].push(plan.schedule[idx]);
+                idx += 1;
+            }
         }
     }
+    // Drop empty workers to avoid spawning useless processes.
+    let per_worker: Vec<(u32, Vec<yz_eval::GameSpec>)> = per_worker
+        .into_iter()
+        .enumerate()
+        .filter_map(|(wid, s)| {
+            if s.is_empty() {
+                None
+            } else {
+                Some((wid as u32, s))
+            }
+        })
+        .collect();
 
-    let mut sink = ProgressSink {
-        run_json: run_json.clone(),
-        iter_idx,
-    };
+    #[derive(serde::Serialize)]
+    struct GameSpecJson {
+        episode_seed: u64,
+        swap: bool,
+    }
 
-    let report = yz_eval::gate_with_progress(
-        cfg,
-        yz_eval::GateOptions {
-            infer_endpoint: infer_endpoint.to_string(),
-            best_model_id: 0,
-            cand_model_id: 1,
-            client_opts: yz_infer::ClientOptions {
-                max_inflight_total: 64,
-                max_outbound_queue: 256,
-                request_id_start: 1,
-            },
-            mcts_cfg: yz_mcts::MctsConfig {
-                c_puct: cfg.mcts.c_puct,
-                simulations_mark: cfg.mcts.budget_mark.max(1),
-                simulations_reroll: cfg.mcts.budget_reroll.max(1),
-                dirichlet_alpha: cfg.mcts.dirichlet_alpha,
-                dirichlet_epsilon: 0.0,
-                max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
-                virtual_loss: 1.0,
-            },
-        },
-        Some(&mut sink),
-    )?;
+    let exe = std::env::current_exe().map_err(ControllerError::Fs)?;
+    let mut children: Vec<(u32, PathBuf, Child)> = Vec::new(); // (wid, result_path, child)
+    for (wid, sched) in &per_worker {
+        let sched_path = gate_workers_dir.join(format!("sched_{wid:03}.json"));
+        let out_path = gate_workers_dir.join(format!("result_{wid:03}.json"));
+        let items: Vec<GameSpecJson> = sched
+            .iter()
+            .map(|g| GameSpecJson {
+                episode_seed: g.episode_seed,
+                swap: g.swap,
+            })
+            .collect();
+        let bytes =
+            serde_json::to_vec(&items).map_err(|e| ControllerError::Fs(std::io::Error::other(e)))?;
+        std::fs::write(&sched_path, bytes)?;
+
+        let mut cmd = Command::new(&exe);
+        cmd.arg("gate-worker");
+        cmd.arg("--run-dir").arg(run_dir);
+        cmd.arg("--infer").arg(infer_endpoint);
+        cmd.arg("--worker-id").arg(wid.to_string());
+        cmd.arg("--num-workers").arg((per_worker.len() as u32).to_string());
+        cmd.arg("--best-id").arg("0");
+        cmd.arg("--cand-id").arg("1");
+        cmd.arg("--schedule-file").arg(&sched_path);
+        cmd.arg("--out").arg(&out_path);
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        let child = cmd.spawn().map_err(ControllerError::Fs)?;
+        children.push((*wid, out_path, child));
+    }
+
+    fn read_gate_worker_progress_sum(logs_gate_workers_dir: &Path) -> u32 {
+        #[derive(serde::Deserialize)]
+        struct P {
+            games_completed: u32,
+        }
+        let mut sum = 0u32;
+        if let Ok(rd) = std::fs::read_dir(logs_gate_workers_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let f = p.join("progress.json");
+                if let Ok(bytes) = std::fs::read(&f) {
+                    if let Ok(pp) = serde_json::from_slice::<P>(&bytes) {
+                        sum = sum.saturating_add(pp.games_completed);
+                    }
+                }
+            }
+        }
+        sum
+    }
+
+    let mut last_manifest_ts = std::time::Instant::now();
+    while !children.is_empty() {
+        if ctrl.cancelled() {
+            for (_, _, mut c) in children {
+                let _ = c.kill();
+            }
+            return Err(ControllerError::Cancelled);
+        }
+
+        let mut failure: Option<String> = None;
+        let mut i = 0usize;
+        while i < children.len() {
+            let (wid, _out_path, child) = &mut children[i];
+            if let Some(status) = child.try_wait().map_err(ControllerError::Fs)? {
+                if !status.success() {
+                    failure = Some(format!("gate-worker {wid} failed with status {status}"));
+                    break;
+                }
+                children.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+        if let Some(msg) = failure {
+            for (_, _, mut c) in children {
+                let _ = c.kill();
+            }
+            return Err(ControllerError::Fs(std::io::Error::other(msg)));
+        }
+
+        // Live progress: sum worker progress and update run.json for the TUI.
+        if last_manifest_ts.elapsed() >= Duration::from_millis(250) {
+            let completed = read_gate_worker_progress_sum(&logs_gate_workers_dir).min(total_games);
+            if let Ok(mut mm) = yz_logging::read_manifest(&run_json) {
+                if let Some(it) = mm.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+                    it.gate.games_completed = completed as u64;
+                    it.gate.games_target = total_games as u64;
+                }
+                let _ = yz_logging::write_manifest_atomic(&run_json, &mm);
+            }
+            last_manifest_ts = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Aggregate results.
+    #[derive(serde::Deserialize)]
+    struct GateWorkerResult {
+        games: u32,
+        cand_wins: u32,
+        cand_losses: u32,
+        draws: u32,
+        cand_score_diff_sum: i64,
+        cand_score_diff_sumsq: f64,
+        oracle_total: u64,
+        oracle_matched: u64,
+        oracle_total_mark: u64,
+        oracle_matched_mark: u64,
+        oracle_total_reroll: u64,
+        oracle_matched_reroll: u64,
+        oracle_keepall_ignored: u64,
+    }
+
+    let mut partial = yz_eval::GatePartial::default();
+    for (wid, _) in &per_worker {
+        let path = gate_workers_dir.join(format!("result_{wid:03}.json"));
+        let bytes = std::fs::read(&path)?;
+        let r: GateWorkerResult =
+            serde_json::from_slice(&bytes).map_err(|e| ControllerError::Fs(std::io::Error::other(e)))?;
+        let mut p = yz_eval::GatePartial::default();
+        p.games = r.games;
+        p.cand_wins = r.cand_wins;
+        p.cand_losses = r.cand_losses;
+        p.draws = r.draws;
+        p.cand_score_diff_sum = r.cand_score_diff_sum;
+        p.cand_score_diff_sumsq = r.cand_score_diff_sumsq;
+        p.oracle.total = r.oracle_total;
+        p.oracle.matched = r.oracle_matched;
+        p.oracle.total_mark = r.oracle_total_mark;
+        p.oracle.matched_mark = r.oracle_matched_mark;
+        p.oracle.total_reroll = r.oracle_total_reroll;
+        p.oracle.matched_reroll = r.oracle_matched_reroll;
+        p.oracle.oracle_keepall_ignored = r.oracle_keepall_ignored;
+        partial.merge(&p);
+    }
+
+    let report = partial.into_report(yz_eval::GatePlan {
+        schedule: Vec::new(),
+        seeds: plan.seeds,
+        seeds_hash: plan.seeds_hash,
+        warnings: plan.warnings,
+    });
 
     let wr = report.win_rate();
     m.gate_games = Some(report.games as u64);
