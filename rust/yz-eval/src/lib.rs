@@ -10,8 +10,26 @@ use thiserror::Error;
 use yz_core::{apply_action, initial_state, is_terminal, terminal_winner, TurnContext};
 use yz_infer::ClientOptions;
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchResult};
+#[cfg(test)]
 use yz_oracle as oracle_mod;
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct OracleDiagEvent {
+    pub avail_mask: u16,
+    pub upper_total_cap: u8,
+    pub dice_sorted: [u8; 5],
+    pub rerolls_left: u8,
+    pub chosen_action_idx: u8,
+    // Optional context for debugging/offline analysis.
+    pub episode_seed: u64,
+    pub swap: bool,
+}
+
+pub trait OracleDiagSink {
+    fn on_step(&mut self, ev: &OracleDiagEvent);
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OracleDiagStep {
     // Oracle-slice state for the current player (solitaire view).
@@ -22,30 +40,7 @@ struct OracleDiagStep {
     chosen_action: yz_core::Action,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OracleDiagCounts {
-    pub total: u64,
-    pub matched: u64,
-    pub total_mark: u64,
-    pub matched_mark: u64,
-    pub total_reroll: u64,
-    pub matched_reroll: u64,
-    pub oracle_keepall_ignored: u64,
-}
-
-impl OracleDiagCounts {
-    pub fn merge(&mut self, other: &OracleDiagCounts) {
-        self.total = self.total.saturating_add(other.total);
-        self.matched = self.matched.saturating_add(other.matched);
-        self.total_mark = self.total_mark.saturating_add(other.total_mark);
-        self.matched_mark = self.matched_mark.saturating_add(other.matched_mark);
-        self.total_reroll = self.total_reroll.saturating_add(other.total_reroll);
-        self.matched_reroll = self.matched_reroll.saturating_add(other.matched_reroll);
-        self.oracle_keepall_ignored =
-            self.oracle_keepall_ignored.saturating_add(other.oracle_keepall_ignored);
-    }
-}
-
+#[cfg(test)]
 fn should_ignore_oracle_action(a: oracle_mod::Action, rerolls_left: u8) -> bool {
     match a {
         oracle_mod::Action::KeepMask { mask } => mask == 31 && rerolls_left > 0,
@@ -53,59 +48,6 @@ fn should_ignore_oracle_action(a: oracle_mod::Action, rerolls_left: u8) -> bool 
     }
 }
 
-fn oracle_diag_update_counts(
-    oracle: &oracle_mod::YatzyDP,
-    s: &OracleDiagStep,
-    counts: &mut OracleDiagCounts,
-) {
-    let (oa, _ev) = oracle.best_action(
-        s.avail_mask,
-        s.upper_total_cap,
-        s.dice_sorted,
-        s.rerolls_left,
-    );
-    if should_ignore_oracle_action(oa, s.rerolls_left) {
-        counts.oracle_keepall_ignored += 1;
-        return;
-    }
-
-    let expected: yz_core::Action = match oa {
-        oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
-        oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
-    };
-
-    let is_match = expected == s.chosen_action;
-
-    counts.total += 1;
-    if is_match {
-        counts.matched += 1;
-    }
-
-    match s.chosen_action {
-        yz_core::Action::Mark(_) => {
-            counts.total_mark += 1;
-            if is_match {
-                counts.matched_mark += 1;
-            }
-        }
-        yz_core::Action::KeepMask(_) => {
-            counts.total_reroll += 1;
-            if is_match {
-                counts.matched_reroll += 1;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-fn compute_oracle_diag_counts(steps: &[OracleDiagStep]) -> OracleDiagCounts {
-    let oracle = oracle_mod::oracle();
-    let mut c = OracleDiagCounts::default();
-    for s in steps {
-        oracle_diag_update_counts(oracle, s, &mut c);
-    }
-    c
-}
 
 #[derive(Debug, Error)]
 pub enum GateError {
@@ -336,7 +278,6 @@ pub struct GatePartial {
     pub draws: u32,
     pub cand_score_diff_sum: i64,
     pub cand_score_diff_sumsq: f64, // sum of (diff^2)
-    pub oracle: OracleDiagCounts,
 }
 
 impl GatePartial {
@@ -347,7 +288,6 @@ impl GatePartial {
         self.draws = self.draws.saturating_add(other.draws);
         self.cand_score_diff_sum = self.cand_score_diff_sum.saturating_add(other.cand_score_diff_sum);
         self.cand_score_diff_sumsq += other.cand_score_diff_sumsq;
-        self.oracle.merge(&other.oracle);
     }
 
     pub fn into_report(self, plan: GatePlan) -> GateReport {
@@ -367,24 +307,6 @@ impl GatePartial {
             self.games as u64,
             &mut report,
         );
-
-        // Oracle diag rates from counts
-        report.oracle_match_rate_overall = if self.oracle.total == 0 {
-            0.0
-        } else {
-            self.oracle.matched as f64 / self.oracle.total as f64
-        };
-        report.oracle_match_rate_mark = if self.oracle.total_mark == 0 {
-            0.0
-        } else {
-            self.oracle.matched_mark as f64 / self.oracle.total_mark as f64
-        };
-        report.oracle_match_rate_reroll = if self.oracle.total_reroll == 0 {
-            0.0
-        } else {
-            self.oracle.matched_reroll as f64 / self.oracle.total_reroll as f64
-        };
-        report.oracle_keepall_ignored = self.oracle.oracle_keepall_ignored;
 
         report
     }
@@ -454,8 +376,11 @@ pub fn gate_with_progress(
         &cand_backend,
         &plan.schedule,
         progress,
+        None,
     )?;
 
+    // Note: oracle diagnostics are computed offline (controller) for multi-process gating.
+    // For in-process `yz gate`, we leave these fields at default.
     Ok(partial.into_report(plan))
 }
 
@@ -467,6 +392,7 @@ pub fn gate_schedule_subset(
     opts: GateOptions,
     schedule: &[GameSpec],
     progress: Option<&mut dyn GateProgress>,
+    oracle_sink: Option<&mut dyn OracleDiagSink>,
 ) -> Result<GatePartial, GateError> {
     let (best_backend, cand_backend) = connect_two_backends(
         &opts.infer_endpoint,
@@ -481,6 +407,7 @@ pub fn gate_schedule_subset(
         &cand_backend,
         schedule,
         progress,
+        oracle_sink,
     )
 }
 
@@ -491,6 +418,7 @@ fn gate_schedule_subset_with_backends(
     cand_backend: &InferBackend,
     schedule: &[GameSpec],
     mut progress: Option<&mut dyn GateProgress>,
+    mut oracle_sink: Option<&mut dyn OracleDiagSink>,
 ) -> Result<GatePartial, GateError> {
     let total = schedule.len() as u32;
 
@@ -498,7 +426,6 @@ fn gate_schedule_subset_with_backends(
     mcts_cfg.dirichlet_epsilon = 0.0;
     let mut mcts = Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
 
-    let oracle = oracle_mod::oracle();
     let mut partial = GatePartial::default();
     partial.games = total;
 
@@ -510,8 +437,7 @@ fn gate_schedule_subset_with_backends(
             best_backend,
             cand_backend,
             gs,
-            oracle,
-            &mut partial.oracle,
+            &mut oracle_sink,
         )?;
         match cand_outcome {
             Outcome::Win => partial.cand_wins += 1,
@@ -630,8 +556,7 @@ fn run_one_game(
     best_backend: &InferBackend,
     cand_backend: &InferBackend,
     gs: GameSpec,
-    oracle: &oracle_mod::YatzyDP,
-    oracle_counts: &mut OracleDiagCounts,
+    oracle_sink: &mut Option<&mut dyn OracleDiagSink>,
 ) -> Result<(i32, i32, Outcome), GateError> {
     // Initialize state using the same chance mode policy as the game loop.
     let mut ctx = if cfg.gating.deterministic_chance {
@@ -665,14 +590,17 @@ fn run_one_game(
 
         if is_cand_turn {
             let ps = &state.players[state.player_to_move as usize];
-            let step = OracleDiagStep {
-                avail_mask: ps.avail_mask,
-                upper_total_cap: ps.upper_total_cap,
-                dice_sorted: state.dice_sorted,
-                rerolls_left: state.rerolls_left,
-                chosen_action: action,
-            };
-            oracle_diag_update_counts(oracle, &step, oracle_counts);
+            if let Some(s) = oracle_sink.as_deref_mut() {
+                s.on_step(&OracleDiagEvent {
+                    avail_mask: ps.avail_mask,
+                    upper_total_cap: ps.upper_total_cap,
+                    dice_sorted: state.dice_sorted,
+                    rerolls_left: state.rerolls_left,
+                    chosen_action_idx: yz_core::action_to_index(action),
+                    episode_seed: gs.episode_seed,
+                    swap: gs.swap,
+                });
+            }
         }
 
         let next =
@@ -946,6 +874,61 @@ gating:
             oracle_mod::Action::KeepMask { mask: 31 },
             0
         ));
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct OracleDiagCounts {
+        total: u64,
+        matched: u64,
+        total_mark: u64,
+        matched_mark: u64,
+        total_reroll: u64,
+        matched_reroll: u64,
+        oracle_keepall_ignored: u64,
+    }
+
+    fn compute_oracle_diag_counts(steps: &[OracleDiagStep]) -> OracleDiagCounts {
+        let oracle = oracle_mod::oracle();
+        let mut c = OracleDiagCounts::default();
+        for s in steps {
+            let (oa, _ev) = oracle.best_action(
+                s.avail_mask,
+                s.upper_total_cap,
+                s.dice_sorted,
+                s.rerolls_left,
+            );
+            if should_ignore_oracle_action(oa, s.rerolls_left) {
+                c.oracle_keepall_ignored += 1;
+                continue;
+            }
+
+            let expected: yz_core::Action = match oa {
+                oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
+                oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
+            };
+            let is_match = expected == s.chosen_action;
+
+            c.total += 1;
+            if is_match {
+                c.matched += 1;
+            }
+
+            match s.chosen_action {
+                yz_core::Action::Mark(_) => {
+                    c.total_mark += 1;
+                    if is_match {
+                        c.matched_mark += 1;
+                    }
+                }
+                yz_core::Action::KeepMask(_) => {
+                    c.total_reroll += 1;
+                    if is_match {
+                        c.matched_reroll += 1;
+                    }
+                }
+            }
+        }
+        c
     }
 
     #[test]

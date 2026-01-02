@@ -10,4 +10,5 @@ yz-infer = { path = "../yz-infer" }
 yz-oracle = { path = "../yz-oracle" }
 thiserror = "1.0"
 blake3 = "1"
+serde = { version = "1", features = ["derive"] }
 
