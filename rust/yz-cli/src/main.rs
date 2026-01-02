@@ -114,6 +114,7 @@ COMMANDS:
     selfplay            Run self-play with MCTS + inference
     selfplay-worker     Internal: run one self-play worker process (spawned by controller)
     gate                Gate candidate vs best model (paired seed + side swap)
+    gate-worker         Internal: run one gating worker process (spawned by controller)
     oracle-eval         Evaluate models against oracle baseline
     bench               Run Criterion micro-benchmarks (wrapper around cargo bench)
     tui                 Terminal UI (Ratatui) for configuring + monitoring runs
@@ -872,6 +873,310 @@ OPTIONS:
     println!("Self-play complete. Games={games} out={out}");
 }
 
+fn cmd_gate_worker(args: &[String]) {
+    use std::path::PathBuf;
+
+    let mut run_dir: Option<String> = None;
+    let mut infer: Option<String> = None;
+    let mut worker_id: u32 = 0;
+    let mut num_workers: u32 = 1;
+    let mut best_id: u32 = 0;
+    let mut cand_id: u32 = 1;
+    let mut schedule_file: Option<String> = None;
+    let mut out_path: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz gate-worker
+
+USAGE:
+    yz gate-worker --run-dir runs/<id> --infer unix:///tmp/yatzy_infer.sock --worker-id W --num-workers N --best-id 0 --cand-id 1 --schedule-file PATH --out PATH
+
+NOTES:
+    - Internal command spawned by the controller for parallel gating.
+    - Does NOT write replay shards; only writes results/progress.
+
+OPTIONS:
+    --run-dir DIR         Run directory (contains run.json + config.yaml) (required)
+    --infer ENDPOINT      Inference endpoint (unix:///... or tcp://host:port) (required)
+    --worker-id W         Worker id in [0, N) (required)
+    --num-workers N       Total worker processes (required)
+    --best-id N           model_id for best (default 0)
+    --cand-id N           model_id for candidate (default 1)
+    --schedule-file PATH  JSON schedule file for this worker (required)
+    --out PATH            Output JSON result file path (required)
+"#
+                );
+                return;
+            }
+            "--run-dir" => {
+                run_dir = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--infer" => {
+                infer = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--worker-id" => {
+                worker_id = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --worker-id value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--num-workers" => {
+                num_workers = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("Invalid --num-workers value");
+                        process::exit(1);
+                    });
+                i += 2;
+            }
+            "--best-id" => {
+                best_id = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(best_id);
+                i += 2;
+            }
+            "--cand-id" => {
+                cand_id = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cand_id);
+                i += 2;
+            }
+            "--schedule-file" => {
+                schedule_file = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz gate-worker`: {other}");
+                eprintln!("Run `yz gate-worker --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let run_dir = run_dir.unwrap_or_else(|| {
+        eprintln!("Missing --run-dir");
+        process::exit(1);
+    });
+    let infer = infer.unwrap_or_else(|| {
+        eprintln!("Missing --infer");
+        process::exit(1);
+    });
+    let schedule_file = schedule_file.unwrap_or_else(|| {
+        eprintln!("Missing --schedule-file");
+        process::exit(1);
+    });
+    let out_path = out_path.unwrap_or_else(|| {
+        eprintln!("Missing --out");
+        process::exit(1);
+    });
+
+    let run_dir = PathBuf::from(run_dir);
+    let cfg_path = run_dir.join("config.yaml");
+    let cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config.yaml: {e}");
+        process::exit(1);
+    });
+
+    #[derive(serde::Deserialize)]
+    struct GameSpecJson {
+        episode_seed: u64,
+        swap: bool,
+    }
+    let sched_bytes = std::fs::read(&schedule_file).unwrap_or_else(|e| {
+        eprintln!("Failed to read schedule file: {e}");
+        process::exit(1);
+    });
+    let sched: Vec<GameSpecJson> = serde_json::from_slice(&sched_bytes).unwrap_or_else(|e| {
+        eprintln!("Failed to parse schedule JSON: {e}");
+        process::exit(1);
+    });
+    let schedule: Vec<yz_eval::GameSpec> = sched
+        .into_iter()
+        .map(|s| yz_eval::GameSpec {
+            episode_seed: s.episode_seed,
+            swap: s.swap,
+        })
+        .collect();
+
+    let games_target = schedule.len() as u32;
+
+    // Bounded inflight to avoid flooding the inference server.
+    let client_opts = yz_infer::ClientOptions {
+        max_inflight_total: 64,
+        max_outbound_queue: 256,
+        request_id_start: 1,
+    };
+    let mcts_cfg = yz_mcts::MctsConfig {
+        c_puct: cfg.mcts.c_puct,
+        simulations_mark: cfg.mcts.budget_mark.max(1),
+        simulations_reroll: cfg.mcts.budget_reroll.max(1),
+        dirichlet_alpha: cfg.mcts.dirichlet_alpha,
+        dirichlet_epsilon: 0.0, // gating: no root noise
+        max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
+        virtual_loss: 1.0,
+    };
+
+    // Progress + output directories (mirrors selfplay-worker layout, but under logs_gate_workers).
+    let logs_dir = run_dir
+        .join("logs_gate_workers")
+        .join(format!("worker_{worker_id:03}"));
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let progress_path = logs_dir.join("progress.json");
+
+    #[derive(serde::Serialize)]
+    struct GateWorkerProgress {
+        worker_id: u32,
+        num_workers: u32,
+        games_target: u32,
+        games_completed: u32,
+        pid: u32,
+        ts_ms: u64,
+    }
+
+    fn write_progress_atomic(path: &PathBuf, p: &GateWorkerProgress) {
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(p) {
+            let _ = std::fs::write(&tmp, &bytes);
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    // Initial progress file for live aggregation.
+    write_progress_atomic(
+        &progress_path,
+        &GateWorkerProgress {
+            worker_id,
+            num_workers,
+            games_target,
+            games_completed: 0,
+            pid: std::process::id(),
+            ts_ms: yz_logging::now_ms(),
+        },
+    );
+
+    struct ProgressSink {
+        progress_path: PathBuf,
+        worker_id: u32,
+        num_workers: u32,
+        games_target: u32,
+    }
+    impl yz_eval::GateProgress for ProgressSink {
+        fn on_game_completed(&mut self, completed: u32, _total: u32) {
+            write_progress_atomic(
+                &self.progress_path,
+                &GateWorkerProgress {
+                    worker_id: self.worker_id,
+                    num_workers: self.num_workers,
+                    games_target: self.games_target,
+                    games_completed: completed,
+                    pid: std::process::id(),
+                    ts_ms: yz_logging::now_ms(),
+                },
+            );
+        }
+    }
+
+    let mut sink = ProgressSink {
+        progress_path: progress_path.clone(),
+        worker_id,
+        num_workers,
+        games_target,
+    };
+
+    let partial = yz_eval::gate_schedule_subset(
+        &cfg,
+        yz_eval::GateOptions {
+            infer_endpoint: infer,
+            best_model_id: best_id,
+            cand_model_id: cand_id,
+            client_opts,
+            mcts_cfg,
+        },
+        &schedule,
+        Some(&mut sink),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("gate-worker failed: {e}");
+        process::exit(1);
+    });
+
+    // Ensure final progress is complete.
+    write_progress_atomic(
+        &progress_path,
+        &GateWorkerProgress {
+            worker_id,
+            num_workers,
+            games_target,
+            games_completed: games_target,
+            pid: std::process::id(),
+            ts_ms: yz_logging::now_ms(),
+        },
+    );
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct GateWorkerResult {
+        worker_id: u32,
+        games: u32,
+        cand_wins: u32,
+        cand_losses: u32,
+        draws: u32,
+        cand_score_diff_sum: i64,
+        cand_score_diff_sumsq: f64,
+        oracle_total: u64,
+        oracle_matched: u64,
+        oracle_total_mark: u64,
+        oracle_matched_mark: u64,
+        oracle_total_reroll: u64,
+        oracle_matched_reroll: u64,
+        oracle_keepall_ignored: u64,
+    }
+
+    let out_path = PathBuf::from(out_path);
+    let tmp = out_path.with_extension("json.tmp");
+    let res = GateWorkerResult {
+        worker_id,
+        games: partial.games,
+        cand_wins: partial.cand_wins,
+        cand_losses: partial.cand_losses,
+        draws: partial.draws,
+        cand_score_diff_sum: partial.cand_score_diff_sum,
+        cand_score_diff_sumsq: partial.cand_score_diff_sumsq,
+        oracle_total: partial.oracle.total,
+        oracle_matched: partial.oracle.matched,
+        oracle_total_mark: partial.oracle.total_mark,
+        oracle_matched_mark: partial.oracle.matched_mark,
+        oracle_total_reroll: partial.oracle.total_reroll,
+        oracle_matched_reroll: partial.oracle.matched_reroll,
+        oracle_keepall_ignored: partial.oracle.oracle_keepall_ignored,
+    };
+    let bytes = serde_json::to_vec(&res).expect("serialize gate worker result");
+    std::fs::write(&tmp, bytes).unwrap_or_else(|e| {
+        eprintln!("Failed to write gate worker result: {e}");
+        process::exit(1);
+    });
+    std::fs::rename(&tmp, &out_path).unwrap_or_else(|e| {
+        eprintln!("Failed to rename gate worker result: {e}");
+        process::exit(1);
+    });
+}
+
 fn cmd_gate(args: &[String]) {
     let mut config_path: Option<String> = None;
     let mut infer: Option<String> = None;
@@ -1530,6 +1835,9 @@ fn main() {
         }
         "selfplay-worker" => {
             cmd_selfplay_worker(&args[2..]);
+        }
+        "gate-worker" => {
+            cmd_gate_worker(&args[2..]);
         }
         "iter" => {
             if args.len() < 3 {
