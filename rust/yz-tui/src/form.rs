@@ -36,6 +36,7 @@ pub enum FieldId {
     // inference
     InferBind,
     InferDevice,
+    InferProtocolVersion,
     InferMaxBatch,
     InferMaxWaitUs,
     InferTorchThreads,
@@ -91,6 +92,7 @@ impl FieldId {
             // System: Inference server settings
             FieldId::InferBind
             | FieldId::InferDevice
+            | FieldId::InferProtocolVersion
             | FieldId::InferMaxBatch
             | FieldId::InferMaxWaitUs
             | FieldId::InferTorchThreads
@@ -139,6 +141,7 @@ impl FieldId {
         match self {
             FieldId::InferBind => "inference.bind",
             FieldId::InferDevice => "inference.device",
+            FieldId::InferProtocolVersion => "inference.protocol_version",
             FieldId::InferMaxBatch => "inference.max_batch",
             FieldId::InferMaxWaitUs => "inference.max_wait_us",
             FieldId::InferTorchThreads => "inference.torch_threads",
@@ -237,6 +240,7 @@ pub const ALL_FIELDS: &[FieldId] = &[
     // System: Inference server settings
     FieldId::InferBind,
     FieldId::InferDevice,
+    FieldId::InferProtocolVersion,
     FieldId::InferMaxBatch,
     FieldId::InferMaxWaitUs,
     FieldId::InferTorchThreads,

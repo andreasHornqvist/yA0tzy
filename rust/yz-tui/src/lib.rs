@@ -588,6 +588,14 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 app.cfg.inference.device = "cpu".to_string();
             }
         }
+        FieldId::InferProtocolVersion => {
+            // Toggle between v1 and v2.
+            app.cfg.inference.protocol_version = if app.cfg.inference.protocol_version == 2 {
+                1
+            } else {
+                2
+            };
+        }
         FieldId::MctsTempKind => {
             let t0 = match app.cfg.mcts.temperature_schedule {
                 TemperatureSchedule::Constant { t0 } => t0,
@@ -653,6 +661,15 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 Ok(())
             } else {
                 Err("inference.device must be cpu|cuda".to_string())
+            }
+        }
+        FieldId::InferProtocolVersion => {
+            let v = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
+            if v == 1 || v == 2 {
+                cfg.inference.protocol_version = v;
+                Ok(())
+            } else {
+                Err("inference.protocol_version must be 1|2".to_string())
             }
         }
         FieldId::InferMaxBatch => {
@@ -876,6 +893,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
     match field {
         FieldId::InferBind => cfg.inference.bind.clone(),
         FieldId::InferDevice => cfg.inference.device.clone(),
+        FieldId::InferProtocolVersion => cfg.inference.protocol_version.to_string(),
         FieldId::InferMaxBatch => cfg.inference.max_batch.to_string(),
         FieldId::InferMaxWaitUs => cfg.inference.max_wait_us.to_string(),
         FieldId::InferTorchThreads => cfg
