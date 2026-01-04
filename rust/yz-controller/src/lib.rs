@@ -158,6 +158,16 @@ fn python_project_dir_from_run_dir(run_dir: &Path) -> PathBuf {
     repo_root_from_run_dir(run_dir).join("python")
 }
 
+fn uv_available() -> bool {
+    Command::new("uv")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn get_server_capabilities(metrics_bind: &str) -> Result<ServerCapabilities, ControllerError> {
     let url = format!("http://{}/capabilities", metrics_bind);
     let resp = ureq::get(&url)
@@ -194,13 +204,9 @@ fn build_infer_server_command(
     python_exe: &str,
 ) -> Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
-    let use_uv = Command::new("uv")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Fallback: invoke the provided python executable directly.
+    let use_uv = (python_exe == "python")
+        && uv_available();
 
     let py_dir = python_project_dir_from_run_dir(run_dir);
 
@@ -211,6 +217,14 @@ fn build_infer_server_command(
     let max_wait_us = cfg.inference.max_wait_us.to_string();
     let torch_threads = cfg.inference.torch_threads.map(|x| x.to_string());
     let torch_interop_threads = cfg.inference.torch_interop_threads.map(|x| x.to_string());
+    let print_stats_every_s = if matches!(
+        std::env::var("YZ_INFER_PRINT_STATS").as_deref(),
+        Ok("1" | "true" | "yes")
+    ) {
+        "2.0"
+    } else {
+        "0"
+    };
 
     if use_uv {
         let mut cmd = Command::new("uv");
@@ -228,7 +242,7 @@ fn build_infer_server_command(
         if let Some(v) = torch_interop_threads.as_deref() {
             cmd.args(["--torch-interop-threads", v]);
         }
-        cmd.args(["--print-stats-every-s", "0"]);
+        cmd.args(["--print-stats-every-s", print_stats_every_s]);
         cmd
     } else {
         let mut cmd = Command::new(python_exe);
@@ -246,7 +260,7 @@ fn build_infer_server_command(
         if let Some(v) = torch_interop_threads.as_deref() {
             cmd.args(["--torch-interop-threads", v]);
         }
-        cmd.args(["--print-stats-every-s", "0"]);
+        cmd.args(["--print-stats-every-s", print_stats_every_s]);
         cmd
     }
 }
@@ -541,43 +555,71 @@ pub fn spawn_iteration(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = Arc::clone(&cancel);
     let join = std::thread::spawn(move || {
+        // Ensure we always attempt to stop the inference server on exit (success/cancel/error).
+        // Per TUI semantics: always shut down the server at config.inference.metrics_bind.
+        struct ShutdownGuard {
+            metrics_bind: String,
+            infer_srv: Option<InferServerChild>,
+        }
+        impl Drop for ShutdownGuard {
+            fn drop(&mut self) {
+                let _ = shutdown_server(&self.metrics_bind);
+                // Drop infer server child last; if it was started by us, this guarantees teardown.
+                // If the server was reused (no child), shutdown_server above still applies.
+                let _ = self.infer_srv.take();
+            }
+        }
+
         // Create a controller bound to the shared cancel token.
         let ctrl = IterationController {
             run_dir: run_dir.clone(),
             cancel: cancel2,
         };
-        // Ensure manifest/config snapshot exists even if cancelled early.
-        let mut manifest = ensure_manifest(&run_dir, &cfg)?;
-
-        let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
-
-        // Absolute semantics: controller_iteration_idx is the number of completed iterations so far.
-        // If already complete, do a no-op and do NOT start subprocesses (infer-server / model-init).
-        if manifest.controller_iteration_idx >= total_iters {
-            ctrl.set_phase(
-                Phase::Done,
-                format!(
-                    "done (completed {}/{})",
-                    manifest.controller_iteration_idx, total_iters
-                ),
-            )?;
-            return Ok(());
-        }
-
-        // Ensure inference server is running (owned by controller for this iteration).
-        // If one is already running, we reuse it.
-        let _infer_srv = ensure_infer_server(&run_dir, &cfg, &python_exe)?;
-
-        // E13.2S2: Ensure best.pt exists (bootstrap via model-init if missing).
-        ensure_best_pt(&run_dir, &cfg, &python_exe)?;
-
         let res: Result<(), ControllerError> = (|| {
+            // Enforce uv-managed Python when using PATH python (TUI default).
+            if python_exe == "python" && !uv_available() {
+                return Err(ControllerError::InferServer(
+                    "uv not found on PATH. Install uv (recommended) or run yz-controller with an explicit python_exe.".to_string(),
+                ));
+            }
+
+            // Ensure manifest/config snapshot exists even if cancelled early.
+            let mut manifest = ensure_manifest(&run_dir, &cfg)?;
+
+            let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
+
+            // Absolute semantics: controller_iteration_idx is the number of completed iterations so far.
+            // If already complete, do a no-op and do NOT start subprocesses (infer-server / model-init).
+            if manifest.controller_iteration_idx >= total_iters {
+                ctrl.set_phase(
+                    Phase::Done,
+                    format!(
+                        "done (completed {}/{})",
+                        manifest.controller_iteration_idx, total_iters
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            // Ensure inference server is running (owned by controller for this iteration).
+            // If one is already running, we reuse it.
+            let infer_srv = ensure_infer_server(&run_dir, &cfg, &python_exe)?;
+            let _shutdown_guard = ShutdownGuard {
+                metrics_bind: cfg.inference.metrics_bind.clone(),
+                infer_srv,
+            };
+
+            // E13.2S2: Ensure best.pt exists (bootstrap via model-init if missing).
+            ensure_best_pt(&run_dir, &cfg, &python_exe)?;
+
             if ctrl.cancelled() {
+                let _ = ctrl.set_phase(Phase::Selfplay, "shutting down...");
                 return Err(ControllerError::Cancelled);
             }
 
             while manifest.controller_iteration_idx < total_iters {
                 if ctrl.cancelled() {
+                    let _ = ctrl.set_phase(Phase::Selfplay, "shutting down...");
                     return Err(ControllerError::Cancelled);
                 }
 
@@ -605,6 +647,7 @@ pub fn spawn_iteration(
                     iter_idx,
                 )?;
                 if ctrl.cancelled() {
+                    let _ = ctrl.set_phase(Phase::Selfplay, "shutting down...");
                     return Err(ControllerError::Cancelled);
                 }
 
@@ -620,6 +663,7 @@ pub fn spawn_iteration(
 
                 run_train_subprocess(&run_dir, &python_exe, &ctrl, iter_idx)?;
                 if ctrl.cancelled() {
+                    let _ = ctrl.set_phase(Phase::Train, "shutting down...");
                     return Err(ControllerError::Cancelled);
                 }
                 // After training completes, pull the latest train stats from run.json (trainer updates it).
@@ -703,9 +747,11 @@ fn begin_iteration(
         it.promotion_reason = None;
         it.selfplay.started_ts_ms = None;
         it.selfplay.ended_ts_ms = None;
+        it.selfplay.first_game_started_ts_ms = None;
         it.selfplay.games_completed = 0;
         it.gate.started_ts_ms = None;
         it.gate.ended_ts_ms = None;
+        it.gate.first_game_started_ts_ms = None;
         it.gate.games_completed = 0;
         it.gate.win_rate = None;
         it.gate.draw_rate = None;
@@ -758,6 +804,47 @@ fn reload_model(
     model_id: &str,
     checkpoint_path: &Path,
 ) -> Result<(), ControllerError> {
+    // region agent log
+    fn dbg_enabled() -> bool {
+        matches!(std::env::var("YZ_DEBUG_LOG").as_deref(), Ok("1" | "true" | "yes"))
+    }
+    fn dbg_emit(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+        if !dbg_enabled() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "timestamp": yz_logging::now_ms(),
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+        });
+        if let Ok(line) = serde_json::to_string(&payload) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+            {
+                let _ = std::io::Write::write_all(&mut f, line.as_bytes());
+                let _ = std::io::Write::write_all(&mut f, b"\n");
+            }
+        }
+    }
+    let t0 = std::time::Instant::now();
+    dbg_emit(
+        "H_reload",
+        "rust/yz-controller/src/lib.rs:reload_model",
+        "reload start",
+        serde_json::json!({
+            "metrics_bind": metrics_bind,
+            "model_id": model_id,
+            "checkpoint": checkpoint_path.display().to_string(),
+        }),
+    );
+    // endregion agent log
+
     let url = format!("http://{}/reload", metrics_bind);
     let body = ReloadRequest {
         model_id,
@@ -774,6 +861,20 @@ fn reload_model(
     let resp_body: ReloadResponse = resp
         .into_json()
         .map_err(|e| ControllerError::ReloadModel(format!("invalid response JSON: {e}")))?;
+
+    // region agent log
+    dbg_emit(
+        "H_reload",
+        "rust/yz-controller/src/lib.rs:reload_model",
+        "reload done",
+        serde_json::json!({
+            "model_id": model_id,
+            "ok": resp_body.ok,
+            "dt_ms": (t0.elapsed().as_secs_f64() * 1000.0),
+            "error": resp_body.error,
+        }),
+    );
+    // endregion agent log
 
     if resp_body.ok {
         Ok(())
@@ -962,16 +1063,11 @@ fn tail_file(path: &Path, max_bytes: usize) -> Option<String> {
     }
 }
 
-fn build_train_command(run_dir: &Path, python_exe: &str) -> std::process::Command {
+fn build_train_command(run_dir: &Path, python_exe: &str, iter_idx: u32) -> std::process::Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
     // Fallback: invoke the provided python executable directly.
-    let use_uv = std::process::Command::new("uv")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let use_uv = (python_exe == "python")
+        && uv_available();
 
     // We expect the standard repo layout: python package lives under ./python.
     let py_dir = python_project_dir_from_run_dir(run_dir);
@@ -983,6 +1079,9 @@ fn build_train_command(run_dir: &Path, python_exe: &str) -> std::process::Comman
     let replay_dir = run_dir_abs.join("replay");
     let best_pt = run_dir_abs.join("models").join("best.pt");
     let config_yaml = run_dir_abs.join("config.yaml");
+    // Use per-iteration replay snapshots so pruning/new shards never break training.
+    // (Trainer will create this snapshot if missing; it is used to freeze the dataset for that iteration.)
+    let snapshot_path = run_dir_abs.join(format!("replay_snapshot_iter_{iter_idx:03}.json"));
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -997,6 +1096,8 @@ fn build_train_command(run_dir: &Path, python_exe: &str) -> std::process::Comman
             config_yaml.to_string_lossy().as_ref(),
             "--best",
             best_pt.to_string_lossy().as_ref(),
+            "--snapshot",
+            snapshot_path.to_string_lossy().as_ref(),
         ]);
         cmd
     } else {
@@ -1012,6 +1113,8 @@ fn build_train_command(run_dir: &Path, python_exe: &str) -> std::process::Comman
             config_yaml.to_string_lossy().as_ref(),
             "--best",
             best_pt.to_string_lossy().as_ref(),
+            "--snapshot",
+            snapshot_path.to_string_lossy().as_ref(),
         ]);
         cmd
     }
@@ -1023,13 +1126,8 @@ fn build_model_init_command(
     python_exe: &str,
 ) -> std::process::Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
-    let use_uv = std::process::Command::new("uv")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let use_uv = (python_exe == "python")
+        && uv_available();
 
     let py_dir = python_project_dir_from_run_dir(run_dir);
     // Must use absolute path since command runs from py_dir, not cwd.
@@ -1145,7 +1243,7 @@ fn run_train_subprocess(
     let stderr_f = std::fs::File::create(&stderr_path)?;
 
     // Minimal args. Trainer will update run.json and metrics.ndjson itself (E10.5S2).
-    let mut cmd = build_train_command(run_dir, python_exe);
+    let mut cmd = build_train_command(run_dir, python_exe, iter_idx);
     let child = cmd
         .stdout(std::process::Stdio::from(stdout_f))
         .stderr(std::process::Stdio::from(stderr_f))
@@ -1238,12 +1336,15 @@ fn run_selfplay(
         children.push((wid, games_for, child));
     }
 
-    fn read_worker_progress_sum(logs_workers_dir: &Path) -> u32 {
+    fn read_worker_progress_sum(logs_workers_dir: &Path) -> (u32, Option<u64>) {
         #[derive(serde::Deserialize)]
         struct P {
             games_completed: u32,
+            #[serde(default)]
+            first_game_started_ts_ms: Option<u64>,
         }
         let mut sum = 0u32;
+        let mut first_game_min: Option<u64> = None;
         if let Ok(rd) = std::fs::read_dir(logs_workers_dir) {
             for e in rd.flatten() {
                 let p = e.path();
@@ -1254,11 +1355,17 @@ fn run_selfplay(
                 if let Ok(bytes) = std::fs::read(&f) {
                     if let Ok(pp) = serde_json::from_slice::<P>(&bytes) {
                         sum = sum.saturating_add(pp.games_completed);
+                        if let Some(ts) = pp.first_game_started_ts_ms {
+                            first_game_min = Some(match first_game_min {
+                                Some(cur) => cur.min(ts),
+                                None => ts,
+                            });
+                        }
                     }
                 }
             }
         }
-        sum
+        (sum, first_game_min)
     }
 
     let mut completed_games: u32;
@@ -1297,12 +1404,16 @@ fn run_selfplay(
 
         // Live progress: periodically sum worker progress files and update run.json for the TUI.
         if last_manifest_ts.elapsed() >= Duration::from_millis(250) {
-            completed_games = read_worker_progress_sum(&logs_workers_dir).min(games_total);
+            let (sum, first_game_min) = read_worker_progress_sum(&logs_workers_dir);
+            completed_games = sum.min(games_total);
             let total = base_total + completed_games as u64;
             manifest.selfplay_games_completed = total;
             if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
                 it.selfplay.games_completed = completed_games as u64;
                 it.selfplay.games_target = games_total as u64;
+                if it.selfplay.first_game_started_ts_ms.is_none() {
+                    it.selfplay.first_game_started_ts_ms = first_game_min;
+                }
             }
             let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
             last_manifest_ts = std::time::Instant::now();
@@ -1316,6 +1427,10 @@ fn run_selfplay(
     if let Some(it) = manifest.iterations.iter_mut().find(|it| it.idx == iter_idx) {
         it.selfplay.games_completed = completed_games as u64;
         it.selfplay.games_target = games_total as u64;
+        if it.selfplay.first_game_started_ts_ms.is_none() {
+            // Best-effort: if not observed during polling, approximate as phase start.
+            it.selfplay.first_game_started_ts_ms = it.selfplay.started_ts_ms;
+        }
     }
     let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
 
@@ -1549,12 +1664,15 @@ fn run_gate(
         children.push((*wid, out_path, child));
     }
 
-    fn read_gate_worker_progress_sum(logs_gate_workers_dir: &Path) -> u32 {
+    fn read_gate_worker_progress_sum(logs_gate_workers_dir: &Path) -> (u32, Option<u64>) {
         #[derive(serde::Deserialize)]
         struct P {
             games_completed: u32,
+            #[serde(default)]
+            first_game_started_ts_ms: Option<u64>,
         }
         let mut sum = 0u32;
+        let mut first_game_min: Option<u64> = None;
         if let Ok(rd) = std::fs::read_dir(logs_gate_workers_dir) {
             for e in rd.flatten() {
                 let p = e.path();
@@ -1565,11 +1683,17 @@ fn run_gate(
                 if let Ok(bytes) = std::fs::read(&f) {
                     if let Ok(pp) = serde_json::from_slice::<P>(&bytes) {
                         sum = sum.saturating_add(pp.games_completed);
+                        if let Some(ts) = pp.first_game_started_ts_ms {
+                            first_game_min = Some(match first_game_min {
+                                Some(cur) => cur.min(ts),
+                                None => ts,
+                            });
+                        }
                     }
                 }
             }
         }
-        sum
+        (sum, first_game_min)
     }
 
     let mut last_manifest_ts = std::time::Instant::now();
@@ -1604,11 +1728,15 @@ fn run_gate(
 
         // Live progress: sum worker progress and update run.json for the TUI.
         if last_manifest_ts.elapsed() >= Duration::from_millis(250) {
-            let completed = read_gate_worker_progress_sum(&logs_gate_workers_dir).min(total_games);
+            let (sum, first_game_min) = read_gate_worker_progress_sum(&logs_gate_workers_dir);
+            let completed = sum.min(total_games);
             if let Ok(mut mm) = yz_logging::read_manifest(&run_json) {
                 if let Some(it) = mm.iterations.iter_mut().find(|it| it.idx == iter_idx) {
                     it.gate.games_completed = completed as u64;
                     it.gate.games_target = total_games as u64;
+                    if it.gate.first_game_started_ts_ms.is_none() {
+                        it.gate.first_game_started_ts_ms = first_game_min;
+                    }
                 }
                 let _ = yz_logging::write_manifest_atomic(&run_json, &mm);
             }
@@ -2058,7 +2186,7 @@ mod cancel_tests {
         // E13.2S1: controller passes --best to trainer.
         let dir = tempfile::tempdir().unwrap();
         let run_dir = dir.path();
-        let cmd = build_train_command(run_dir, "python");
+        let cmd = build_train_command(run_dir, "python", 0);
 
         // Collect args as strings for easy searching.
         let args: Vec<String> = cmd

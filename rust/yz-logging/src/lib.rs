@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// region agent log
+fn dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("YZ_DEBUG_LOG").as_deref(), Ok("1" | "true" | "yes")))
+}
+// endregion agent log
+
 /// Run manifest schema version (Epic E8.5).
 pub const RUN_MANIFEST_VERSION: u32 = 1;
 
@@ -117,6 +124,10 @@ pub struct IterSelfplaySummaryV1 {
     pub started_ts_ms: Option<u64>,
     #[serde(default)]
     pub ended_ts_ms: Option<u64>,
+    /// Timestamp when the first self-play game actually started (first worker enters the game loop).
+    /// Used by the TUI to show "setup time" vs "running time".
+    #[serde(default)]
+    pub first_game_started_ts_ms: Option<u64>,
     pub games_target: u64,
     pub games_completed: u64,
 }
@@ -140,6 +151,10 @@ pub struct IterGateSummaryV1 {
     pub started_ts_ms: Option<u64>,
     #[serde(default)]
     pub ended_ts_ms: Option<u64>,
+    /// Timestamp when the first gating game actually started (first worker enters the game loop).
+    /// Used by the TUI to show "setup time" vs "running time".
+    #[serde(default)]
+    pub first_game_started_ts_ms: Option<u64>,
     pub games_target: u64,
     pub games_completed: u64,
     pub win_rate: Option<f64>,
@@ -541,6 +556,9 @@ fn log_debug_outlier(
     ndjson_path: Option<&Path>,
     dt_ms: f64,
 ) -> io::Result<()> {
+    if !dbg_enabled() {
+        return Ok(());
+    }
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -567,6 +585,9 @@ fn log_debug_outlier(
 static DBG_OUTLIER_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 
 fn dbg_outlier_send(line: String) {
+    if !dbg_enabled() {
+        return;
+    }
     let tx = DBG_OUTLIER_TX.get_or_init(|| dbg_outlier_start().unwrap_or_else(dbg_outlier_drop));
     let _ = tx.send(line);
 }

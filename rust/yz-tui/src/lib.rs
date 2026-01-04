@@ -50,8 +50,15 @@ struct App {
 
     dashboard_manifest: Option<RunManifestV1>,
     dashboard_err: Option<String>,
+    dashboard_planned_total_iterations: Option<u32>,
+    dashboard_planned_loaded_for_run: Option<String>,
 
     iter: Option<yz_controller::IterationHandle>,
+
+    /// Shutdown state: set when user cancels (x) or quits (q) during an active run.
+    shutdown_requested: bool,
+    /// If true, exit the TUI after shutdown completes.
+    shutdown_exit_after: bool,
 
     /// Input buffer for naming a new run.
     naming_input: String,
@@ -70,7 +77,11 @@ impl App {
             form: FormState::default(),
             dashboard_manifest: None,
             dashboard_err: None,
+            dashboard_planned_total_iterations: None,
+            dashboard_planned_loaded_for_run: None,
             iter: None,
+            shutdown_requested: false,
+            shutdown_exit_after: false,
             naming_input: String::new(),
         }
     }
@@ -178,6 +189,8 @@ impl App {
         let Some(run_dir) = self.run_dir() else {
             self.dashboard_manifest = None;
             self.dashboard_err = None;
+            self.dashboard_planned_total_iterations = None;
+            self.dashboard_planned_loaded_for_run = None;
             return;
         };
         let run_json = run_dir.join("run.json");
@@ -196,6 +209,19 @@ impl App {
                 self.dashboard_err = Some(format!("failed to read run.json: {e}"));
             }
         }
+
+        // Load planned iterations (best-effort) once per active run.
+        let rid = self.active_run_id.clone().unwrap_or_default();
+        if self.dashboard_planned_loaded_for_run.as_deref() != Some(rid.as_str()) {
+            self.dashboard_planned_loaded_for_run = Some(rid);
+            self.dashboard_planned_total_iterations = None;
+            let cfg_path = run_dir.join("config.yaml");
+            if cfg_path.exists() {
+                if let Ok(cfg) = yz_core::Config::load(&cfg_path) {
+                    self.dashboard_planned_total_iterations = cfg.controller.total_iterations;
+                }
+            }
+        }
     }
 
     fn enter_dashboard(&mut self) {
@@ -204,7 +230,11 @@ impl App {
         }
         self.refresh_dashboard();
         self.screen = Screen::Dashboard;
-        self.status = "r refresh | x cancel | Esc back | q quit".to_string();
+        if self.shutdown_requested {
+            self.status = "cancelling… waiting for shutdown | r refresh".to_string();
+        } else {
+            self.status = "r refresh | x cancel | Esc back | q quit".to_string();
+        }
     }
 
     fn start_iteration(&mut self) {
@@ -224,14 +254,6 @@ impl App {
             return;
         }
 
-        // Snapshot semantics: only allow start if config.yaml does not exist (run-local snapshot).
-        let snap = run_dir.join("config.yaml");
-        if snap.exists() {
-            self.status = "config.yaml already exists; create a new run to start with a new config"
-                .to_string();
-            return;
-        }
-
         // Best-effort save draft before starting.
         self.save_config_draft();
 
@@ -247,9 +269,28 @@ impl App {
     fn cancel_iteration_hard(&mut self) {
         if let Some(h) = &self.iter {
             h.cancel_hard();
-            self.status = "cancel requested".to_string();
+            self.shutdown_requested = true;
+            self.shutdown_exit_after = false;
+            self.status = "cancelling… waiting for shutdown".to_string();
         } else {
             self.status = "no active run".to_string();
+        }
+    }
+
+    fn request_quit_or_cancel(&mut self) -> bool {
+        // Returns true if the UI should exit immediately.
+        if self.iter.is_some() {
+            // Always route to dashboard while shutting down so the user can see status.
+            self.enter_dashboard();
+            if let Some(h) = &self.iter {
+                h.cancel_hard();
+            }
+            self.shutdown_requested = true;
+            self.shutdown_exit_after = true;
+            self.status = "cancelling… waiting for shutdown".to_string();
+            false
+        } else {
+            true
         }
     }
 }
@@ -310,7 +351,11 @@ pub fn run() -> io::Result<()> {
                 }
                 match app.screen {
                     Screen::Home => match k.code {
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
                         KeyCode::Char('r') => app.refresh_runs(),
                         KeyCode::Char('n') => {
                             app.naming_input.clear();
@@ -344,6 +389,11 @@ pub fn run() -> io::Result<()> {
                             }
                             app.naming_input.clear();
                         }
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
                         KeyCode::Backspace => {
                             app.naming_input.pop();
                         }
@@ -355,7 +405,11 @@ pub fn run() -> io::Result<()> {
                         _ => {}
                     },
                     Screen::Config => match k.code {
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
                         KeyCode::Esc => {
                             app.screen = Screen::Home;
                             app.active_run_id = None;
@@ -367,7 +421,11 @@ pub fn run() -> io::Result<()> {
                         _ => handle_config_key(&mut app, k),
                     },
                     Screen::Dashboard => match k.code {
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
                         KeyCode::Esc => {
                             app.screen = Screen::Config;
                             app.status = config_help(&app.form);
@@ -396,15 +454,31 @@ pub fn run() -> io::Result<()> {
                             } else {
                                 "Failed"
                             };
-                            app.status =
-                                format!("{msg} | r refresh | g start | Esc back | q quit");
+                            // Surface a short error so failures are diagnosable without digging in logs.
+                            let mut detail = e.to_string();
+                            const MAX: usize = 180;
+                            if detail.len() > MAX {
+                                detail.truncate(MAX);
+                                detail.push_str("…");
+                            }
+                            app.status = format!(
+                                "{msg}: {detail} | r refresh | g start | Esc back | q quit"
+                            );
                         }
                     }
                     app.refresh_dashboard();
+                    if app.shutdown_exit_after {
+                        break;
+                    }
+                    app.shutdown_requested = false;
+                    app.shutdown_exit_after = false;
                 }
             }
             if matches!(app.screen, Screen::Dashboard) {
                 app.refresh_dashboard();
+                if app.shutdown_requested {
+                    app.status = "cancelling… waiting for shutdown | r refresh".to_string();
+                }
             }
             last_tick = Instant::now();
         }
@@ -1230,6 +1304,35 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             let mut left: Vec<Line> = Vec::new();
             match (&app.dashboard_manifest, &app.dashboard_err) {
                 (Some(m), _) => {
+                    // Iteration-level AvgIter + ETA (completed iterations only).
+                    if let Some(total_planned) = app.dashboard_planned_total_iterations {
+                        let mut completed_durs_ms: Vec<u64> = Vec::new();
+                        for it in &m.iterations {
+                            if let Some(end) = it.ended_ts_ms {
+                                completed_durs_ms.push(end.saturating_sub(it.started_ts_ms));
+                            }
+                        }
+                        if !completed_durs_ms.is_empty() {
+                            let sum: u64 = completed_durs_ms.iter().sum();
+                            let avg_ms = sum / completed_durs_ms.len() as u64;
+                            let avg_s = avg_ms / 1000;
+                            let avg_m = avg_s / 60;
+                            let avg_s_rem = avg_s % 60;
+                            left.push(Line::from(format!(" AvgIter: {avg_m}m {avg_s_rem:02}s")));
+
+                            let completed_iters = completed_durs_ms.len() as u32;
+                            let remaining = total_planned.saturating_sub(completed_iters);
+                            let eta_ms = avg_ms.saturating_mul(remaining as u64);
+                            let eta_s = eta_ms / 1000;
+                            let eta_m = eta_s / 60;
+                            let eta_s_rem = eta_s % 60;
+                            left.push(Line::from(format!(
+                                " ETA: {eta_m}m {eta_s_rem:02}s (remaining {remaining}/{total_planned})"
+                            )));
+                            left.push(Line::from(""));
+                        }
+                    }
+
                     // Header row
                     left.push(Line::from(Span::styled(
                         " Iter   Decision   WinRate   Oracle    Loss (t/p/v)",
@@ -1352,17 +1455,37 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
                             // Timing stats
                             if let Some(started) = it.selfplay.started_ts_ms {
-                                let elapsed_ms = now_ms.saturating_sub(started);
-                                if done > 0 {
-                                    let avg_ms = elapsed_ms / done as u64;
-                                    let remaining = tot.saturating_sub(done);
-                                    let eta_ms = avg_ms * remaining as u64;
-                                    let avg_s = avg_ms as f64 / 1000.0;
-                                    let eta_s = eta_ms / 1000;
-                                    let eta_m = eta_s / 60;
-                                    let eta_s_rem = eta_s % 60;
+                                if let Some(first) = it.selfplay.first_game_started_ts_ms {
+                                    let setup_ms = first.saturating_sub(started);
+                                    let s = setup_ms / 1000;
+                                    let m2 = s / 60;
+                                    let s2 = s % 60;
+                                    right_lines.push(Line::from(format!("setup: {m2}m {s2:02}s")));
+                                    let run_ms = now_ms.saturating_sub(first);
+                                    let rs = run_ms / 1000;
+                                    let rm = rs / 60;
+                                    let rs2 = rs % 60;
+                                    right_lines.push(Line::from(format!("running: {rm}m {rs2:02}s")));
+
+                                    if done > 0 {
+                                        let avg_ms = run_ms / done as u64;
+                                        let remaining = tot.saturating_sub(done);
+                                        let eta_ms = avg_ms * remaining as u64;
+                                        let avg_s = avg_ms as f64 / 1000.0;
+                                        let eta_s = eta_ms / 1000;
+                                        let eta_m = eta_s / 60;
+                                        let eta_s_rem = eta_s % 60;
+                                        right_lines.push(Line::from(format!(
+                                            "avg: {avg_s:.1}s/game  ETA: {eta_m}m {eta_s_rem}s"
+                                        )));
+                                    }
+                                } else {
+                                    let elapsed_ms = now_ms.saturating_sub(started);
+                                    let s = elapsed_ms / 1000;
+                                    let m2 = s / 60;
+                                    let s2 = s % 60;
                                     right_lines.push(Line::from(format!(
-                                        "avg: {avg_s:.1}s/game  ETA: {eta_m}m {eta_s_rem}s"
+                                        "setup: {m2}m {s2:02}s (waiting for first game)"
                                     )));
                                 }
                             }
@@ -1375,17 +1498,37 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
                             // Timing stats
                             if let Some(started) = it.gate.started_ts_ms {
-                                let elapsed_ms = now_ms.saturating_sub(started);
-                                if done > 0 {
-                                    let avg_ms = elapsed_ms / done as u64;
-                                    let remaining = tot.saturating_sub(done);
-                                    let eta_ms = avg_ms * remaining as u64;
-                                    let avg_s = avg_ms as f64 / 1000.0;
-                                    let eta_s = eta_ms / 1000;
-                                    let eta_m = eta_s / 60;
-                                    let eta_s_rem = eta_s % 60;
+                                if let Some(first) = it.gate.first_game_started_ts_ms {
+                                    let setup_ms = first.saturating_sub(started);
+                                    let s = setup_ms / 1000;
+                                    let m2 = s / 60;
+                                    let s2 = s % 60;
+                                    right_lines.push(Line::from(format!("setup: {m2}m {s2:02}s")));
+                                    let run_ms = now_ms.saturating_sub(first);
+                                    let rs = run_ms / 1000;
+                                    let rm = rs / 60;
+                                    let rs2 = rs % 60;
+                                    right_lines.push(Line::from(format!("running: {rm}m {rs2:02}s")));
+
+                                    if done > 0 {
+                                        let avg_ms = run_ms / done as u64;
+                                        let remaining = tot.saturating_sub(done);
+                                        let eta_ms = avg_ms * remaining as u64;
+                                        let avg_s = avg_ms as f64 / 1000.0;
+                                        let eta_s = eta_ms / 1000;
+                                        let eta_m = eta_s / 60;
+                                        let eta_s_rem = eta_s % 60;
+                                        right_lines.push(Line::from(format!(
+                                            "avg: {avg_s:.1}s/game  ETA: {eta_m}m {eta_s_rem}s"
+                                        )));
+                                    }
+                                } else {
+                                    let elapsed_ms = now_ms.saturating_sub(started);
+                                    let s = elapsed_ms / 1000;
+                                    let m2 = s / 60;
+                                    let s2 = s % 60;
                                     right_lines.push(Line::from(format!(
-                                        "avg: {avg_s:.1}s/game  ETA: {eta_m}m {eta_s_rem}s"
+                                        "setup: {m2}m {s2:02}s (waiting for first game)"
                                     )));
                                 }
                             }
