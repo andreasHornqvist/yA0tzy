@@ -148,7 +148,7 @@ pub fn apply_action(
     let avail_mask = state.players[p].avail_mask;
     let legal = legal_action_mask(avail_mask, state.rerolls_left);
     let idx = action_to_index(action) as usize;
-    if !legal[idx] {
+    if !crate::legal_is_legal(legal, idx) {
         return Err(ApplyError::IllegalAction { action });
     }
 

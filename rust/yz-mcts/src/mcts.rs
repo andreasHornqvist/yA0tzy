@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use thiserror::Error;
-use yz_core::{index_to_action, legal_action_mask, GameState, A};
+use yz_core::{index_to_action, legal_action_mask, GameState, LegalMask, A};
 
 // region agent log
 #[inline]
@@ -288,7 +288,7 @@ impl Mcts {
             if self.cfg.dirichlet_epsilon > 0.0 {
                 let noisy = apply_root_dirichlet_noise(
                     &raw_priors,
-                    &legal,
+                    legal,
                     self.cfg.dirichlet_alpha,
                     self.cfg.dirichlet_epsilon,
                     &mut rng,
@@ -343,8 +343,8 @@ impl Mcts {
                     pe.leaf_state.rerolls_left,
                 );
                 let features = yz_features::encode_state_v1(&pe.leaf_state);
-                let (logits, v) = infer.eval(&features, &legal);
-                let (priors, _used_fallback) = masked_softmax(&logits, &legal, &mut self.stats);
+                let (logits, v) = infer.eval(&features, legal);
+                let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
 
                 let leaf = self.arena.get_mut(pe.leaf_node);
                 if !leaf.is_expanded {
@@ -420,7 +420,7 @@ impl Mcts {
             root_state.players[root_state.player_to_move as usize].avail_mask,
             root_state.rerolls_left,
         );
-        let root_ticket = backend.submit(&root_state, &legal).ok(); // if submit fails, we'll fallback in tick()
+        let root_ticket = backend.submit(&root_state, legal).ok(); // if submit fails, we'll fallback in tick()
 
         SearchDriver {
             root_state,
@@ -483,7 +483,7 @@ impl Mcts {
                 state.players[state.player_to_move as usize].avail_mask,
                 state.rerolls_left,
             );
-            let a_idx = self.select_action(node_id, &legal, mode) as usize;
+            let a_idx = self.select_action(node_id, legal, mode) as usize;
             let action = index_to_action(a_idx as u8);
             let next_state = match yz_core::apply_action(state, action, ctx) {
                 Ok(s2) => s2,
@@ -548,9 +548,9 @@ impl Mcts {
             state.rerolls_left,
         );
         let features = yz_features::encode_state_v1(state);
-        let (logits, v) = infer.eval(&features, &legal);
+        let (logits, v) = infer.eval(&features, legal);
 
-        let (priors, used_fallback) = masked_softmax(&logits, &legal, &mut self.stats);
+        let (priors, used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
 
         let n = self.arena.get_mut(node_id);
         n.is_expanded = true;
@@ -573,7 +573,7 @@ impl Mcts {
             leaf_state.rerolls_left,
         );
         let logits = vec_logits_to_array(&resp.policy_logits);
-        let (priors, _used_fallback) = masked_softmax(&logits, &legal, &mut self.stats);
+        let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
 
         let leaf = self.arena.get_mut(leaf_node);
         if !leaf.is_expanded {
@@ -586,7 +586,7 @@ impl Mcts {
         self.backup_with_virtual_loss(path, resp.value.clamp(-1.0, 1.0));
     }
 
-    fn select_action(&mut self, node_id: NodeId, legal: &[bool; A], mode: ChanceMode) -> u8 {
+    fn select_action(&mut self, node_id: NodeId, legal: LegalMask, mode: ChanceMode) -> u8 {
         let n = self.arena.get(node_id);
         let use_vl = self.cfg.virtual_loss > 0.0;
         let n_sum_eff = if use_vl {
@@ -599,8 +599,8 @@ impl Mcts {
         let mut best_score = f32::NEG_INFINITY;
         let mut best_a: u8 = 0;
 
-        for (a, &ok) in legal.iter().enumerate() {
-            if !ok {
+        for a in 0..A {
+            if !legal_ok(legal, a) {
                 continue;
             }
             let q = n.q_eff(a, use_vl);
@@ -659,14 +659,14 @@ impl Mcts {
 
         if self.force_uniform_root_pi {
             // Guardrail: if priors were invalid at root (fallback), return uniform-over-legal `pi`.
-            let pi = uniform_over_legal(&legal);
+            let pi = uniform_over_legal(legal);
             return (pi, 0.0);
         }
 
         let mut pi = [0.0f32; A];
         let mut sum = 0.0f32;
-        for (a, &ok) in legal.iter().enumerate() {
-            if ok {
+        for a in 0..A {
+            if legal_ok(legal, a) {
                 let v = root.n[a] as f32;
                 pi[a] = v;
                 sum += v;
@@ -676,11 +676,16 @@ impl Mcts {
             // fallback uniform
             // count as a fallback event (pi degenerate)
             // (we can't mutate self.stats here; this is a pure read path)
-            let cnt = legal.iter().filter(|&&ok| ok).count();
+            let mut cnt = 0usize;
+            for a in 0..A {
+                if legal_ok(legal, a) {
+                    cnt += 1;
+                }
+            }
             if cnt > 0 {
                 let u = 1.0 / (cnt as f32);
-                for (a, &ok) in legal.iter().enumerate() {
-                    if ok {
+                for a in 0..A {
+                    if legal_ok(legal, a) {
                         pi[a] = u;
                     }
                 }
@@ -694,8 +699,8 @@ impl Mcts {
         // Root value estimate: mean Q over legal actions weighted by visits (or 0 if none).
         let mut v = 0.0f32;
         if sum > 0.0 {
-            for (a, &ok) in legal.iter().enumerate() {
-                if ok {
+            for a in 0..A {
+                if legal_ok(legal, a) {
                     v += (root.n[a] as f32) * root.q(a);
                 }
             }
@@ -713,7 +718,7 @@ impl Mcts {
 pub fn bench_select_action_v1(
     cfg: &MctsConfig,
     node: &Node,
-    legal: &[bool; A],
+    legal: LegalMask,
     mode: ChanceMode,
 ) -> u8 {
     let use_vl = cfg.virtual_loss > 0.0;
@@ -727,8 +732,8 @@ pub fn bench_select_action_v1(
     let mut best_score = f32::NEG_INFINITY;
     let mut best_a: u8 = 0;
 
-    for (a, &ok) in legal.iter().enumerate() {
-        if !ok {
+    for a in 0..A {
+        if !legal_ok(legal, a) {
             continue;
         }
         let q = node.q_eff(a, use_vl);
@@ -925,7 +930,7 @@ impl SearchDriver {
                             pe.leaf_state.players[pe.leaf_state.player_to_move as usize].avail_mask,
                             pe.leaf_state.rerolls_left,
                         );
-                        let ticket = match backend.submit(&pe.leaf_state, &legal) {
+                        let ticket = match backend.submit(&pe.leaf_state, legal) {
                             Ok(t) => t,
                             Err(_) => {
                                 mcts.backup_with_virtual_loss(&pe.path, 0.0);
@@ -1061,7 +1066,7 @@ impl SearchDriver {
 
         let Some(ticket) = &self.root_ticket else {
             mcts.stats.fallbacks += 1;
-            let priors = uniform_over_legal(&legal);
+            let priors = uniform_over_legal(legal);
             let n = mcts.arena.get_mut(self.root_id);
             n.is_expanded = true;
             n.to_play = self.root_state.player_to_move;
@@ -1076,7 +1081,7 @@ impl SearchDriver {
         match ticket.try_recv() {
             Ok(Some(resp)) => {
                 let logits = vec_logits_to_array(&resp.policy_logits);
-                let (mut priors, used_fallback) = masked_softmax(&logits, &legal, &mut mcts.stats);
+                let (mut priors, used_fallback) = masked_softmax(&logits, legal, &mut mcts.stats);
                 if used_fallback {
                     mcts.force_uniform_root_pi = true;
                 }
@@ -1090,7 +1095,7 @@ impl SearchDriver {
                         let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xD1E7_C437_9E37_79B9u64);
                         let noisy = apply_root_dirichlet_noise(
                             &priors,
-                            &legal,
+                            legal,
                             mcts.cfg.dirichlet_alpha,
                             mcts.cfg.dirichlet_epsilon,
                             &mut rng,
@@ -1111,7 +1116,7 @@ impl SearchDriver {
             Err(_) => {
                 // Treat as fallback.
                 mcts.stats.fallbacks += 1;
-                let priors = uniform_over_legal(&legal);
+                let priors = uniform_over_legal(legal);
                 let n = mcts.arena.get_mut(self.root_id);
                 n.is_expanded = true;
                 n.to_play = self.root_state.player_to_move;
@@ -1149,16 +1154,21 @@ fn vec_logits_to_array(v: &[f32]) -> [f32; A] {
     out
 }
 
+#[inline]
+fn legal_ok(legal: LegalMask, idx: usize) -> bool {
+    ((legal >> idx) & 1) != 0
+}
+
 fn masked_softmax(
     logits: &[f32; A],
-    legal: &[bool; A],
+    legal: LegalMask,
     stats: &mut SearchStats,
 ) -> ([f32; A], bool) {
     let mut out = [0.0f32; A];
 
     let mut max = f32::NEG_INFINITY;
-    for (a, &ok) in legal.iter().enumerate() {
-        if ok && logits[a].is_finite() {
+    for a in 0..A {
+        if legal_ok(legal, a) && logits[a].is_finite() {
             max = max.max(logits[a]);
         }
     }
@@ -1169,7 +1179,7 @@ fn masked_softmax(
 
     let mut sum = 0.0f32;
     for a in 0..A {
-        if legal[a] {
+        if legal_ok(legal, a) {
             let z = (logits[a] - max).exp();
             if z.is_finite() {
                 out[a] = z;
@@ -1189,11 +1199,11 @@ fn masked_softmax(
     (out, false)
 }
 
-fn uniform_over_legal(legal: &[bool; A]) -> [f32; A] {
+fn uniform_over_legal(legal: LegalMask) -> [f32; A] {
     let mut out = [0.0f32; A];
     let mut cnt = 0usize;
-    for &ok in legal {
-        if ok {
+    for i in 0..A {
+        if legal_ok(legal, i) {
             cnt += 1;
         }
     }
@@ -1201,8 +1211,8 @@ fn uniform_over_legal(legal: &[bool; A]) -> [f32; A] {
         return out;
     }
     let u = 1.0 / (cnt as f32);
-    for (i, &ok) in legal.iter().enumerate() {
-        if ok {
+    for i in 0..A {
+        if legal_ok(legal, i) {
             out[i] = u;
         }
     }
@@ -1211,7 +1221,7 @@ fn uniform_over_legal(legal: &[bool; A]) -> [f32; A] {
 
 fn apply_root_dirichlet_noise(
     p_raw: &[f32; A],
-    legal: &[bool; A],
+    legal: LegalMask,
     alpha: f32,
     eps: f32,
     rng: &mut impl Rng,
@@ -1224,8 +1234,8 @@ fn apply_root_dirichlet_noise(
     let gamma = Gamma::new(alpha as f64, 1.0).expect("alpha>0");
     let mut eta = [0.0f32; A];
     let mut sum = 0.0f64;
-    for (i, &ok) in legal.iter().enumerate() {
-        if ok {
+    for i in 0..A {
+        if legal_ok(legal, i) {
             let x = gamma.sample(rng);
             eta[i] = x as f32;
             sum += x;
@@ -1240,8 +1250,8 @@ fn apply_root_dirichlet_noise(
 
     // Mix.
     let mut out = [0.0f32; A];
-    for (i, &ok) in legal.iter().enumerate() {
-        if ok {
+    for i in 0..A {
+        if legal_ok(legal, i) {
             out[i] = (1.0 - eps) * p_raw[i] + eps * eta[i];
         } else {
             out[i] = 0.0;
@@ -1250,7 +1260,7 @@ fn apply_root_dirichlet_noise(
     out
 }
 
-pub fn apply_temperature(pi_target: &[f32; A], legal: &[bool; A], t: f32) -> [f32; A] {
+pub fn apply_temperature(pi_target: &[f32; A], legal: LegalMask, t: f32) -> [f32; A] {
     // Executed-move distribution only. Caller chooses how/when to sample.
     if !t.is_finite() || t < 0.0 {
         return uniform_over_legal(legal);
@@ -1258,8 +1268,8 @@ pub fn apply_temperature(pi_target: &[f32; A], legal: &[bool; A], t: f32) -> [f3
     if t == 0.0 {
         // Greedy argmax with deterministic tie-break (lowest idx).
         let mut best = None::<(usize, f32)>;
-        for (i, &ok) in legal.iter().enumerate() {
-            if !ok {
+        for i in 0..A {
+            if !legal_ok(legal, i) {
                 continue;
             }
             let v = pi_target[i];
@@ -1281,8 +1291,8 @@ pub fn apply_temperature(pi_target: &[f32; A], legal: &[bool; A], t: f32) -> [f3
     let inv_t = 1.0 / t;
     let mut out = [0.0f32; A];
     let mut sum = 0.0f32;
-    for (i, &ok) in legal.iter().enumerate() {
-        if ok {
+    for i in 0..A {
+        if legal_ok(legal, i) {
             let v = pi_target[i].max(0.0);
             let w = v.powf(inv_t);
             out[i] = w;

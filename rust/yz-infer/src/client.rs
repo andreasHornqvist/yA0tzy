@@ -399,7 +399,7 @@ impl InferenceClient {
                     "try_send_ms": send_ms,
                     "reused_buf": reused,
                     "features_len": req.features.len(),
-                    "legal_len": req.legal_mask.len(),
+                    "legal_len": crate::protocol::ACTION_SPACE_A,
                 }),
             );
         }
@@ -420,7 +420,7 @@ impl InferenceClient {
                                 "n": n,
                                 "encode_ms": enc_ms,
                                 "features_len": req.features.len(),
-                                "legal_len": req.legal_mask.len(),
+                                "legal_len": crate::protocol::ACTION_SPACE_A,
                                 "reused_buf": reused,
                             }),
                         );

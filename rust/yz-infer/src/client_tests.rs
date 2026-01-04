@@ -15,7 +15,7 @@ fn mk_req(model_id: u32) -> InferRequestV1 {
         model_id,
         feature_schema_id: FEATURE_SCHEMA_ID_V1,
         features: vec![0.0; FEATURE_LEN_V1 as usize],
-        legal_mask: vec![1u8; ACTION_SPACE_A as usize],
+        legal_mask: (1u64 << ACTION_SPACE_A) - 1,
     }
 }
 

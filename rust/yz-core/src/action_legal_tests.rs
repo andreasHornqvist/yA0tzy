@@ -51,7 +51,7 @@ mod tests {
         // KeepMasks all illegal
         for idx in 0..=31usize {
             assert!(
-                !legal[idx],
+                ((legal >> idx) & 1) == 0,
                 "KeepMask idx {} should be illegal at rerolls=0",
                 idx
             );
@@ -62,7 +62,8 @@ mod tests {
             let idx = (32 + cat) as usize;
             let should_be_legal = cat == 0 || cat == 14;
             assert_eq!(
-                legal[idx], should_be_legal,
+                (((legal >> idx) & 1) != 0),
+                should_be_legal,
                 "Mark cat {} (idx {}) mismatch",
                 cat, idx
             );
@@ -78,18 +79,21 @@ mod tests {
         // KeepMask 0..=30 legal
         for idx in 0..=30usize {
             assert!(
-                legal[idx],
+                ((legal >> idx) & 1) != 0,
                 "KeepMask idx {} should be legal at rerolls>0",
                 idx
             );
         }
         // KeepMask 31 illegal
-        assert!(!legal[31], "KeepMask(31) should be illegal when rerolls>0");
+        assert!(
+            ((legal >> 31) & 1) == 0,
+            "KeepMask(31) should be illegal when rerolls>0"
+        );
 
         // Marks all legal
         for idx in 32..A {
             assert!(
-                legal[idx],
+                ((legal >> idx) & 1) != 0,
                 "Mark idx {} should be legal when category available",
                 idx
             );

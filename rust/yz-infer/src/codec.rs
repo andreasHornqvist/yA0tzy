@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use crate::protocol::{FLAG_LEGAL_MASK_BITSET, LEGAL_MASK_BITSET_BYTES, PROTOCOL_VERSION_V2};
 use crate::protocol::{
-    InferRequestV1, InferResponseV1, MsgKind, ACTION_SPACE_A, FEATURE_LEN_V1, FEATURE_SCHEMA_ID_V1,
-    PROTOCOL_VERSION,
+    InferRequestV1, InferResponseV1, LegalMask, MsgKind, ACTION_SPACE_A, FEATURE_LEN_V1,
+    FEATURE_SCHEMA_ID_V1, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Error)]
@@ -42,7 +42,7 @@ pub fn encode_request_v1_len(req: &InferRequestV1) -> usize {
     // header: u32 version + u8 kind + u8 flags + u16 reserved = 8 bytes
     // ids: u64 request_id + u32 model_id + u32 schema_id = 16 bytes
     // vectors: u32 features_len + f32[...] + u32 legal_len + u8[...] = 8 + features*4 + legal
-    32 + req.features.len() * 4 + req.legal_mask.len()
+    32 + req.features.len() * 4 + (ACTION_SPACE_A as usize)
 }
 
 pub fn encode_request_v1_into(out: &mut Vec<u8>, req: &InferRequestV1) {
@@ -64,9 +64,9 @@ pub fn encode_request_v1_into(out: &mut Vec<u8>, req: &InferRequestV1) {
         out.extend_from_slice(&f.to_le_bytes());
     }
 
-    let legal_len: u32 = req.legal_mask.len() as u32;
-    out.extend_from_slice(&legal_len.to_le_bytes());
-    out.extend_from_slice(&req.legal_mask);
+    out.extend_from_slice(&(ACTION_SPACE_A as u32).to_le_bytes());
+    let legal_bytes = legal_mask_to_bytes47(req.legal_mask);
+    out.extend_from_slice(&legal_bytes);
 }
 
 pub fn encode_request_into(
@@ -86,11 +86,7 @@ pub fn encode_request_v2_into(out: &mut Vec<u8>, req: &InferRequestV1, legal_mas
     out.clear();
     // header (8) + ids (16) + lens (8) + features bytes + legal bytes
     let features_bytes_len = (req.features.len() * 4) as usize;
-    let legal_bytes_len = if legal_mask_bitset {
-        LEGAL_MASK_BITSET_BYTES
-    } else {
-        req.legal_mask.len()
-    };
+    let legal_bytes_len = if legal_mask_bitset { LEGAL_MASK_BITSET_BYTES } else { ACTION_SPACE_A as usize };
     out.reserve(32 + features_bytes_len + legal_bytes_len);
 
     out.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
@@ -120,36 +116,27 @@ pub fn encode_request_v2_into(out: &mut Vec<u8>, req: &InferRequestV1, legal_mas
     }
 
     if legal_mask_bitset {
-        // Pack 47 bytes (0/1) into 6 bytes (LSB-first).
-        debug_assert_eq!(req.legal_mask.len(), ACTION_SPACE_A as usize);
-        let packed = pack_legal_mask_bitset(&req.legal_mask);
+        let packed = legal_mask_to_bitset_bytes6(req.legal_mask);
         let legal_len: u32 = LEGAL_MASK_BITSET_BYTES as u32;
         out.extend_from_slice(&legal_len.to_le_bytes());
         out.extend_from_slice(&packed);
     } else {
-        let legal_len: u32 = req.legal_mask.len() as u32;
-        out.extend_from_slice(&legal_len.to_le_bytes());
-        out.extend_from_slice(&req.legal_mask);
+        out.extend_from_slice(&(ACTION_SPACE_A as u32).to_le_bytes());
+        let legal_bytes = legal_mask_to_bytes47(req.legal_mask);
+        out.extend_from_slice(&legal_bytes);
     }
 }
 
-fn pack_legal_mask_bitset(legal: &[u8]) -> [u8; LEGAL_MASK_BITSET_BYTES] {
-    // Hot path: keep this cheap. Avoid div/mod in the per-bit loop.
-    debug_assert_eq!(legal.len(), ACTION_SPACE_A as usize);
-    let mut out = [0u8; LEGAL_MASK_BITSET_BYTES];
-    let mut i = 0usize;
-    for byte_i in 0..LEGAL_MASK_BITSET_BYTES {
-        let mut b = 0u8;
-        // LSB-first within each byte.
-        for bit in 0..8usize {
-            if i >= legal.len() {
-                break;
-            }
-            // Legal bytes are 0/1; mask just in case.
-            b |= (legal[i] & 1) << bit;
-            i += 1;
-        }
-        out[byte_i] = b;
+#[inline]
+fn legal_mask_to_bitset_bytes6(mask: LegalMask) -> [u8; LEGAL_MASK_BITSET_BYTES] {
+    let b = mask.to_le_bytes();
+    [b[0], b[1], b[2], b[3], b[4], b[5]]
+}
+
+fn legal_mask_to_bytes47(mask: LegalMask) -> [u8; ACTION_SPACE_A as usize] {
+    let mut out = [0u8; ACTION_SPACE_A as usize];
+    for i in 0..(ACTION_SPACE_A as usize) {
+        out[i] = ((mask >> i) & 1) as u8;
     }
     out
 }
@@ -194,11 +181,15 @@ pub fn decode_request_v1(bytes: &[u8]) -> Result<InferRequestV1, DecodeError> {
             expected: ACTION_SPACE_A,
         });
     }
-    let mut legal_mask = vec![0u8; legal_len as usize];
-    c.read_bytes_into(&mut legal_mask)?;
-    for &b in &legal_mask {
+    let mut legal_bytes = vec![0u8; legal_len as usize];
+    c.read_bytes_into(&mut legal_bytes)?;
+    let mut legal_mask: LegalMask = 0;
+    for (i, &b) in legal_bytes.iter().enumerate() {
         if b != 0 && b != 1 {
             return Err(DecodeError::BadLegalByte(b));
+        }
+        if b == 1 {
+            legal_mask |= 1u64 << i;
         }
     }
 
@@ -453,7 +444,7 @@ mod v2_tests {
             model_id: 7,
             feature_schema_id: FEATURE_SCHEMA_ID_V1,
             features: vec![0.0; FEATURE_LEN_V1 as usize],
-            legal_mask: vec![1u8; ACTION_SPACE_A as usize],
+            legal_mask: (1u64 << ACTION_SPACE_A) - 1,
         };
         let mut out = Vec::new();
         encode_request_v2_into(&mut out, &req, false);
@@ -468,10 +459,7 @@ mod v2_tests {
 
     #[test]
     fn encode_request_v2_bitset_sets_flag_and_uses_6_bytes() {
-        let mut legal = vec![0u8; ACTION_SPACE_A as usize];
-        legal[0] = 1;
-        legal[1] = 1;
-        legal[8] = 1;
+        let legal = (1u64 << 0) | (1u64 << 1) | (1u64 << 8);
         let req = InferRequestV1 {
             request_id: 1,
             model_id: 7,

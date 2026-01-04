@@ -18,6 +18,9 @@ pub const FLAG_LEGAL_MASK_BITSET: u8 = 0x01;
 /// Packed legal mask size in bytes for A=47 (48 bits).
 pub const LEGAL_MASK_BITSET_BYTES: usize = 6;
 
+/// Internal legal mask representation: 47 bits in a u64 (bit i => action i).
+pub type LegalMask = u64;
+
 /// Feature schema id currently supported (PRD Epic E3/E3.5).
 pub const FEATURE_SCHEMA_ID_V1: u32 = 1;
 
@@ -32,7 +35,7 @@ pub struct InferRequestV1 {
     pub model_id: u32,
     pub feature_schema_id: u32,
     pub features: Vec<f32>,  // length = F (for schema)
-    pub legal_mask: Vec<u8>, // length = A, values 0/1
+    pub legal_mask: LegalMask,
 }
 
 #[derive(Debug, Clone, PartialEq)]

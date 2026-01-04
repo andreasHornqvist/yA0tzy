@@ -25,7 +25,7 @@ fn main() {
         model_id: 0,
         feature_schema_id: FEATURE_SCHEMA_ID_V1,
         features: vec![0.0; FEATURE_LEN_V1 as usize],
-        legal_mask: vec![1u8; ACTION_SPACE_A as usize],
+        legal_mask: (1u64 << ACTION_SPACE_A) - 1,
     };
     let resp = InferResponseV1 {
         request_id: 1,

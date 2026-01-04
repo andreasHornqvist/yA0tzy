@@ -29,6 +29,7 @@ pub use engine::{
     terminal_z_from_pov, ApplyError, ChanceMode, TurnContext, FULL_MASK,
 };
 pub use legal::legal_action_mask;
+pub use legal::{is_legal as legal_is_legal, to_u8_array as legal_mask_to_u8_array, LegalMask};
 pub use scoring::{apply_mark_score, scores_for_dice};
 pub use state::{outcome_to_z, GameState, PlayerState};
 

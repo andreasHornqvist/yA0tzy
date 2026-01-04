@@ -152,10 +152,7 @@ impl GameTask {
                     self.state.players[self.state.player_to_move as usize].avail_mask,
                     self.state.rerolls_left,
                 );
-                let mut legal = [0u8; yz_core::A];
-                for (i, &ok) in legal_b.iter().enumerate() {
-                    legal[i] = if ok { 1 } else { 0 };
-                }
+                let legal = yz_core::legal_mask_to_u8_array(legal_b);
                 self.traj.push(PendingSample {
                     features: feats,
                     legal_mask: legal,

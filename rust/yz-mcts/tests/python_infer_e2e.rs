@@ -160,7 +160,7 @@ fn python_infer_server_real_checkpoint_e2e_opt_in() {
     );
     let mut sum = 0.0f32;
     for a in 0..yz_core::A {
-        if legal[a] {
+        if ((legal >> a) & 1) != 0 {
             assert!(res.pi[a].is_finite());
             assert!(res.pi[a] >= 0.0);
             sum += res.pi[a];

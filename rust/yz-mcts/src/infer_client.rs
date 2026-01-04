@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use thiserror::Error;
-use yz_core::{GameState, A};
+use yz_core::{GameState, LegalMask, A};
 use yz_features::{encode_state_v1, schema};
 use yz_infer::protocol;
 use yz_infer::{ClientError, ClientOptions, InferenceClient, Ticket};
@@ -107,19 +107,12 @@ impl InferBackend {
     pub fn submit(
         &self,
         state: &GameState,
-        legal: &[bool; A],
+        legal: LegalMask,
     ) -> Result<Ticket, InferBackendError> {
         let t0 = Instant::now();
         let t_enc0 = Instant::now();
         let features = encode_state_v1(state);
         let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
-
-        let t_mask0 = Instant::now();
-        let mut legal_mask = Vec::with_capacity(A);
-        for &ok in legal.iter() {
-            legal_mask.push(if ok { 1u8 } else { 0u8 });
-        }
-        let mask_ms = t_mask0.elapsed().as_secs_f64() * 1000.0;
 
         let t_req0 = Instant::now();
         let req = protocol::InferRequestV1 {
@@ -127,7 +120,7 @@ impl InferBackend {
             model_id: self.model_id,
             feature_schema_id: self.feature_schema_id,
             features: features.to_vec(),
-            legal_mask,
+            legal_mask: legal,
         };
         let t_submit0 = Instant::now();
         let out = self.client.submit(req)?;
@@ -146,7 +139,6 @@ impl InferBackend {
                     serde_json::json!({
                         "n": n,
                         "enc_ms": enc_ms,
-                        "mask_ms": mask_ms,
                         "req_build_ms": req_build_ms,
                         "client_submit_ms": submit_ms,
                         "total_ms": total_ms,

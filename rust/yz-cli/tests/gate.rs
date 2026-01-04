@@ -31,8 +31,8 @@ fn start_dummy_infer_server_tcp() -> (std::net::SocketAddr, std::thread::JoinHan
                 };
 
                 let mut logits = vec![0.0f32; ACTION_SPACE_A as usize];
-                for (i, &b) in req.legal_mask.iter().enumerate() {
-                    if b == 0 {
+                for i in 0..(ACTION_SPACE_A as usize) {
+                    if ((req.legal_mask >> i) & 1) == 0 {
                         logits[i] = -1.0e9;
                     }
                 }

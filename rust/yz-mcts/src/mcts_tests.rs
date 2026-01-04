@@ -1,11 +1,11 @@
 use crate::{apply_temperature, ChanceMode, InferBackend, Mcts, MctsConfig, UniformInference};
-use yz_core::A;
+use yz_core::{LegalMask, A};
 use yz_infer::ClientOptions;
 
 struct BadInference;
 
 impl crate::Inference for BadInference {
-    fn eval(&self, _features: &[f32], _legal: &[bool; A]) -> ([f32; A], f32) {
+    fn eval(&self, _features: &[f32], _legal: LegalMask) -> ([f32; A], f32) {
         ([f32::NAN; A], 0.0)
     }
 }
@@ -33,8 +33,8 @@ fn start_dummy_infer_server_tcp() -> (std::net::SocketAddr, std::thread::JoinHan
             };
 
             let mut logits = vec![0.0f32; ACTION_SPACE_A as usize];
-            for (i, &b) in req.legal_mask.iter().enumerate() {
-                if b == 0 {
+            for i in 0..(ACTION_SPACE_A as usize) {
+                if ((req.legal_mask >> i) & 1) == 0 {
                     logits[i] = -1.0e9;
                 }
             }
@@ -83,7 +83,7 @@ fn pi_is_valid_distribution_and_respects_legality() {
     );
     let mut sum = 0.0f32;
     for a in 0..yz_core::A {
-        if legal[a] {
+        if ((legal >> a) & 1) != 0 {
             assert!(res.pi[a].is_finite());
             assert!(res.pi[a] >= 0.0);
             sum += res.pi[a];
@@ -137,7 +137,7 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
     );
     let mut sum = 0.0f32;
     for a in 0..yz_core::A {
-        if legal[a] {
+        if ((legal >> a) & 1) != 0 {
             assert!(res.pi[a].is_finite());
             assert!(res.pi[a] >= 0.0);
             sum += res.pi[a];
@@ -249,8 +249,8 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
     );
 
     // pi target is identical regardless of how we later apply temperature for executed move.
-    let exec_t1 = apply_temperature(&r1.pi, &legal, 1.0);
-    let exec_t0 = apply_temperature(&r1.pi, &legal, 0.0);
+    let exec_t1 = apply_temperature(&r1.pi, legal, 1.0);
+    let exec_t0 = apply_temperature(&r1.pi, legal, 0.0);
     assert_ne!(exec_t1, exec_t0);
 
     // But the replay target itself is unchanged.
@@ -292,10 +292,15 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
     assert!(r.fallbacks > 0, "expected fallback counter to increment");
     let expected = {
         let mut out = [0.0f32; A];
-        let cnt = legal.iter().filter(|&&ok| ok).count();
-        let u = 1.0 / (cnt as f32);
-        for (i, &ok) in legal.iter().enumerate() {
-            if ok {
+        let mut cnt = 0usize;
+        for i in 0..A {
+            if ((legal >> i) & 1) != 0 {
+                cnt += 1;
+            }
+        }
+        let u = if cnt > 0 { 1.0 / (cnt as f32) } else { 0.0 };
+        for i in 0..A {
+            if ((legal >> i) & 1) != 0 {
                 out[i] = u;
             }
         }

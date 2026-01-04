@@ -47,8 +47,8 @@ mod tests {
 
             // Dummy response: logits = 0.0 for legal, -1e9 for illegal, value=0.
             let mut logits = vec![0.0f32; ACTION_SPACE_A as usize];
-            for (i, &b) in req.legal_mask.iter().enumerate() {
-                if b == 0 {
+            for i in 0..(ACTION_SPACE_A as usize) {
+                if ((req.legal_mask >> i) & 1) == 0 {
                     logits[i] = -1.0e9;
                 }
             }
@@ -69,7 +69,7 @@ mod tests {
             model_id: 7,
             feature_schema_id: FEATURE_SCHEMA_ID_V1,
             features: vec![0.0; FEATURE_LEN_V1 as usize],
-            legal_mask: vec![1u8; ACTION_SPACE_A as usize],
+            legal_mask: (1u64 << ACTION_SPACE_A) - 1,
         };
         let payload = encode_request_v1(&req);
         write_frame(&mut client, &payload).unwrap();

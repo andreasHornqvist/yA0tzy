@@ -119,7 +119,7 @@ fn random_playout_terminates_in_30_marks_deterministic_mode() {
 
         let p = s.player_to_move as usize;
         let legal = legal_action_mask(s.players[p].avail_mask, s.rerolls_left);
-        let legal_idxs: Vec<usize> = (0..A).filter(|&i| legal[i]).collect();
+        let legal_idxs: Vec<usize> = (0..A).filter(|&i| ((legal >> i) & 1) != 0).collect();
         assert!(!legal_idxs.is_empty());
 
         let pick = chooser.gen_range(0..legal_idxs.len());
@@ -152,7 +152,7 @@ fn random_playout_terminates_in_30_marks_rng_mode() {
 
         let p = s.player_to_move as usize;
         let legal = legal_action_mask(s.players[p].avail_mask, s.rerolls_left);
-        let legal_idxs: Vec<usize> = (0..A).filter(|&i| legal[i]).collect();
+        let legal_idxs: Vec<usize> = (0..A).filter(|&i| ((legal >> i) & 1) != 0).collect();
         assert!(!legal_idxs.is_empty());
 
         let pick = chooser.gen_range(0..legal_idxs.len());
