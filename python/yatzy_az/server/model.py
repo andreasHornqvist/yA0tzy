@@ -11,7 +11,32 @@ import numpy as np
 
 from .checkpoint import load_checkpoint
 from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
-from .protocol_v1 import ACTION_SPACE_A
+from .protocol_v1 import ACTION_SPACE_A, LEGAL_MASK_BITSET_BYTES
+
+
+_BITS_LUT_U8: np.ndarray | None = None
+
+
+def _bits_lut_u8() -> np.ndarray:
+    """Return a [256,8] uint8 LUT mapping byte->LSB-first bits."""
+    global _BITS_LUT_U8
+    if _BITS_LUT_U8 is not None:
+        return _BITS_LUT_U8
+    lut = np.zeros((256, 8), dtype=np.uint8)
+    for b in range(256):
+        for bit in range(8):
+            lut[b, bit] = (b >> bit) & 1
+    _BITS_LUT_U8 = lut
+    return lut
+
+
+def _unpack_legal_mask_bitset_lsb(legal6: bytes) -> np.ndarray:
+    """Unpack 6-byte bitset into a uint8 mask of length ACTION_SPACE_A (0/1)."""
+    if len(legal6) != LEGAL_MASK_BITSET_BYTES:
+        raise ValueError(f"expected {LEGAL_MASK_BITSET_BYTES} bytes, got {len(legal6)}")
+    arr = np.frombuffer(legal6, dtype=np.uint8, count=LEGAL_MASK_BITSET_BYTES)
+    bits = _bits_lut_u8()[arr].reshape(-1)  # 48 bits
+    return bits[:ACTION_SPACE_A]
 
 
 class Model:
@@ -171,7 +196,10 @@ class DummyModel(Model):
         bsz = int(x_np.shape[0])
         logits = np.zeros((bsz, ACTION_SPACE_A), dtype=np.float32)
         for i, legal in enumerate(legal_mask_batch):
-            m = np.frombuffer(legal, dtype=np.uint8, count=ACTION_SPACE_A)
+            if len(legal) == LEGAL_MASK_BITSET_BYTES:
+                m = _unpack_legal_mask_bitset_lsb(legal)
+            else:
+                m = np.frombuffer(legal, dtype=np.uint8, count=ACTION_SPACE_A)
             logits[i, m == 0] = -1.0e9
         values = np.full((bsz,), float(self._value), dtype=np.float32)
         return (logits.tobytes(), values.tobytes(), None)

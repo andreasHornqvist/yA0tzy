@@ -25,6 +25,12 @@ class InferenceConfig(BaseModel):
             "- 2: v2 (packed f32 tensors)"
         ),
     )
+    legal_mask_bitset: bool = Field(
+        default=False,
+        description=(
+            "If true and protocol_version==2, encode legal_mask as a compact 6-byte bitset (A=47)."
+        ),
+    )
     max_batch: int = Field(description="Maximum batch size before flushing")
     max_wait_us: int = Field(
         description="Maximum wait time (microseconds) before flushing a partial batch"

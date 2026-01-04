@@ -13,6 +13,8 @@ PROTOCOL_VERSION_V2: Final[int] = 2
 # Backwards-compatible default.
 PROTOCOL_VERSION: Final[int] = PROTOCOL_VERSION_V1
 ACTION_SPACE_A: Final[int] = 47
+FLAG_LEGAL_MASK_BITSET: Final[int] = 0x01
+LEGAL_MASK_BITSET_BYTES: Final[int] = 6
 FEATURE_SCHEMA_ID_V1: Final[int] = 1
 FEATURE_LEN_V1: Final[int] = 45
 MAX_FRAME_LEN: Final[int] = 64 * 1024 * 1024  # 64 MiB (matches rust/yz-infer)
@@ -92,7 +94,8 @@ class InferRequestPacked:
     model_id: int
     feature_schema_id: int
     features_f32: memoryview  # len=F*4
-    legal_mask: bytes  # len=A, each byte 0/1
+    legal_mask: bytes  # len=47 (byte-mask) or len=6 (bitset)
+    legal_is_bitset: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,7 +287,7 @@ def decode_request_v2_packed(payload: bytes) -> InferRequestPacked:
     kind = struct.unpack("<B", take(1))[0]
     if kind != 1:
         raise DecodeError(f"bad kind: {kind}")
-    _flags = struct.unpack("<B", take(1))[0]
+    flags = struct.unpack("<B", take(1))[0]
     take(2)  # reserved
 
     request_id = struct.unpack("<Q", take(8))[0]
@@ -299,14 +302,23 @@ def decode_request_v2_packed(payload: bytes) -> InferRequestPacked:
         raise DecodeError(f"bad features byte len: got {features_byte_len}, expected {expected}")
     features_f32 = take(int(features_byte_len))
 
+    legal_is_bitset = (int(flags) & int(FLAG_LEGAL_MASK_BITSET)) != 0
     legal_len = struct.unpack("<I", take(4))[0]
-    if legal_len != ACTION_SPACE_A:
-        raise DecodeError(f"bad legal len: got {legal_len}, expected {ACTION_SPACE_A}")
-    legal_mv = take(int(legal_len))
-    legal_mask = bytes(legal_mv)
-    for b in legal_mask:
-        if b not in (0, 1):
-            raise DecodeError(f"bad legal byte: {b}")
+    if legal_is_bitset:
+        if legal_len != LEGAL_MASK_BITSET_BYTES:
+            raise DecodeError(
+                f"bad legal len (bitset): got {legal_len}, expected {LEGAL_MASK_BITSET_BYTES}"
+            )
+        legal_mv = take(int(legal_len))
+        legal_mask = bytes(legal_mv)
+    else:
+        if legal_len != ACTION_SPACE_A:
+            raise DecodeError(f"bad legal len: got {legal_len}, expected {ACTION_SPACE_A}")
+        legal_mv = take(int(legal_len))
+        legal_mask = bytes(legal_mv)
+        for b in legal_mask:
+            if b not in (0, 1):
+                raise DecodeError(f"bad legal byte: {b}")
 
     return InferRequestPacked(
         protocol_version=PROTOCOL_VERSION_V2,
@@ -315,6 +327,7 @@ def decode_request_v2_packed(payload: bytes) -> InferRequestPacked:
         feature_schema_id=feature_schema_id,
         features_f32=features_f32,
         legal_mask=legal_mask,
+        legal_is_bitset=legal_is_bitset,
     )
 
 
@@ -332,6 +345,7 @@ def decode_request_packed(payload: bytes) -> InferRequestPacked:
             feature_schema_id=r1.feature_schema_id,
             features_f32=r1.features_f32,
             legal_mask=r1.legal_mask,
+            legal_is_bitset=False,
         )
     if version == PROTOCOL_VERSION_V2:
         return decode_request_v2_packed(payload)
