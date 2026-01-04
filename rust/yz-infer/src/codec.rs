@@ -134,13 +134,22 @@ pub fn encode_request_v2_into(out: &mut Vec<u8>, req: &InferRequestV1, legal_mas
 }
 
 fn pack_legal_mask_bitset(legal: &[u8]) -> [u8; LEGAL_MASK_BITSET_BYTES] {
+    // Hot path: keep this cheap. Avoid div/mod in the per-bit loop.
+    debug_assert_eq!(legal.len(), ACTION_SPACE_A as usize);
     let mut out = [0u8; LEGAL_MASK_BITSET_BYTES];
-    for i in 0..(ACTION_SPACE_A as usize) {
-        if legal.get(i).copied().unwrap_or(0) != 0 {
-            let byte = i / 8;
-            let bit = i % 8;
-            out[byte] |= 1u8 << bit;
+    let mut i = 0usize;
+    for byte_i in 0..LEGAL_MASK_BITSET_BYTES {
+        let mut b = 0u8;
+        // LSB-first within each byte.
+        for bit in 0..8usize {
+            if i >= legal.len() {
+                break;
+            }
+            // Legal bytes are 0/1; mask just in case.
+            b |= (legal[i] & 1) << bit;
+            i += 1;
         }
+        out[byte_i] = b;
     }
     out
 }

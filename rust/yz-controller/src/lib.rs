@@ -85,6 +85,16 @@ struct InferServerChild {
 
 impl Drop for InferServerChild {
     fn drop(&mut self) {
+        // We generally request a graceful shutdown via the metrics `/shutdown` endpoint first.
+        // Avoid sending SIGKILL immediately: it makes Python's asyncio print noisy
+        // "Task was destroyed but it is pending!" warnings which look like failures in the TUI.
+        for _ in 0..200 {
+            match self.child.try_wait() {
+                Ok(Some(_status)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
