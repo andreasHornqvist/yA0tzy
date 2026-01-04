@@ -221,6 +221,12 @@ pub struct GatingConfig {
     /// Whether to use deterministic event-keyed chance for gating/eval (optional).
     #[serde(default = "default_gating_deterministic_chance")]
     pub deterministic_chance: bool,
+    /// Optional: number of parallel in-flight games per gate-worker process.
+    ///
+    /// If None, gating will derive a reasonable default from `selfplay.threads_per_worker`,
+    /// typically scaling by 2 because gating uses two model_id streams (best + candidate).
+    #[serde(default)]
+    pub threads_per_worker: Option<u32>,
 }
 
 fn default_gating_deterministic_chance() -> bool {
@@ -292,6 +298,7 @@ impl Default for Config {
                 win_rate_threshold: default_gating_win_rate_threshold(),
                 paired_seed_swap: true,
                 deterministic_chance: default_gating_deterministic_chance(),
+                threads_per_worker: None,
             },
             replay: ReplayConfig::default(),
             controller: ControllerConfig::default(),
@@ -323,6 +330,7 @@ mod tests {
         assert_eq!(config.gating.seed_set_id.as_deref(), Some("dev_v1"));
         assert!(config.gating.paired_seed_swap);
         assert!(config.gating.deterministic_chance);
+        assert_eq!(config.gating.threads_per_worker, None);
         assert_eq!(config.replay.capacity_shards, Some(20));
         assert_eq!(config.controller.total_iterations, Some(10));
     }

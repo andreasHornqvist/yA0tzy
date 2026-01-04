@@ -329,11 +329,21 @@ OPTIONS:
         num_workers: u32,
         games_target: u32,
         games_completed: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_game_started_ts_ms: Option<u64>,
         pid: u32,
         sched_ticks: u64,
         sched_steps: u64,
         sched_would_block: u64,
         sched_terminal: u64,
+        // Inference client stats (helps diagnose throughput bottlenecks).
+        infer_inflight: u64,
+        infer_sent: u64,
+        infer_received: u64,
+        infer_errors: u64,
+        infer_latency_p50_us: u64,
+        infer_latency_p95_us: u64,
+        infer_latency_mean_us: f64,
         ts_ms: u64,
     }
     fn write_progress_atomic(path: &PathBuf, p: &WorkerProgress) {
@@ -350,11 +360,19 @@ OPTIONS:
             num_workers,
             games_target: games,
             games_completed: 0,
+            first_game_started_ts_ms: None,
             pid: std::process::id(),
             sched_ticks: 0,
             sched_steps: 0,
             sched_would_block: 0,
             sched_terminal: 0,
+            infer_inflight: 0,
+            infer_sent: 0,
+            infer_received: 0,
+            infer_errors: 0,
+            infer_latency_p50_us: 0,
+            infer_latency_p95_us: 0,
+            infer_latency_mean_us: 0.0,
             ts_ms: yz_logging::now_ms(),
         },
     );
@@ -383,7 +401,23 @@ OPTIONS:
     let mut completed_games: u32 = 0;
     let mut next_seq: u64 = parallel_games as u64;
     let mut last_progress_write = std::time::Instant::now();
+    let mut first_game_started_ts_ms: Option<u64> = None;
     while completed_games < games {
+        if first_game_started_ts_ms.is_none() {
+            first_game_started_ts_ms = Some(yz_logging::now_ms());
+            if let Some(w) = worker_log.as_mut() {
+                let _ = w.write_event(&WorkerStatsEvent {
+                    event: "selfplay_worker_first_game_start",
+                    ts_ms: first_game_started_ts_ms.unwrap(),
+                    worker_id,
+                    num_workers,
+                    games_target: games,
+                    games_completed: completed_games,
+                    wall_ms: t_start.elapsed().as_millis() as u64,
+                });
+                let _ = w.flush();
+            }
+        }
         let before_steps = sched.stats().steps;
         let before_terminal = sched.stats().terminal;
         sched.tick_and_write(&backend, &mut writer, None)
@@ -396,13 +430,14 @@ OPTIONS:
         // Avoid busy-spinning when all tasks are waiting on inference.
         // This yields CPU to the Python inference server and improves throughput.
         if after_steps == before_steps && after_terminal == before_terminal {
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            backend.wait_for_progress(std::time::Duration::from_micros(200));
         }
 
         // Heartbeat progress even before games complete, so we can prove workers are running.
         // Rate-limit to avoid excessive filesystem churn.
         if last_progress_write.elapsed() >= std::time::Duration::from_millis(500) {
             let s = sched.stats();
+            let inf = backend.stats_snapshot();
             write_progress_atomic(
                 &progress_path,
                 &WorkerProgress {
@@ -410,11 +445,19 @@ OPTIONS:
                     num_workers,
                     games_target: games,
                     games_completed: completed_games,
+                    first_game_started_ts_ms,
                     pid: std::process::id(),
                     sched_ticks: s.ticks,
                     sched_steps: s.steps,
                     sched_would_block: s.would_block,
                     sched_terminal: s.terminal,
+                    infer_inflight: inf.inflight as u64,
+                    infer_sent: inf.sent,
+                    infer_received: inf.received,
+                    infer_errors: inf.errors,
+                    infer_latency_p50_us: inf.latency_us.summary.p50_us,
+                    infer_latency_p95_us: inf.latency_us.summary.p95_us,
+                    infer_latency_mean_us: inf.latency_us.summary.mean_us,
                     ts_ms: yz_logging::now_ms(),
                 },
             );
@@ -433,6 +476,7 @@ OPTIONS:
                             num_workers,
                             games_target: games,
                             games_completed: completed_games,
+                            first_game_started_ts_ms,
                             pid: std::process::id(),
                             // Note: we can't borrow `sched` here because we already hold a mutable
                             // borrow from `tasks_mut()`. These fields will be updated by the
@@ -441,6 +485,13 @@ OPTIONS:
                             sched_steps: 0,
                             sched_would_block: 0,
                             sched_terminal: 0,
+                            infer_inflight: 0,
+                            infer_sent: 0,
+                            infer_received: 0,
+                            infer_errors: 0,
+                            infer_latency_p50_us: 0,
+                            infer_latency_p95_us: 0,
+                            infer_latency_mean_us: 0.0,
                             ts_ms: yz_logging::now_ms(),
                         },
                     );
@@ -471,6 +522,7 @@ OPTIONS:
     });
     // Final progress.
     let s = sched.stats();
+    let inf = backend.stats_snapshot();
     write_progress_atomic(
         &progress_path,
         &WorkerProgress {
@@ -478,11 +530,19 @@ OPTIONS:
             num_workers,
             games_target: games,
             games_completed: completed_games,
+            first_game_started_ts_ms,
             pid: std::process::id(),
             sched_ticks: s.ticks,
             sched_steps: s.steps,
             sched_would_block: s.would_block,
             sched_terminal: s.terminal,
+            infer_inflight: inf.inflight as u64,
+            infer_sent: inf.sent,
+            infer_received: inf.received,
+            infer_errors: inf.errors,
+            infer_latency_p50_us: inf.latency_us.summary.p50_us,
+            infer_latency_p95_us: inf.latency_us.summary.p95_us,
+            infer_latency_mean_us: inf.latency_us.summary.mean_us,
             ts_ms: yz_logging::now_ms(),
         },
     );
@@ -1016,6 +1076,7 @@ OPTIONS:
         .collect();
 
     let games_target = schedule.len() as u32;
+    let parallel_games = yz_eval::effective_gate_parallel_games(&cfg);
 
     // Bounded inflight to avoid flooding the inference server.
     let client_opts = yz_infer::ClientOptions {
@@ -1046,6 +1107,8 @@ OPTIONS:
         num_workers: u32,
         games_target: u32,
         games_completed: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_game_started_ts_ms: Option<u64>,
         pid: u32,
         ts_ms: u64,
     }
@@ -1059,6 +1122,7 @@ OPTIONS:
     }
 
     // Initial progress file for live aggregation.
+    let first_game_started_ts_ms = yz_logging::now_ms();
     write_progress_atomic(
         &progress_path,
         &GateWorkerProgress {
@@ -1066,6 +1130,9 @@ OPTIONS:
             num_workers,
             games_target,
             games_completed: 0,
+            // Gate-worker doesn't have a scheduler heartbeat by default; record first-game-start
+            // immediately so the controller/TUI can show setup time accurately.
+            first_game_started_ts_ms: Some(first_game_started_ts_ms),
             pid: std::process::id(),
             ts_ms: yz_logging::now_ms(),
         },
@@ -1076,9 +1143,12 @@ OPTIONS:
         worker_id: u32,
         num_workers: u32,
         games_target: u32,
+        parallel_games: u32,
         worker_stats: Option<yz_logging::NdjsonWriter>,
         t_start: std::time::Instant,
+        first_game_started_ts_ms: Option<u64>,
         first_done_logged: bool,
+        last_progress_write: std::time::Instant,
     }
     impl yz_eval::GateProgress for ProgressSink {
         fn on_game_completed(&mut self, completed: u32, _total: u32) {
@@ -1089,6 +1159,7 @@ OPTIONS:
                     num_workers: self.num_workers,
                     games_target: self.games_target,
                     games_completed: completed,
+                    first_game_started_ts_ms: self.first_game_started_ts_ms,
                     pid: std::process::id(),
                     ts_ms: yz_logging::now_ms(),
                 },
@@ -1107,6 +1178,62 @@ OPTIONS:
                     let _ = w.flush();
                 }
                 self.first_done_logged = true;
+            }
+        }
+
+        fn on_tick(&mut self, stats: &yz_eval::GateTickStats) {
+            // Heartbeat progress even before any game finishes, so the controller can surface
+            // "waiting for first game" setup vs running time accurately.
+            if self.last_progress_write.elapsed() >= std::time::Duration::from_millis(500) {
+                write_progress_atomic(
+                    &self.progress_path,
+                    &GateWorkerProgress {
+                        worker_id: self.worker_id,
+                        num_workers: self.num_workers,
+                        games_target: self.games_target,
+                        games_completed: stats.games_completed,
+                        first_game_started_ts_ms: self.first_game_started_ts_ms,
+                        pid: std::process::id(),
+                        ts_ms: yz_logging::now_ms(),
+                    },
+                );
+                self.last_progress_write = std::time::Instant::now();
+            }
+            if let Some(w) = self.worker_stats.as_mut() {
+                #[derive(serde::Serialize)]
+                struct GateWorkerTickEvent<'a> {
+                    event: &'a str,
+                    ts_ms: u64,
+                    worker_id: u32,
+                    num_workers: u32,
+                    games_target: u32,
+                    parallel_games: u32,
+                    games_completed: u32,
+                    wall_ms: u64,
+                    ticks: u64,
+                    would_block: u64,
+                    progress: u64,
+                    terminal: u64,
+                    best_inflight: u64,
+                    cand_inflight: u64,
+                }
+                let _ = w.write_event(&GateWorkerTickEvent {
+                    event: "gate_worker_tick",
+                    ts_ms: yz_logging::now_ms(),
+                    worker_id: self.worker_id,
+                    num_workers: self.num_workers,
+                    games_target: self.games_target,
+                    parallel_games: self.parallel_games,
+                    games_completed: stats.games_completed,
+                    wall_ms: self.t_start.elapsed().as_millis() as u64,
+                    ticks: stats.ticks,
+                    would_block: stats.would_block,
+                    progress: stats.progress,
+                    terminal: stats.terminal,
+                    best_inflight: stats.best_inflight,
+                    cand_inflight: stats.cand_inflight,
+                });
+                let _ = w.flush();
             }
         }
     }
@@ -1169,9 +1296,12 @@ OPTIONS:
         worker_id,
         num_workers,
         games_target,
+        parallel_games,
         worker_stats,
         t_start,
+        first_game_started_ts_ms: Some(first_game_started_ts_ms),
         first_done_logged: false,
+        last_progress_write: std::time::Instant::now(),
     };
 
     let partial = yz_eval::gate_schedule_subset(
@@ -1202,6 +1332,7 @@ OPTIONS:
             num_workers,
             games_target,
             games_completed: games_target,
+            first_game_started_ts_ms: sink.first_game_started_ts_ms,
             pid: std::process::id(),
             ts_ms: yz_logging::now_ms(),
         },

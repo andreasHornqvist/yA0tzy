@@ -5,11 +5,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use thiserror::Error;
 use yz_core::{apply_action, initial_state, is_terminal, terminal_winner, TurnContext};
 use yz_infer::ClientOptions;
-use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchResult};
+use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchDriver};
 #[cfg(test)]
 use yz_oracle as oracle_mod;
 
@@ -230,9 +231,25 @@ pub struct GateOptions {
     pub mcts_cfg: MctsConfig,
 }
 
+/// Periodic scheduling stats for gating (used for low-overhead worker diagnostics).
+#[derive(Debug, Clone, Copy)]
+pub struct GateTickStats {
+    pub ticks: u64,
+    pub tasks: u32,
+    pub games_completed: u32,
+    pub would_block: u64,
+    pub progress: u64,
+    pub terminal: u64,
+    pub best_inflight: u64,
+    pub cand_inflight: u64,
+}
+
 /// Optional progress sink for gating (used by TUI/controller to render live progress bars).
 pub trait GateProgress {
     fn on_game_completed(&mut self, completed: u32, total: u32);
+    fn on_tick(&mut self, _stats: &GateTickStats) {
+        // Optional; default is no-op.
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +258,26 @@ pub struct GatePlan {
     pub seeds: Vec<u64>,
     pub seeds_hash: String,
     pub warnings: Vec<String>,
+}
+
+/// Effective per-process gating parallelism (number of in-flight games per gate-worker).
+///
+/// If `cfg.gating.threads_per_worker` is set, we use it (clamped to >=1).
+/// Otherwise we derive a reasonable default from self-play, typically scaling by 2 because
+/// gating uses two model_id streams (best + candidate).
+///
+/// NOTE: This does **not** change per-game leaf eval concurrency; that remains capped by
+/// `cfg.mcts.max_inflight_per_game`.
+pub fn effective_gate_parallel_games(cfg: &yz_core::Config) -> u32 {
+    let base = cfg.selfplay.threads_per_worker.max(1);
+    let derived = base.saturating_mul(2);
+    let override_v = cfg.gating.threads_per_worker.map(|x| x.max(1));
+
+    // Soft cap based on client inflight budget (64) and per-game inflight cap.
+    let per_game = cfg.mcts.max_inflight_per_game.max(1);
+    let cap = (2 * (64 / per_game).max(1)).max(1);
+
+    override_v.unwrap_or(derived).min(cap).max(1)
 }
 
 pub fn gate_plan(cfg: &yz_core::Config) -> Result<GatePlan, GateError> {
@@ -424,34 +461,309 @@ fn gate_schedule_subset_with_backends(
 
     // Always disable root Dirichlet noise in gating/eval.
     mcts_cfg.dirichlet_epsilon = 0.0;
-    let mut mcts = Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
 
     let mut partial = GatePartial::default();
     partial.games = total;
 
-    let mut completed: u32 = 0;
-    for gs in schedule.iter().copied() {
-        let (cand_score, best_score, cand_outcome) = run_one_game(
-            cfg,
-            &mut mcts,
-            best_backend,
-            cand_backend,
-            gs,
-            &mut oracle_sink,
-        )?;
-        match cand_outcome {
-            Outcome::Win => partial.cand_wins += 1,
-            Outcome::Loss => partial.cand_losses += 1,
-            Outcome::Draw => partial.draws += 1,
-        }
-        let d = cand_score - best_score;
-        partial.cand_score_diff_sum += d as i64;
-        let x = d as f64;
-        partial.cand_score_diff_sumsq += x * x;
+    if schedule.is_empty() {
+        // Keep semantics: 0 scheduled -> 0 completed (progress never called).
+        return Ok(partial);
+    }
 
-        completed += 1;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StepStatus {
+        Progress,
+        WouldBlock,
+        Terminal,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TerminalResult {
+        cand_score: i32,
+        best_score: i32,
+        outcome: Outcome,
+    }
+
+    #[derive(Debug)]
+    struct StepResult {
+        status: StepStatus,
+        terminal: Option<TerminalResult>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BackendSel {
+        Best,
+        Cand,
+    }
+
+    struct GateGameTask {
+        gs: GameSpec,
+        cand_seat: u8,
+        ctx: TurnContext,
+        state: yz_core::GameState,
+        chance_mode: ChanceMode,
+        mcts: Mcts,
+        search: Option<SearchDriver>,
+        search_backend: BackendSel,
+        active: bool,
+    }
+
+    impl GateGameTask {
+        fn new(
+            cfg: &yz_core::Config,
+            mcts_cfg: MctsConfig,
+            gs: GameSpec,
+        ) -> Result<Self, GateError> {
+            // Initialize state using the same chance mode policy as the sequential gating loop.
+            let mut ctx = if cfg.gating.deterministic_chance {
+                TurnContext::new_deterministic(gs.episode_seed)
+            } else {
+                TurnContext::new_rng(gs.episode_seed)
+            };
+            let state = initial_state(&mut ctx);
+            let chance_mode = if cfg.gating.deterministic_chance {
+                ChanceMode::Deterministic {
+                    episode_seed: gs.episode_seed,
+                }
+            } else {
+                ChanceMode::Rng {
+                    seed: gs.episode_seed,
+                }
+            };
+
+            let cand_seat = if gs.swap { 1u8 } else { 0u8 };
+            let mcts =
+                Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
+
+            Ok(Self {
+                gs,
+                cand_seat,
+                ctx,
+                state,
+                chance_mode,
+                mcts,
+                search: None,
+                search_backend: BackendSel::Best,
+                active: true,
+            })
+        }
+
+        fn reset(
+            &mut self,
+            cfg: &yz_core::Config,
+            mcts_cfg: MctsConfig,
+            gs: GameSpec,
+        ) -> Result<(), GateError> {
+            *self = GateGameTask::new(cfg, mcts_cfg, gs)?;
+            Ok(())
+        }
+
+        fn backend_for_turn<'a>(
+            &mut self,
+            best_backend: &'a InferBackend,
+            cand_backend: &'a InferBackend,
+        ) -> (&'a InferBackend, BackendSel, bool) {
+            let cand_turn = self.state.player_to_move == self.cand_seat;
+            let backend = select_backend(best_backend, cand_backend, self.state.player_to_move, self.gs.swap);
+            let sel = if std::ptr::eq(backend, cand_backend) {
+                BackendSel::Cand
+            } else {
+                BackendSel::Best
+            };
+            (backend, sel, cand_turn)
+        }
+
+        fn step(
+            &mut self,
+            best_backend: &InferBackend,
+            cand_backend: &InferBackend,
+            max_work: u32,
+            oracle_sink: &mut Option<&mut dyn OracleDiagSink>,
+        ) -> Result<StepResult, GateError> {
+            if !self.active {
+                return Ok(StepResult {
+                    status: StepStatus::Terminal,
+                    terminal: None,
+                });
+            }
+
+            if is_terminal(&self.state) {
+                self.active = false;
+                let tr = Self::terminal_result(&self.state, self.cand_seat)?;
+                return Ok(StepResult {
+                    status: StepStatus::Terminal,
+                    terminal: Some(tr),
+                });
+            }
+
+            if self.search.is_none() {
+                let (backend, sel, _cand_turn) = self.backend_for_turn(best_backend, cand_backend);
+                self.search_backend = sel;
+                let d = self
+                    .mcts
+                    .begin_search_with_backend(self.state, self.chance_mode, backend);
+                self.search = Some(d);
+            }
+
+            let backend = match self.search_backend {
+                BackendSel::Best => best_backend,
+                BackendSel::Cand => cand_backend,
+            };
+            if let Some(search) = &mut self.search {
+                let res = search.tick(&mut self.mcts, backend, max_work);
+                if let Some(sr) = res {
+                    // Search finished -> choose executed action.
+                    let a = argmax_tie_lowest(&sr.pi);
+                    let action = yz_core::index_to_action(a);
+
+                    // Oracle diagnostics: record only candidate moves (agent under test).
+                    let is_cand_turn = self.state.player_to_move == self.cand_seat;
+                    if is_cand_turn {
+                        let ps = &self.state.players[self.state.player_to_move as usize];
+                        if let Some(s) = oracle_sink.as_deref_mut() {
+                            s.on_step(&OracleDiagEvent {
+                                avail_mask: ps.avail_mask,
+                                upper_total_cap: ps.upper_total_cap,
+                                dice_sorted: self.state.dice_sorted,
+                                rerolls_left: self.state.rerolls_left,
+                                chosen_action_idx: yz_core::action_to_index(action),
+                                episode_seed: self.gs.episode_seed,
+                                swap: self.gs.swap,
+                            });
+                        }
+                    }
+
+                    let next = apply_action(self.state, action, &mut self.ctx)
+                        .map_err(|_| GateError::IllegalTransition)?;
+                    self.state = next;
+                    self.search = None;
+
+                    if is_terminal(&self.state) {
+                        self.active = false;
+                        let tr = Self::terminal_result(&self.state, self.cand_seat)?;
+                        return Ok(StepResult {
+                            status: StepStatus::Terminal,
+                            terminal: Some(tr),
+                        });
+                    }
+
+                    return Ok(StepResult {
+                        status: StepStatus::Progress,
+                        terminal: None,
+                    });
+                }
+            }
+
+            Ok(StepResult {
+                status: StepStatus::WouldBlock,
+                terminal: None,
+            })
+        }
+
+        fn terminal_result(state: &yz_core::GameState, cand_seat: u8) -> Result<TerminalResult, GateError> {
+            let winner = terminal_winner(state).map_err(|_| GateError::IllegalTransition)?;
+            let best_seat = 1u8 ^ cand_seat;
+            let cand_score = state.players[cand_seat as usize].total_score as i32;
+            let best_score = state.players[best_seat as usize].total_score as i32;
+            let outcome = if winner == 2 {
+                Outcome::Draw
+            } else if winner == cand_seat {
+                Outcome::Win
+            } else {
+                Outcome::Loss
+            };
+            Ok(TerminalResult {
+                cand_score,
+                best_score,
+                outcome,
+            })
+        }
+    }
+
+    let parallel_games =
+        (effective_gate_parallel_games(cfg) as usize).min(schedule.len()).max(1);
+    let init_n = parallel_games.min(schedule.len());
+    let mut tasks: Vec<GateGameTask> = Vec::with_capacity(init_n);
+    for &gs in schedule.iter().take(init_n) {
+        tasks.push(GateGameTask::new(cfg, mcts_cfg, gs)?);
+    }
+    let mut next_idx: usize = init_n;
+
+    let mut completed: u32 = 0;
+    let mut sched_ticks: u64 = 0;
+    let mut sched_progress: u64 = 0;
+    let mut sched_would_block: u64 = 0;
+    let mut sched_terminal: u64 = 0;
+    let mut last_tick_emit = std::time::Instant::now();
+    while (completed as usize) < schedule.len() {
+        let mut made_progress = false;
+        sched_ticks += 1;
+        for t in tasks.iter_mut() {
+            if !t.active && next_idx >= schedule.len() {
+                continue;
+            }
+            let r = t.step(best_backend, cand_backend, 64, &mut oracle_sink)?;
+            match r.status {
+                StepStatus::Progress => {
+                    made_progress = true;
+                    sched_progress += 1;
+                }
+                StepStatus::Terminal => {
+                    if let Some(tr) = r.terminal {
+                        match tr.outcome {
+                            Outcome::Win => partial.cand_wins += 1,
+                            Outcome::Loss => partial.cand_losses += 1,
+                            Outcome::Draw => partial.draws += 1,
+                        }
+                        let d = tr.cand_score - tr.best_score;
+                        partial.cand_score_diff_sum += d as i64;
+                        let x = d as f64;
+                        partial.cand_score_diff_sumsq += x * x;
+
+                        completed += 1;
+                        made_progress = true;
+                        sched_terminal += 1;
+                        if let Some(p) = progress.as_deref_mut() {
+                            p.on_game_completed(completed, total);
+                        }
+                    }
+
+                    // Start a new game in this slot if schedule items remain.
+                    if next_idx < schedule.len() {
+                        let gs = schedule[next_idx];
+                        next_idx += 1;
+                        t.reset(cfg, mcts_cfg, gs)?;
+                    }
+                }
+                StepStatus::WouldBlock => {}
+            }
+        }
+
+        // Optional: periodic tick stats for diagnostics.
         if let Some(p) = progress.as_deref_mut() {
-            p.on_game_completed(completed, total);
+            if last_tick_emit.elapsed() >= Duration::from_secs(1) {
+                let b = best_backend.stats_snapshot();
+                let c = cand_backend.stats_snapshot();
+                p.on_tick(&GateTickStats {
+                    ticks: sched_ticks,
+                    tasks: tasks.len() as u32,
+                    games_completed: completed,
+                    would_block: sched_would_block,
+                    progress: sched_progress,
+                    terminal: sched_terminal,
+                    best_inflight: b.inflight as u64,
+                    cand_inflight: c.inflight as u64,
+                });
+                last_tick_emit = std::time::Instant::now();
+            }
+        }
+
+        // Avoid busy-spinning when all tasks are waiting on inference, but do NOT introduce
+        // fixed polling delays (which add response-consumption latency).
+        if !made_progress {
+            sched_would_block += 1;
+            best_backend.wait_for_progress(Duration::from_micros(100));
+            cand_backend.wait_for_progress(Duration::from_micros(100));
         }
     }
     Ok(partial)
@@ -548,80 +860,6 @@ enum Outcome {
     Win,
     Loss,
     Draw,
-}
-
-fn run_one_game(
-    cfg: &yz_core::Config,
-    mcts: &mut Mcts,
-    best_backend: &InferBackend,
-    cand_backend: &InferBackend,
-    gs: GameSpec,
-    oracle_sink: &mut Option<&mut dyn OracleDiagSink>,
-) -> Result<(i32, i32, Outcome), GateError> {
-    // Initialize state using the same chance mode policy as the game loop.
-    let mut ctx = if cfg.gating.deterministic_chance {
-        TurnContext::new_deterministic(gs.episode_seed)
-    } else {
-        TurnContext::new_rng(gs.episode_seed)
-    };
-    let mut state = initial_state(&mut ctx);
-
-    let chance_mode = if cfg.gating.deterministic_chance {
-        ChanceMode::Deterministic {
-            episode_seed: gs.episode_seed,
-        }
-    } else {
-        ChanceMode::Rng {
-            seed: gs.episode_seed,
-        }
-    };
-
-    let cand_seat = if gs.swap { 1u8 } else { 0u8 };
-
-    // Deterministic executed-move rule for gating: greedy argmax(pi) with lowest-index tie-break.
-    while !is_terminal(&state) {
-        // Oracle diagnostics: record only candidate moves (agent under test).
-        let is_cand_turn = state.player_to_move == cand_seat;
-
-        let backend = select_backend(best_backend, cand_backend, state.player_to_move, gs.swap);
-        let sr: SearchResult = mcts.run_search_with_backend(state, chance_mode, backend);
-        let a = argmax_tie_lowest(&sr.pi);
-        let action = yz_core::index_to_action(a);
-
-        if is_cand_turn {
-            let ps = &state.players[state.player_to_move as usize];
-            if let Some(s) = oracle_sink.as_deref_mut() {
-                s.on_step(&OracleDiagEvent {
-                    avail_mask: ps.avail_mask,
-                    upper_total_cap: ps.upper_total_cap,
-                    dice_sorted: state.dice_sorted,
-                    rerolls_left: state.rerolls_left,
-                    chosen_action_idx: yz_core::action_to_index(action),
-                    episode_seed: gs.episode_seed,
-                    swap: gs.swap,
-                });
-            }
-        }
-
-        let next =
-            apply_action(state, action, &mut ctx).map_err(|_| GateError::IllegalTransition)?;
-        state = next;
-    }
-
-    let winner = terminal_winner(&state).map_err(|_| GateError::IllegalTransition)?;
-    let best_seat = 1u8 ^ cand_seat;
-    let cand_score = state.players[cand_seat as usize].total_score as i32;
-    let best_score = state.players[best_seat as usize].total_score as i32;
-
-    let outcome = if winner == 2 {
-        Outcome::Draw
-    } else if winner == cand_seat {
-        Outcome::Win
-    } else {
-        Outcome::Loss
-    };
-
-    Ok((cand_score, best_score, outcome))
 }
 
 fn argmax_tie_lowest(pi: &[f32; yz_core::A]) -> u8 {
