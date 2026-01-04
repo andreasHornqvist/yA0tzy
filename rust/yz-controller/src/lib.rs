@@ -157,15 +157,64 @@ impl IterationController {
 fn repo_root_from_run_dir(run_dir: &Path) -> PathBuf {
     // Expected v1 layout: <repo>/runs/<run_id>/...
     // If the user passes a different layout, fall back to CWD-based resolution.
-    run_dir
+    let guessed = run_dir.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    // Verify the guess actually looks like the repo root (must contain python/pyproject.toml).
+    if let Some(root) = guessed.as_ref() {
+        if root.join("python").join("pyproject.toml").exists() {
+            return root.clone();
+        }
+    }
+
+    // Robust fallback: locate repo root relative to this crate (works for tests using temp run dirs).
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // rust/yz-controller
+    let fallback = here
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."));
+    if fallback.join("python").join("pyproject.toml").exists() {
+        return fallback;
+    }
+
+    guessed.unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn python_project_dir_from_run_dir(run_dir: &Path) -> PathBuf {
     repo_root_from_run_dir(run_dir).join("python")
+}
+
+fn yz_worker_exe_from_run_dir(run_dir: &Path) -> PathBuf {
+    // Allow explicit override (useful for tests and non-standard launchers).
+    if let Ok(p) = std::env::var("YZ_WORKER_EXE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("yz"));
+    // Normal case: controller is running inside the `yz` binary, so spawning self as a worker works.
+    if exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s == "yz")
+        .unwrap_or(false)
+    {
+        return exe;
+    }
+
+    // Tests (and some harnesses) run controller code inside a test binary. Try to locate `yz`
+    // under the repo's target directory if available.
+    let repo_root = repo_root_from_run_dir(run_dir);
+    for cand in [
+        repo_root.join("target").join("release").join("yz"),
+        repo_root.join("target").join("debug").join("yz"),
+    ] {
+        if cand.exists() {
+            return cand;
+        }
+    }
+
+    exe
 }
 
 fn uv_available() -> bool {
@@ -1353,7 +1402,7 @@ fn run_selfplay(
     let base = games_total / num_workers;
     let rem = games_total % num_workers;
 
-    let exe = std::env::current_exe().map_err(ControllerError::Fs)?;
+    let exe = yz_worker_exe_from_run_dir(run_dir);
     let mut children: Vec<(u32, u32, Child)> = Vec::new(); // (wid, games_for_worker, child)
     for wid in 0..num_workers {
         let games_for = base + if wid < rem { 1 } else { 0 };
@@ -1670,7 +1719,7 @@ fn run_gate(
         swap: bool,
     }
 
-    let exe = std::env::current_exe().map_err(ControllerError::Fs)?;
+    let exe = yz_worker_exe_from_run_dir(run_dir);
     let mut children: Vec<(u32, PathBuf, Child)> = Vec::new(); // (wid, result_path, child)
     for (wid, sched) in &per_worker {
         let sched_path = gate_workers_dir.join(format!("sched_{wid:03}.json"));
