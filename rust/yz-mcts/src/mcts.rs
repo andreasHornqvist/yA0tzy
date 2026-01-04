@@ -16,6 +16,12 @@ use thiserror::Error;
 use yz_core::{index_to_action, legal_action_mask, GameState, A};
 
 // region agent log
+#[inline]
+fn dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("YZ_DEBUG_LOG").as_deref(), Ok("1" | "true" | "yes")))
+}
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -25,6 +31,9 @@ fn now_ms() -> u64 {
 }
 
 fn dbg_log_line(line: String) {
+    if !dbg_enabled() {
+        return;
+    }
     static DBG_TX: OnceLock<std::sync::mpsc::Sender<String>> = OnceLock::new();
     fn start() -> Option<std::sync::mpsc::Sender<String>> {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -388,14 +397,16 @@ impl Mcts {
         };
 
         // region agent log
-        dbg_log_line(format!(
-            "{{\"timestamp\":{},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_budget\",\"location\":\"rust/yz-mcts/src/mcts.rs:begin_search_with_backend\",\"message\":\"begin_search\",\"data\":{{\"rerolls_left\":{},\"sim_mark\":{},\"sim_reroll\":{},\"target_sims\":{}}}}}",
-            now_ms(),
-            root_state.rerolls_left,
-            self.cfg.simulations_mark,
-            self.cfg.simulations_reroll,
-            target_sims
-        ));
+        if dbg_enabled() {
+            dbg_log_line(format!(
+                "{{\"timestamp\":{},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_budget\",\"location\":\"rust/yz-mcts/src/mcts.rs:begin_search_with_backend\",\"message\":\"begin_search\",\"data\":{{\"rerolls_left\":{},\"sim_mark\":{},\"sim_reroll\":{},\"target_sims\":{}}}}}",
+                now_ms(),
+                root_state.rerolls_left,
+                self.cfg.simulations_mark,
+                self.cfg.simulations_reroll,
+                target_sims
+            ));
+        }
         // endregion agent log
 
         self.reset_tree();
@@ -753,7 +764,12 @@ impl SearchDriver {
         max_work: u32,
     ) -> Option<SearchResult> {
         // region agent log
-        let tick_id = MCTS_TICK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let dbg = dbg_enabled();
+        let tick_id = if dbg {
+            MCTS_TICK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        } else {
+            0
+        };
         let t_tick0 = std::time::Instant::now();
         let mut n_submit: u32 = 0;
         let mut n_apply: u32 = 0;
@@ -762,6 +778,7 @@ impl SearchDriver {
 
         fn maybe_emit_slow_tick(
             tick_started: std::time::Instant,
+            dbg: bool,
             tick_id: u64,
             max_work: u32,
             pending_len: usize,
@@ -776,20 +793,22 @@ impl SearchDriver {
             if dt_ms < 2.0 {
                 return;
             }
-            dbg_log_line(format!(
-                "{{\"timestamp\":{},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_mcts_tick\",\"location\":\"rust/yz-mcts/src/mcts.rs:SearchDriver::tick\",\"message\":\"slow tick\",\"data\":{{\"tick_id\":{},\"dt_ms\":{:.3},\"max_work\":{},\"pending\":{},\"completed\":{},\"target_sims\":{},\"n_submit\":{},\"n_apply\":{},\"n_term\":{},\"ret_reason\":\"{}\"}}}}",
-                now_ms(),
-                tick_id,
-                dt_ms,
-                max_work,
-                pending_len,
-                completed,
-                target_sims,
-                n_submit,
-                n_apply,
-                n_term,
-                ret_reason
-            ));
+            if dbg {
+                dbg_log_line(format!(
+                    "{{\"timestamp\":{},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_mcts_tick\",\"location\":\"rust/yz-mcts/src/mcts.rs:SearchDriver::tick\",\"message\":\"slow tick\",\"data\":{{\"tick_id\":{},\"dt_ms\":{:.3},\"max_work\":{},\"pending\":{},\"completed\":{},\"target_sims\":{},\"n_submit\":{},\"n_apply\":{},\"n_term\":{},\"ret_reason\":\"{}\"}}}}",
+                    now_ms(),
+                    tick_id,
+                    dt_ms,
+                    max_work,
+                    pending_len,
+                    completed,
+                    target_sims,
+                    n_submit,
+                    n_apply,
+                    n_term,
+                    ret_reason
+                ));
+            }
         }
         // endregion agent log
 
@@ -799,11 +818,43 @@ impl SearchDriver {
                 if !self.poll_root(mcts) {
                     // Root not ready yet; non-blocking.
                     // region agent log
-                    ret_reason = "root_not_ready";
+                    if dbg {
+                        ret_reason = "root_not_ready";
+                    }
                     // endregion agent log
                     // region agent log
+                    if dbg {
+                        maybe_emit_slow_tick(
+                            t_tick0,
+                            dbg,
+                            tick_id,
+                            max_work,
+                            self.pending.len(),
+                            self.completed,
+                            self.target_sims,
+                            n_submit,
+                            n_apply,
+                            n_term,
+                            ret_reason,
+                        );
+                    }
+                    // endregion agent log
+                    return None;
+                }
+                continue;
+            }
+
+            if self.completed >= self.target_sims {
+                // region agent log
+                if dbg {
+                    ret_reason = "done";
+                }
+                // endregion agent log
+                // region agent log
+                if dbg {
                     maybe_emit_slow_tick(
                         t_tick0,
+                            dbg,
                         tick_id,
                         max_work,
                         self.pending.len(),
@@ -814,46 +865,26 @@ impl SearchDriver {
                         n_term,
                         ret_reason,
                     );
-                    // endregion agent log
-                    return None;
                 }
-                continue;
-            }
-
-            if self.completed >= self.target_sims {
-                // region agent log
-                ret_reason = "done";
                 // endregion agent log
                 // region agent log
-                maybe_emit_slow_tick(
-                    t_tick0,
-                    tick_id,
-                    max_work,
-                    self.pending.len(),
-                    self.completed,
-                    self.target_sims,
-                    n_submit,
-                    n_apply,
-                    n_term,
-                    ret_reason,
-                );
-                // endregion agent log
-                // region agent log
-                let dur_ms = self.search_started.elapsed().as_secs_f64() * 1000.0;
-                dbg_log_line(format!(
-                    "{{\"timestamp\":{},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_search\",\"location\":\"rust/yz-mcts/src/mcts.rs:SearchDriver::tick\",\"message\":\"search_done\",\"data\":{{\"duration_ms\":{:.3},\"target_sims\":{},\"completed\":{},\"submitted\":{},\"applied\":{},\"terminals\":{},\"fallbacks\":{},\"expansions\":{},\"node_count\":{},\"pending_max\":{}}}}}",
-                    now_ms(),
-                    dur_ms,
-                    self.target_sims,
-                    self.completed,
-                    self.submitted,
-                    self.applied,
-                    self.terminals,
-                    mcts.stats.fallbacks,
-                    mcts.stats.expansions,
-                    mcts.stats.node_count,
-                    mcts.stats.pending_count_max
-                ));
+                if dbg {
+                    let dur_ms = self.search_started.elapsed().as_secs_f64() * 1000.0;
+                    dbg_log_line(format!(
+                        "{{\"timestamp\":{},\"sessionId\":\"debug-session\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H_search\",\"location\":\"rust/yz-mcts/src/mcts.rs:SearchDriver::tick\",\"message\":\"search_done\",\"data\":{{\"duration_ms\":{:.3},\"target_sims\":{},\"completed\":{},\"submitted\":{},\"applied\":{},\"terminals\":{},\"fallbacks\":{},\"expansions\":{},\"node_count\":{},\"pending_max\":{}}}}}",
+                        now_ms(),
+                        dur_ms,
+                        self.target_sims,
+                        self.completed,
+                        self.submitted,
+                        self.applied,
+                        self.terminals,
+                        mcts.stats.fallbacks,
+                        mcts.stats.expansions,
+                        mcts.stats.node_count,
+                        mcts.stats.pending_count_max
+                    ));
+                }
                 // endregion agent log
                 return Some(self.finish(mcts));
             }
@@ -883,8 +914,10 @@ impl SearchDriver {
                         mcts.backup_with_virtual_loss(&path, z);
                         self.completed += 1;
                         // region agent log
-                        n_term += 1;
-                        self.terminals += 1;
+                        if dbg {
+                            n_term += 1;
+                            self.terminals += 1;
+                        }
                         // endregion agent log
                     }
                     LeafSelection::Pending(pe) => {
@@ -909,8 +942,10 @@ impl SearchDriver {
                         mcts.stats.pending_count_max =
                             mcts.stats.pending_count_max.max(self.pending.len());
                         // region agent log
-                        n_submit += 1;
-                        self.submitted += 1;
+                        if dbg {
+                            n_submit += 1;
+                            self.submitted += 1;
+                        }
                         // endregion agent log
                     }
                 }
@@ -921,21 +956,26 @@ impl SearchDriver {
             if self.pending.is_empty() {
                 // Nothing to do (should be rare); yield to scheduler.
                 // region agent log
-                ret_reason = "no_pending";
+                if dbg {
+                    ret_reason = "no_pending";
+                }
                 // endregion agent log
                 // region agent log
-                maybe_emit_slow_tick(
-                    t_tick0,
-                    tick_id,
-                    max_work,
-                    self.pending.len(),
-                    self.completed,
-                    self.target_sims,
-                    n_submit,
-                    n_apply,
-                    n_term,
-                    ret_reason,
-                );
+                if dbg {
+                    maybe_emit_slow_tick(
+                        t_tick0,
+                        dbg,
+                        tick_id,
+                        max_work,
+                        self.pending.len(),
+                        self.completed,
+                        self.target_sims,
+                        n_submit,
+                        n_apply,
+                        n_term,
+                        ret_reason,
+                    );
+                }
                 // endregion agent log
                 return None;
             }
@@ -949,8 +989,10 @@ impl SearchDriver {
                         self.completed += 1;
                         processed = true;
                         // region agent log
-                        n_apply += 1;
-                        self.applied += 1;
+                        if dbg {
+                            n_apply += 1;
+                            self.applied += 1;
+                        }
                         // endregion agent log
                         break;
                     }
@@ -966,38 +1008,46 @@ impl SearchDriver {
             if !processed {
                 // No response ready; non-blocking.
                 // region agent log
-                ret_reason = "no_resp_ready";
+                if dbg {
+                    ret_reason = "no_resp_ready";
+                }
                 // endregion agent log
                 // region agent log
-                maybe_emit_slow_tick(
-                    t_tick0,
-                    tick_id,
-                    max_work,
-                    self.pending.len(),
-                    self.completed,
-                    self.target_sims,
-                    n_submit,
-                    n_apply,
-                    n_term,
-                    ret_reason,
-                );
+                if dbg {
+                    maybe_emit_slow_tick(
+                        t_tick0,
+                        dbg,
+                        tick_id,
+                        max_work,
+                        self.pending.len(),
+                        self.completed,
+                        self.target_sims,
+                        n_submit,
+                        n_apply,
+                        n_term,
+                        ret_reason,
+                    );
+                }
                 // endregion agent log
                 return None;
             }
         }
         // region agent log
-        maybe_emit_slow_tick(
-            t_tick0,
-            tick_id,
-            max_work,
-            self.pending.len(),
-            self.completed,
-            self.target_sims,
-            n_submit,
-            n_apply,
-            n_term,
-            ret_reason,
-        );
+        if dbg {
+            maybe_emit_slow_tick(
+                t_tick0,
+                dbg,
+                tick_id,
+                max_work,
+                self.pending.len(),
+                self.completed,
+                self.target_sims,
+                n_submit,
+                n_apply,
+                n_term,
+                ret_reason,
+            );
+        }
         // endregion agent log
         None
     }

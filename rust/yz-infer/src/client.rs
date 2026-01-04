@@ -25,6 +25,10 @@ use crate::protocol::{InferRequestV1, InferResponseV1};
 
 // region agent log
 static DBG_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+fn dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("YZ_DEBUG_LOG").as_deref(), Ok("1" | "true" | "yes")))
+}
 
 fn dbg_start_writer_thread() -> Option<mpsc::Sender<String>> {
     let (tx, rx) = mpsc::channel::<String>();
@@ -57,6 +61,9 @@ fn dbg_start_writer_thread() -> Option<mpsc::Sender<String>> {
 }
 
 fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    if !dbg_enabled() {
+        return;
+    }
     let payload = serde_json::json!({
         "timestamp": (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -199,6 +206,12 @@ pub struct InferenceClient {
     inflight: Arc<AtomicUsize>,
     pending: Arc<Mutex<HashMap<u64, PendingEntry>>>,
 
+    /// Coalesced "some response arrived" signal used by outer loops to avoid
+    /// fixed-interval polling sleeps (which can add large response-consumption latency).
+    ///
+    /// Bounded to 1 so multiple responses collapse into a single wake-up token.
+    progress_rx: Mutex<mpsc::Receiver<()>>,
+
     outbound_tx: Option<mpsc::SyncSender<Vec<u8>>>,
     pool_tx: mpsc::SyncSender<Vec<u8>>,
     pool_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -236,6 +249,7 @@ impl InferenceClient {
 
         let (outbound_tx, outbound_rx) = mpsc::sync_channel::<Vec<u8>>(opts.max_outbound_queue);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<Vec<u8>>(opts.max_outbound_queue);
+        let (progress_tx, progress_rx) = mpsc::sync_channel::<()>(1);
 
         let reader_stream = stream.try_clone()?;
         let writer_stream = stream.try_clone()?;
@@ -248,9 +262,18 @@ impl InferenceClient {
         let stats_w = Arc::clone(&stats);
         let inflight_r = Arc::clone(&inflight);
         let inflight_w = Arc::clone(&inflight);
+        let progress_tx_r = progress_tx.clone();
+        let progress_tx_w = progress_tx.clone();
 
         let reader_handle = thread::spawn(move || {
-            reader_loop(reader_stream, pending_r, inflight_r, shutdown_r, stats_r);
+            reader_loop(
+                reader_stream,
+                pending_r,
+                inflight_r,
+                shutdown_r,
+                stats_r,
+                progress_tx_r,
+            );
         });
         let pool_tx_writer = pool_tx.clone();
         let writer_handle = thread::spawn(move || {
@@ -262,6 +285,7 @@ impl InferenceClient {
                 inflight_w,
                 shutdown_w,
                 stats_w,
+                progress_tx_w,
             );
         });
 
@@ -270,6 +294,7 @@ impl InferenceClient {
             opts,
             inflight,
             pending,
+            progress_rx: Mutex::new(progress_rx),
             outbound_tx: Some(outbound_tx),
             pool_tx,
             pool_rx: Mutex::new(pool_rx),
@@ -279,6 +304,15 @@ impl InferenceClient {
             writer_handle: Some(writer_handle),
             stats,
         })
+    }
+
+    /// Wait until at least one response (or a disconnect/error) has been observed, or timeout.
+    ///
+    /// This is used by scheduler loops to avoid fixed sleeps that can add large *extra* latency
+    /// between "response arrived" and "response consumed".
+    pub fn wait_for_progress(&self, timeout: Duration) {
+        let rx = self.progress_rx.lock().unwrap();
+        let _ = rx.recv_timeout(timeout);
     }
 
     /// Submit a request for evaluation.
@@ -364,20 +398,22 @@ impl InferenceClient {
             Ok(()) => {
                 self.stats_lock().on_sent();
                 // region agent log
-                let n = CLIENT_SUBMIT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                if enc_ms >= 0.5 || (n % 50_000 == 0) {
-                    dbg_log(
-                        "H_codec",
-                        "rust/yz-infer/src/client.rs:InferenceClient::submit",
-                        "encode_request_v1 timing",
-                        serde_json::json!({
-                            "n": n,
-                            "encode_ms": enc_ms,
-                            "features_len": req.features.len(),
-                            "legal_len": req.legal_mask.len(),
-                            "reused_buf": reused,
-                        }),
-                    );
+                if dbg_enabled() {
+                    let n = CLIENT_SUBMIT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                    if enc_ms >= 0.5 || (n % 50_000 == 0) {
+                        dbg_log(
+                            "H_codec",
+                            "rust/yz-infer/src/client.rs:InferenceClient::submit",
+                            "encode_request_v1 timing",
+                            serde_json::json!({
+                                "n": n,
+                                "encode_ms": enc_ms,
+                                "features_len": req.features.len(),
+                                "legal_len": req.legal_mask.len(),
+                                "reused_buf": reused,
+                            }),
+                        );
+                    }
                 }
                 // endregion agent log
                 Ok(Ticket { request_id, rx })
@@ -495,6 +531,7 @@ fn reader_loop(
     inflight: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<Stats>>,
+    progress_tx: mpsc::SyncSender<()>,
 ) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -506,6 +543,7 @@ fn reader_loop(
                 stats.lock().unwrap().on_error();
                 stream.shutdown();
                 let _ = e;
+                let _ = progress_tx.try_send(());
                 fail_all_pending(&pending, &inflight, || ClientError::Disconnected);
                 break;
             }
@@ -516,6 +554,7 @@ fn reader_loop(
                 stats.lock().unwrap().on_error();
                 stream.shutdown();
                 let _ = e;
+                let _ = progress_tx.try_send(());
                 fail_all_pending(&pending, &inflight, || ClientError::Disconnected);
                 break;
             }
@@ -531,29 +570,33 @@ fn reader_loop(
             let dt = e.start.elapsed();
             stats.lock().unwrap().on_received(dt);
             inflight.fetch_sub(1, Ordering::SeqCst);
+            // Wake any outer loop waiting for "some response arrived".
+            let _ = progress_tx.try_send(());
             // region agent log
             // RTT log (very hot): sample heavily + keep only extreme outliers.
             // This measures *submit->response dispatch* on the Rust side.
-            let dt_ms = dt.as_secs_f64() * 1000.0;
-            let rid = resp.request_id;
-            let sampled = (rid & DBG_SAMPLE_MASK) == 0;
-            // NOTE: Logging itself has previously been a bottleneck. Keep volume low:
-            // - always log only extreme tails
-            // - otherwise log only sampled requests
-            if dt_ms >= 200.0 || sampled {
-                dbg_log(
-                    "H_rtt",
-                    "rust/yz-infer/src/client.rs:reader_loop",
-                    "slow request rtt",
-                    serde_json::json!({
-                        "request_id": rid,
-                        "rtt_ms": dt_ms,
-                        "sampled": sampled,
-                        "pending_len_after": pending_len_after,
-                        "inflight": inflight.load(Ordering::Relaxed),
-                        "payload_len": payload.len(),
-                    }),
-                );
+            if dbg_enabled() {
+                let dt_ms = dt.as_secs_f64() * 1000.0;
+                let rid = resp.request_id;
+                let sampled = (rid & DBG_SAMPLE_MASK) == 0;
+                // NOTE: Logging itself has previously been a bottleneck. Keep volume low:
+                // - always log only extreme tails
+                // - otherwise log only sampled requests
+                if dt_ms >= 200.0 || sampled {
+                    dbg_log(
+                        "H_rtt",
+                        "rust/yz-infer/src/client.rs:reader_loop",
+                        "slow request rtt",
+                        serde_json::json!({
+                            "request_id": rid,
+                            "rtt_ms": dt_ms,
+                            "sampled": sampled,
+                            "pending_len_after": pending_len_after,
+                            "inflight": inflight.load(Ordering::Relaxed),
+                            "payload_len": payload.len(),
+                        }),
+                    );
+                }
             }
             // endregion agent log
             let _ = e.tx.send(Ok(resp));
@@ -572,6 +615,7 @@ fn writer_loop(
     inflight: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<Stats>>,
+    progress_tx: mpsc::SyncSender<()>,
 ) {
     while let Ok(mut payload) = outbound_rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
@@ -582,26 +626,29 @@ fn writer_loop(
             stats.lock().unwrap().on_error();
             stream.shutdown();
             let _ = e;
+            let _ = progress_tx.try_send(());
             fail_all_pending(&pending, &inflight, || ClientError::Disconnected);
             break;
         }
         // region agent log
         // Write log (hot): sample heavily + keep true outliers.
-        let write_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let sampled = (CLIENT_SUBMIT_COUNTER.load(Ordering::Relaxed) & DBG_SAMPLE_MASK) == 0;
-        if write_ms >= 10.0 || sampled {
-            dbg_log(
-                "H_write_frame",
-                "rust/yz-infer/src/client.rs:writer_loop",
-                "slow write_frame",
-                serde_json::json!({
-                    "write_ms": write_ms,
-                    "sampled": sampled,
-                    "payload_len": payload.len(),
-                    "pending_len": pending.lock().unwrap().len(),
-                    "inflight": inflight.load(Ordering::Relaxed),
-                }),
-            );
+        if dbg_enabled() {
+            let write_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let sampled = (CLIENT_SUBMIT_COUNTER.load(Ordering::Relaxed) & DBG_SAMPLE_MASK) == 0;
+            if write_ms >= 10.0 || sampled {
+                dbg_log(
+                    "H_write_frame",
+                    "rust/yz-infer/src/client.rs:writer_loop",
+                    "slow write_frame",
+                    serde_json::json!({
+                        "write_ms": write_ms,
+                        "sampled": sampled,
+                        "payload_len": payload.len(),
+                        "pending_len": pending.lock().unwrap().len(),
+                        "inflight": inflight.load(Ordering::Relaxed),
+                    }),
+                );
+            }
         }
         // endregion agent log
         payload.clear();

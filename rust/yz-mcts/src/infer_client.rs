@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use thiserror::Error;
 use yz_core::{GameState, A};
@@ -18,7 +19,14 @@ use yz_infer::protocol;
 use yz_infer::{ClientError, ClientOptions, InferenceClient, Ticket};
 
 // region agent log
+fn dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("YZ_DEBUG_LOG").as_deref(), Ok("1" | "true" | "yes")))
+}
 fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    if !dbg_enabled() {
+        return;
+    }
     let payload = serde_json::json!({
         "timestamp": (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -92,6 +100,10 @@ impl InferBackend {
         self.client.stats_snapshot()
     }
 
+    pub fn wait_for_progress(&self, timeout: Duration) {
+        self.client.wait_for_progress(timeout);
+    }
+
     pub fn submit(
         &self,
         state: &GameState,
@@ -124,21 +136,23 @@ impl InferBackend {
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // region agent log
-        let n = SUBMIT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        if total_ms >= 0.5 || (n % 50_000 == 0) {
-            dbg_log(
-                "H_submit_alloc",
-                "rust/yz-mcts/src/infer_client.rs:InferBackend::submit",
-                "submit timing",
-                serde_json::json!({
-                    "n": n,
-                    "enc_ms": enc_ms,
-                    "mask_ms": mask_ms,
-                    "req_build_ms": req_build_ms,
-                    "client_submit_ms": submit_ms,
-                    "total_ms": total_ms,
-                }),
-            );
+        if dbg_enabled() {
+            let n = SUBMIT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+            if total_ms >= 0.5 || (n % 50_000 == 0) {
+                dbg_log(
+                    "H_submit_alloc",
+                    "rust/yz-mcts/src/infer_client.rs:InferBackend::submit",
+                    "submit timing",
+                    serde_json::json!({
+                        "n": n,
+                        "enc_ms": enc_ms,
+                        "mask_ms": mask_ms,
+                        "req_build_ms": req_build_ms,
+                        "client_submit_ms": submit_ms,
+                        "total_ms": total_ms,
+                    }),
+                );
+            }
         }
         // endregion agent log
 
