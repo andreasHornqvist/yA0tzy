@@ -80,6 +80,10 @@ cargo run --bin yz -- --help    # Run CLI
 cargo fmt --check               # Check formatting
 cargo clippy --workspace -- -D warnings  # Lint
 
+# Makefile shortcuts (recommended for local runs)
+make run                        # Optimized default (release)
+make run-dev                    # Debug build (slow, for debugging)
+
 # Opt-in Rust↔Python inference e2e test (E6.5S6)
 YZ_PY_E2E=1 cargo test -p yz-mcts --test python_infer_e2e
 
@@ -102,6 +106,13 @@ uv run python -m yatzy_az model-init --out runs/<id>/models/best.pt --hidden 256
 uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best path:runs/<id>/models/best.pt --cand path:runs/<id>/models/candidate.pt
 # Optional CPU perf stability knobs (E6.5S5):
 uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best path:runs/<id>/models/best.pt --cand path:runs/<id>/models/candidate.pt --torch-threads 1 --torch-interop-threads 1
+
+# Notes:
+# - Controller/TUI normally starts infer-server for you.
+# - If infer-server fails to start due to Python environment, set:
+#     YZ_PYTHON_EXE=/abs/path/to/python
+# - If you explicitly want the controller to use `uv run`, set:
+#     YZ_USE_UV=1
 
 # Benchmarks
 cargo bench -p yz-bench              # Run Criterion microbenches
@@ -129,6 +140,44 @@ See `.github/workflows/ci.yml` for details.
 - **Rust** handles all latency-sensitive work: game simulation, MCTS, self-play workers
 - **Python** handles GPU-bound work: neural network inference and training
 - Communication via Unix domain sockets (or TCP) with a batched request/response protocol
+
+### Inference batching is a first-class performance feature (do not regress it)
+Most end-to-end throughput is determined by how efficiently the Python infer-server can form and execute large batches.
+
+- **Infer-server**: `python/yatzy_az/server/` (asyncio + batching + Prometheus-style metrics)
+- **Protocol + client**: `rust/yz-infer/` (length-delimited frames over UDS/TCP, background reader/writer threads)
+- **MCTS integration**: `rust/yz-mcts/src/infer_client.rs` (encodes state → features, submits to `yz-infer`)
+
+#### Batcher design (current)
+The server’s batcher is intentionally structured to avoid “global batch then split” (which crushes effective batch sizes during gating):
+
+- **Ingress**: a single asyncio queue receives requests (`Batcher.enqueue`).
+- **Staging**: requests are staged into **per-model queues** (`_pending_by_model[model_id]`).
+- **Draining**: after receiving one item, the batcher **opportunistically drains** already-queued items via `get_nowait()` (`_drain_nowait`) to reduce per-item scheduling overhead and form full batches when `max_wait_us` is small.
+- **Flush policy**: flush a per-model batch when either:
+  - **full**: that model has `len(queue) >= max_batch`, or
+  - **deadline**: the oldest queued item for a model exceeds `max_wait_us`.
+
+#### “Do not break batching again” checklist
+If you touch the infer-server, batcher, protocol, or scheduler loops, use this list as a hard constraint:
+
+- **Avoid accidental small-batch flushes**
+  - Do not introduce per-item awaits in hot loops that prevent draining already-ready queue items.
+  - Keep the “drain already queued items nowait” behavior (or an equivalent mechanism). Without it, the system can devolve into tiny batches even at high QPS.
+  - Do not build a global batch and then split it by `model_id` after the fact (this creates many sub-batches).
+
+- **Avoid fixed polling sleeps on the Rust side**
+  - Do not add fixed sleeps that delay consuming already-arrived inference responses (this adds latency and reduces throughput).
+  - Prefer event-driven wakeups: the `yz-infer` client exposes a “progress” signal so outer loops can wait for “some response arrived” without busy-spinning.
+
+- **Validate batching with metrics (this catches regressions immediately)**
+  - **Batch size health** (Prometheus endpoint): check `yatzy_infer_requests_total` vs `yatzy_infer_batches_total`.
+    - Under steady load, `avg_batch_size ≈ requests_total / batches_total` should be “close” to `inference.max_batch` (or at least not single-digit).
+  - **Histogram**: `yatzy_infer_batch_size_bucket{le="..."}`
+    - You want most mass in the top bucket(s) near `max_batch` under load.
+  - **Worker-side symptoms**: `runs/<id>/logs_workers/worker_*/progress.json`
+    - Very high `sched_would_block` + high `infer_latency_*` typically means inference is the bottleneck.
+    - Low batch sizes with low utilization is a batching regression.
 
 ### Controller + training orchestration (v1)
 - **Controller**: in-process Rust (`rust/yz-controller`) invoked by the TUI (`rust/yz-tui`).
@@ -167,6 +216,12 @@ See `.github/workflows/ci.yml` for details.
 - Python package: `yatzy_az` (snake_case)
 - Config files: `lowercase_with_underscores.yaml`
 
+### Runtime environment variables (selected)
+- **`YZ_DEBUG_LOG`**: enable debug logging across Rust/Python (off by default; can be expensive in hot paths).
+- **`YZ_INFER_PRINT_STATS`**: make the controller start infer-server with periodic batch/rps prints (debug aid).
+- **`YZ_PYTHON_EXE`**: override Python executable used by controller/TUI for infer-server and training.
+- **`YZ_USE_UV`**: if set, controller uses `uv run python ...` when spawning Python subprocesses.
+
 ---
 
 ## Where to Find Things
@@ -189,6 +244,8 @@ See `.github/workflows/ci.yml` for details.
 | NDJSON run logs (iteration + sampled roots) | `rust/yz-logging/` (`src/lib.rs`), outputs to `runs/<id>/logs/` |
 | Unified metrics stream (E10.5S2+) | `runs/<id>/logs/metrics.ndjson` (written by `yz selfplay`, `yz gate --run`, and `python -m yatzy_az train`) |
 | Run manifest (E8.5.x) | `runs/<id>/run.json` (written by `yz selfplay`, updated by `python -m yatzy_az train`, and finalized by `yz iter finalize`) |
+| Live per-worker progress (scheduler + inference stats) | `runs/<id>/logs_workers/worker_<N>/progress.json` |
+| Per-worker detailed events/timings | `runs/<id>/logs_workers/worker_<N>/worker_stats.ndjson` |
 | Replay snapshot (E8.5.4) | `runs/<id>/replay_snapshot.json` (created by training; freezes shard list for resumes) |
 | Python replay dataset loader (E8S1) | `python/yatzy_az/replay_dataset.py` |
 | Neural network model | `python/yatzy_az/model/` |
@@ -255,7 +312,7 @@ Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteratio
 
 ### TUI preflight checks (E13.2S5)
 - Before starting an iteration, the TUI verifies the inference server supports hot-reload.
-- Python server exposes `GET /capabilities` returning `{"version": "1", "hot_reload": true|false}`.
+- Python server exposes `GET /capabilities` returning `{"version": "2", "hot_reload": true|false}`.
 - Rust function `check_server_supports_hot_reload()` in `yz-tui` calls this endpoint and parses the response.
 - If hot-reload is not supported, `start_iteration()` fails with a clear error message prompting the user to restart the server.
 - Dashboard displays `model_reloads: N` counter from `run.json.model_reloads` (incremented by controller after each successful reload).
