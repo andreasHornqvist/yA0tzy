@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 
 from . import __version__, wandb_sync
-from .model.init import init_model_checkpoint
 from .server import server as infer_server
 from .trainer import train as train_mod
 
@@ -40,6 +39,8 @@ def cmd_wandb_sync(args: argparse.Namespace) -> int:
 
 def cmd_model_init(args: argparse.Namespace) -> int:
     """Create a fresh best.pt checkpoint for a new run."""
+    from .model.init import init_model_checkpoint
+
     out = Path(args.out)
     init_model_checkpoint(out, hidden=int(args.hidden), blocks=int(args.blocks))
     print(f"wrote: {out}")

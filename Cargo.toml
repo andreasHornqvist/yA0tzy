@@ -40,4 +40,36 @@ opt-level = 3
 [profile.test.package.yz-oracle]
 opt-level = 3
 
+# Self-play is CPU-heavy; speed up dev/test builds for core search/runtime crates.
+# This keeps the TUI usable without requiring `--release` for every run.
+[profile.dev.package.yz-mcts]
+opt-level = 3
+
+[profile.test.package.yz-mcts]
+opt-level = 3
+
+[profile.dev.package.yz-runtime]
+opt-level = 3
+
+[profile.test.package.yz-runtime]
+opt-level = 3
+
+[profile.dev.package.yz-infer]
+opt-level = 3
+
+[profile.test.package.yz-infer]
+opt-level = 3
+
+[profile.dev.package.yz-core]
+opt-level = 3
+
+[profile.test.package.yz-core]
+opt-level = 3
+
+[profile.dev.package.yz-features]
+opt-level = 3
+
+[profile.test.package.yz-features]
+opt-level = 3
+
 

@@ -6,7 +6,8 @@ help:
 	@echo "yA0tzy Make targets"
 	@echo ""
 	@echo "Core:"
-	@echo "  make run                      Start the TUI (controller starts/reuses infer-server)"
+	@echo "  make run                      Start the TUI (release; fast default)"
+	@echo "  make run-dev                  Start the TUI (dev; faster compile, slower runtime)"
 	@echo "  make tui                      Run the Ratatui UI (yz tui)"
 	@echo "  make infer-server             Run Python inference server (with hot-reload)"
 	@echo ""
@@ -16,6 +17,7 @@ help:
 	@echo "  make rust-clippy               cargo clippy --workspace -- -D warnings"
 	@echo ""
 	@echo "Python:"
+	@echo "  make py-sync                   uv sync (install python deps incl. torch)"
 	@echo "  make py-test                   pytest"
 	@echo "  make py-ruff                   ruff check + format --check"
 	@echo "  make py-ruff-fix               ruff check --fix + format"
@@ -68,6 +70,9 @@ rust-clippy:
 	cargo clippy --workspace -- -D warnings
 
 .PHONY: py-test py-ruff py-ruff-fix
+py-sync:
+	cd python && uv sync
+
 py-test:
 	$(PYTEST_RUN) -q
 
@@ -85,7 +90,14 @@ tui:
 
 .PHONY: run
 run:
-	@echo "Starting TUI ..."; \
+	@echo "Starting TUI (release) ..."; \
+	echo "(Press 'g' on Config screen to start an iteration)"; \
+	echo "(The controller will start/reuse the inference server using the current config.)"; \
+	cargo run --release -p yz-cli --bin yz -- tui
+
+.PHONY: run-dev
+run-dev:
+	@echo "Starting TUI (dev) ..."; \
 	echo "(Press 'g' on Config screen to start an iteration)"; \
 	echo "(The controller will start/reuse the inference server using the current config.)"; \
 	cargo run -p yz-cli --bin yz -- tui
@@ -100,6 +112,11 @@ selfplay:
 	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make selfplay RUN=smoke)"; exit 2; fi
 	cargo run -p yz-cli --bin yz -- selfplay --config $(CONFIG) --infer $(INFER_BIND) --out runs/$(RUN)/
 
+.PHONY: selfplay-release
+selfplay-release:
+	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make selfplay-release RUN=smoke)"; exit 2; fi
+	cargo run --release -p yz-cli --bin yz -- selfplay --config $(CONFIG) --infer $(INFER_BIND) --out runs/$(RUN)/
+
 train:
 	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make train RUN=smoke)"; exit 2; fi
 	$(PY_RUN) -m yatzy_az train --replay runs/$(RUN)/replay --out runs/$(RUN)/models --config runs/$(RUN)/config.yaml
@@ -107,5 +124,10 @@ train:
 gate:
 	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make gate RUN=smoke)"; exit 2; fi
 	cargo run -p yz-cli --bin yz -- gate --config $(CONFIG) --infer $(INFER_BIND) --run runs/$(RUN)/
+
+.PHONY: gate-release
+gate-release:
+	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make gate-release RUN=smoke)"; exit 2; fi
+	cargo run --release -p yz-cli --bin yz -- gate --config $(CONFIG) --infer $(INFER_BIND) --run runs/$(RUN)/
 
 
