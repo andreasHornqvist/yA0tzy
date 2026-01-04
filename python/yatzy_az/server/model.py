@@ -8,7 +8,7 @@ import time as _time
 import json as _json
 
 from .checkpoint import load_checkpoint
-from .debug_log import emit as _dbg_emit
+from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
 from .protocol_v1 import ACTION_SPACE_A
 
 
@@ -99,33 +99,34 @@ class TorchModel(Model):
         t_tolist = _time.monotonic()
 
         # region agent log
-        try:
-            total_ms = (t_tolist - t0) * 1000.0
-            sampled = (int(t_tolist * 1000) & 0x3F) == 0  # ~1/64
-            if total_ms >= 5.0 or sampled:
-                _dbg_emit(
-                    {
-                        "timestamp": int(_time.time() * 1000),
-                        "sessionId": "debug-session",
-                        "runId": "pre-fix",
-                        "hypothesisId": "H_latency",
-                        "location": "python/yatzy_az/server/model.py:TorchModel.infer_batch",
-                        "message": "torch timings",
-                        "data": {
-                            "device": str(self._device),
-                            "batch": len(features_batch),
-                            "sampled": bool(sampled),
-                            "as_tensor_ms": (t_as_tensor - t0) * 1000.0,
-                            "to_device_ms": (t_to_dev - t_as_tensor) * 1000.0,
-                            "forward_ms": (t_fwd - t_to_dev) * 1000.0,
-                            "to_cpu_ms": (t_to_cpu - t_fwd) * 1000.0,
-                            "tolist_ms": (t_tolist - t_to_cpu) * 1000.0,
-                            "total_ms": total_ms,
-                        },
-                    }
-                )
-        except Exception:
-            pass
+        if _dbg_enabled():
+            try:
+                total_ms = (t_tolist - t0) * 1000.0
+                sampled = (int(t_tolist * 1000) & 0x3F) == 0  # ~1/64
+                if total_ms >= 5.0 or sampled:
+                    _dbg_emit(
+                        {
+                            "timestamp": int(_time.time() * 1000),
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H_latency",
+                            "location": "python/yatzy_az/server/model.py:TorchModel.infer_batch",
+                            "message": "torch timings",
+                            "data": {
+                                "device": str(self._device),
+                                "batch": len(features_batch),
+                                "sampled": bool(sampled),
+                                "as_tensor_ms": (t_as_tensor - t0) * 1000.0,
+                                "to_device_ms": (t_to_dev - t_as_tensor) * 1000.0,
+                                "forward_ms": (t_fwd - t_to_dev) * 1000.0,
+                                "to_cpu_ms": (t_to_cpu - t_fwd) * 1000.0,
+                                "tolist_ms": (t_tolist - t_to_cpu) * 1000.0,
+                                "total_ms": total_ms,
+                            },
+                        }
+                    )
+            except Exception:
+                pass
         # endregion agent log
 
         out: list[InferOutput] = []

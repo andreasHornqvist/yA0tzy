@@ -15,6 +15,7 @@ from typing import Any
 
 
 _DEBUG_LOG_PATH = "/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log"
+_ENABLED = os.getenv("YZ_DEBUG_LOG") in ("1", "true", "yes")
 
 _q: "queue.SimpleQueue[str]" = queue.SimpleQueue()
 _started = False
@@ -75,6 +76,8 @@ def _ensure_started() -> None:
 
 def emit(payload: dict[str, Any]) -> None:
     """Enqueue a payload as one NDJSON line (best-effort)."""
+    if not _ENABLED:
+        return
     _ensure_started()
     try:
         if "timestamp" not in payload:
@@ -82,6 +85,10 @@ def emit(payload: dict[str, Any]) -> None:
         _q.put(json.dumps(payload) + "\n")
     except Exception:
         pass
+
+
+def enabled() -> bool:
+    return bool(_ENABLED)
 
 
 

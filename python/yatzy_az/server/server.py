@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import json as _json
 
 from .batcher import Batcher
-from .debug_log import emit as _dbg_emit
+from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
 from .metrics import MetricsSnapshot, now_s
 from .metrics_server import ReloadResult, start_metrics_server
 from .model import build_model
@@ -70,25 +70,26 @@ def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
         torch.set_num_interop_threads(int(cfg.torch_interop_threads))
 
     # region agent log
-    try:
-        _dbg_emit(
-            {
-                "timestamp": int(time.time() * 1000),
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H_latency",
-                "location": "python/yatzy_az/server/server.py:_apply_torch_thread_settings",
-                "message": "torch thread settings applied",
-                "data": {
-                    "torch_threads": cfg.torch_threads,
-                    "torch_interop_threads": cfg.torch_interop_threads,
-                    "torch_get_num_threads": int(torch.get_num_threads()),
-                    "torch_get_num_interop_threads": int(torch.get_num_interop_threads()),
-                },
-            }
-        )
-    except Exception:
-        pass
+    if _dbg_enabled():
+        try:
+            _dbg_emit(
+                {
+                    "timestamp": int(time.time() * 1000),
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H_latency",
+                    "location": "python/yatzy_az/server/server.py:_apply_torch_thread_settings",
+                    "message": "torch thread settings applied",
+                    "data": {
+                        "torch_threads": cfg.torch_threads,
+                        "torch_interop_threads": cfg.torch_interop_threads,
+                        "torch_get_num_threads": int(torch.get_num_threads()),
+                        "torch_get_num_interop_threads": int(torch.get_num_interop_threads()),
+                    },
+                }
+            )
+        except Exception:
+            pass
     # endregion agent log
 
 
@@ -111,7 +112,7 @@ async def _handle_conn(
     # region agent log
     # Sampled per-request timing: decode->worker_start and decode->enqueue_done.
     # Keep extremely low-volume (1/1024 by request_id) to avoid perturbing perf.
-    t_dec_by_id: dict[int, float] = {}
+    t_dec_by_id: dict[int, float] | None = {} if _dbg_enabled() else None
     # endregion agent log
 
     async def _writer_loop() -> None:
@@ -130,63 +131,65 @@ async def _handle_conn(
             assert isinstance(req, object)
             try:
                 # region agent log
-                try:
-                    rid = int(req.request_id)  # type: ignore[attr-defined]
-                    t_dec = t_dec_by_id.pop(rid, None)
-                    if t_dec is not None:
-                        dt_to_worker_ms = (time.monotonic() - t_dec) * 1000.0
-                        _dbg_emit(
-                            {
-                                "timestamp": int(time.time() * 1000),
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H_conn_sched",
-                                "location": "python/yatzy_az/server/server.py:_worker_loop",
-                                "message": "worker picked request",
-                                "data": {
-                                    "request_id": rid,
-                                    "worker_id": int(worker_id),
-                                    "dt_decode_to_worker_ms": dt_to_worker_ms,
-                                    "queue_depth": int(batcher.queue_depth),
-                                    "req_q": int(req_q.qsize()),
-                                    "out_q": int(out_q.qsize()),
-                                },
-                            }
-                        )
-                        # put back the decode timestamp so we can also log decode->enqueue_done below
-                        t_dec_by_id[rid] = t_dec
-                except Exception:
-                    pass
+                if t_dec_by_id is not None and _dbg_enabled():
+                    try:
+                        rid = int(req.request_id)  # type: ignore[attr-defined]
+                        t_dec = t_dec_by_id.pop(rid, None)
+                        if t_dec is not None:
+                            dt_to_worker_ms = (time.monotonic() - t_dec) * 1000.0
+                            _dbg_emit(
+                                {
+                                    "timestamp": int(time.time() * 1000),
+                                    "sessionId": "debug-session",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "H_conn_sched",
+                                    "location": "python/yatzy_az/server/server.py:_worker_loop",
+                                    "message": "worker picked request",
+                                    "data": {
+                                        "request_id": rid,
+                                        "worker_id": int(worker_id),
+                                        "dt_decode_to_worker_ms": dt_to_worker_ms,
+                                        "queue_depth": int(batcher.queue_depth),
+                                        "req_q": int(req_q.qsize()),
+                                        "out_q": int(out_q.qsize()),
+                                    },
+                                }
+                            )
+                            # put back the decode timestamp so we can also log decode->enqueue_done below
+                            t_dec_by_id[rid] = t_dec
+                    except Exception:
+                        pass
                 # endregion agent log
 
                 resp: InferResponseV1 = await batcher.enqueue(req)  # type: ignore[arg-type]
 
                 # region agent log
-                try:
-                    rid = int(resp.request_id)
-                    t_dec = t_dec_by_id.pop(rid, None)
-                    if t_dec is not None:
-                        dt_to_done_ms = (time.monotonic() - t_dec) * 1000.0
-                        _dbg_emit(
-                            {
-                                "timestamp": int(time.time() * 1000),
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H_conn_sched",
-                                "location": "python/yatzy_az/server/server.py:_worker_loop",
-                                "message": "enqueue completed",
-                                "data": {
-                                    "request_id": rid,
-                                    "worker_id": int(worker_id),
-                                    "dt_decode_to_enqueue_done_ms": dt_to_done_ms,
-                                    "queue_depth": int(batcher.queue_depth),
-                                    "req_q": int(req_q.qsize()),
-                                    "out_q": int(out_q.qsize()),
-                                },
-                            }
-                        )
-                except Exception:
-                    pass
+                if t_dec_by_id is not None and _dbg_enabled():
+                    try:
+                        rid = int(resp.request_id)
+                        t_dec = t_dec_by_id.pop(rid, None)
+                        if t_dec is not None:
+                            dt_to_done_ms = (time.monotonic() - t_dec) * 1000.0
+                            _dbg_emit(
+                                {
+                                    "timestamp": int(time.time() * 1000),
+                                    "sessionId": "debug-session",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "H_conn_sched",
+                                    "location": "python/yatzy_az/server/server.py:_worker_loop",
+                                    "message": "enqueue completed",
+                                    "data": {
+                                        "request_id": rid,
+                                        "worker_id": int(worker_id),
+                                        "dt_decode_to_enqueue_done_ms": dt_to_done_ms,
+                                        "queue_depth": int(batcher.queue_depth),
+                                        "req_q": int(req_q.qsize()),
+                                        "out_q": int(out_q.qsize()),
+                                    },
+                                }
+                            )
+                    except Exception:
+                        pass
                 # endregion agent log
 
                 await out_q.put(encode_response_v1(resp))
@@ -209,30 +212,31 @@ async def _handle_conn(
                 break
 
             # region agent log
-            try:
-                if _dbg_sample_req(int(req.request_id)):
-                    # Record decode time for sampled requests (used by worker timing logs).
-                    t_dec_by_id[int(req.request_id)] = time.monotonic()
-                    _dbg_emit(
-                        {
-                            "timestamp": int(time.time() * 1000),
-                            "sessionId": "debug-session",
-                            "runId": "pre-fix",
-                            "hypothesisId": "H1",
-                            "location": "python/yatzy_az/server/server.py:_handle_conn",
-                            "message": "decoded request; enqueued to worker pool (pipelined)",
-                            "data": {
-                                "request_id": int(req.request_id),
-                                "model_id": int(req.model_id),
-                                "features_len": len(req.features),
-                                "legal_len": len(req.legal_mask),
-                                "queue_depth": int(batcher.queue_depth),
-                                "req_q": int(req_q.qsize()),
-                            },
-                        }
-                    )
-            except Exception:
-                pass
+            if t_dec_by_id is not None and _dbg_enabled():
+                try:
+                    if _dbg_sample_req(int(req.request_id)):
+                        # Record decode time for sampled requests (used by worker timing logs).
+                        t_dec_by_id[int(req.request_id)] = time.monotonic()
+                        _dbg_emit(
+                            {
+                                "timestamp": int(time.time() * 1000),
+                                "sessionId": "debug-session",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H1",
+                                "location": "python/yatzy_az/server/server.py:_handle_conn",
+                                "message": "decoded request; enqueued to worker pool (pipelined)",
+                                "data": {
+                                    "request_id": int(req.request_id),
+                                    "model_id": int(req.model_id),
+                                    "features_len": len(req.features),
+                                    "legal_len": len(req.legal_mask),
+                                    "queue_depth": int(batcher.queue_depth),
+                                    "req_q": int(req_q.qsize()),
+                                },
+                            }
+                        )
+                except Exception:
+                    pass
             # endregion agent log
 
             await inflight_sem.acquire()
@@ -283,6 +287,33 @@ async def serve(config: ServerConfig) -> None:
     def reload_model(model_id_str: str, path: str) -> ReloadResult:
         """Hot-reload a model (E13.2S4)."""
         try:
+            # region agent log
+            def _dbg_line(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+                if not _dbg_enabled():
+                    return
+                payload = {
+                    "timestamp": int(time.time() * 1000),
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": hypothesis_id,
+                    "location": location,
+                    "message": message,
+                    "data": data,
+                }
+                try:
+                    _dbg_emit(payload)
+                except Exception:
+                    pass
+
+            t0 = time.monotonic()
+            _dbg_line(
+                "H_reload",
+                "python/yatzy_az/server/server.py:reload_model",
+                "reload start",
+                {"model_id": str(model_id_str), "path": str(path)},
+            )
+            # endregion agent log
+
             # Map model_id string to numeric ID.
             if model_id_str == "best":
                 numeric_id = int(config.best_id)
@@ -292,13 +323,41 @@ async def serve(config: ServerConfig) -> None:
                 return ReloadResult(ok=False, error=f"unknown model_id: {model_id_str}")
 
             # Build new model from checkpoint.
+            t_build0 = time.monotonic()
             new_model = build_model(f"path:{path}", device=config.device)
+            build_ms = (time.monotonic() - t_build0) * 1000.0
 
             # Atomically swap the model.
             batcher.replace_model(numeric_id, new_model)
 
+            # region agent log
+            _dbg_line(
+                "H_reload",
+                "python/yatzy_az/server/server.py:reload_model",
+                "reload done",
+                {
+                    "model_id": str(model_id_str),
+                    "numeric_id": int(numeric_id),
+                    "ok": True,
+                    "build_ms": float(build_ms),
+                    "dt_ms": float((time.monotonic() - t0) * 1000.0),
+                },
+            )
+            # endregion agent log
+
             return ReloadResult(ok=True)
         except Exception as e:  # noqa: BLE001
+            # region agent log
+            try:
+                _dbg_line(
+                    "H_reload",
+                    "python/yatzy_az/server/server.py:reload_model",
+                    "reload error",
+                    {"model_id": str(model_id_str), "ok": False, "error": str(e)},
+                )
+            except Exception:
+                pass
+            # endregion agent log
             return ReloadResult(ok=False, error=str(e))
 
     stop_ev = asyncio.Event()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import time
 import json as _json
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Final
 
 from .model import Model
 from .protocol_v1 import InferRequestV1, InferResponseV1
-from .debug_log import emit as _dbg_emit
+from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
 
 
 @dataclass(slots=True)
@@ -57,6 +58,13 @@ class Batcher:
         self._max_batch: Final[int] = max_batch
         self._max_wait_s: Final[float] = max_wait_us / 1_000_000.0
         self._q: asyncio.Queue[_Queued] = asyncio.Queue()
+        # Pending items staged by model_id. This allows per-model batching so we don't
+        # form a global batch that then gets split into smaller sub-batches (common in gating).
+        self._pending_by_model: dict[int, collections.deque[_Queued]] = {}
+        self._pending_total: int = 0
+        # region agent log
+        self._first_batch_logged: set[int] | None = set() if _dbg_enabled() else None
+        # endregion agent log
         self._stats = BatcherStats()
         self._stop = asyncio.Event()
         self._reloads_total: int = 0
@@ -69,7 +77,8 @@ class Batcher:
 
     @property
     def queue_depth(self) -> int:
-        return self._q.qsize()
+        # Include both ingress queue and staged per-model pending.
+        return int(self._q.qsize()) + int(self._pending_total)
 
     @property
     def reloads_total(self) -> int:
@@ -95,152 +104,252 @@ class Batcher:
             try:
                 first = await asyncio.wait_for(self._q.get(), timeout=0.1)
             except TimeoutError:
+                # If we already have staged work, keep making progress by flushing
+                # any model whose oldest item has exceeded max_wait.
+                if self._pending_total > 0:
+                    now = time.monotonic()
+                    oldest_deadline = None
+                    oldest_mid = None
+                    for mid, dq in self._pending_by_model.items():
+                        if not dq:
+                            continue
+                        dl = dq[0].t0 + self._max_wait_s
+                        if oldest_deadline is None or dl < oldest_deadline:
+                            oldest_deadline = dl
+                            oldest_mid = mid
+                    if oldest_deadline is not None and oldest_mid is not None and (oldest_deadline - now) <= 0:
+                        self._flush_one(sample=False, force_model_id=oldest_mid)
                 continue
 
-            batch: list[_Queued] = [first]
-            # IMPORTANT: the batching window is relative to *now*, not relative to when the first
-            # request was enqueued. If the queue backs up (or inference is slow), using first.t0
-            # would make `remaining` <= 0 immediately, forcing batch size 1 forever.
-            deadline = time.monotonic() + self._max_wait_s
+            self._stage(first)
+            # Opportunistically drain already-queued work without awaiting.
+            # This reduces per-item scheduling overhead and helps form larger batches
+            # when max_wait is small (e.g. 1000us) and QPS is high.
+            self._drain_nowait()
 
-            while len(batch) < self._max_batch:
-                remaining = deadline - time.monotonic()
+            # Keep pulling until we can flush a full batch for some model, or until the
+            # oldest pending request (across all models) hits its deadline.
+            while self._pending_total > 0 and not self._stop.is_set():
+                # If any model already has a full batch, flush it immediately.
+                full_model_id = None
+                for mid, dq in self._pending_by_model.items():
+                    if len(dq) >= self._max_batch:
+                        full_model_id = mid
+                        break
+                if full_model_id is not None:
+                    self._flush_one(sample=True, force_model_id=full_model_id)
+                    continue
+
+                # Compute remaining time until the oldest pending item reaches max_wait.
+                now = time.monotonic()
+                oldest_deadline = None
+                oldest_mid = None
+                for mid, dq in self._pending_by_model.items():
+                    if not dq:
+                        continue
+                    dl = dq[0].t0 + self._max_wait_s
+                    if oldest_deadline is None or dl < oldest_deadline:
+                        oldest_deadline = dl
+                        oldest_mid = mid
+                if oldest_deadline is None or oldest_mid is None:
+                    break
+
+                remaining = oldest_deadline - now
                 if remaining <= 0:
-                    break
+                    self._flush_one(sample=True, force_model_id=oldest_mid)
+                    continue
+
                 try:
-                    batch.append(await asyncio.wait_for(self._q.get(), timeout=remaining))
+                    item = await asyncio.wait_for(self._q.get(), timeout=remaining)
+                    self._stage(item)
+                    # If the queue is already populated, drain it quickly without extra awaits.
+                    self._drain_nowait()
                 except TimeoutError:
-                    break
-
-            self._dbg_batch_ctr += 1
-            sample = (self._dbg_batch_ctr & 0x3F) == 0  # 1 / 64 batches
-
-            # region agent log
-            if sample:
-                try:
-                    _dbg_emit(
-                        {
-                            "timestamp": int(time.time() * 1000),
-                            "sessionId": "debug-session",
-                            "runId": "pre-fix",
-                            "hypothesisId": "H1",
-                            "location": "python/yatzy_az/server/batcher.py:Batcher.run",
-                            "message": "formed batch",
-                            "data": {
-                                "batch_len": len(batch),
-                                "queue_depth_after_form": int(self._q.qsize()),
-                                "max_batch": int(self._max_batch),
-                                "max_wait_us": int(self._max_wait_s * 1_000_000),
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
-            # endregion agent log
-
-            # region agent log
-            # Measure how long the oldest request waited in the queue before being flushed.
-            # This helps confirm whether end-to-end latency is dominated by max_wait_us batching.
-            if sample and len(batch) < self._max_batch:
-                try:
-                    now = time.monotonic()
-                    age_us = int((now - first.t0) * 1_000_000)
-                    _dbg_emit(
-                        {
-                            "timestamp": int(time.time() * 1000),
-                            "sessionId": "debug-session",
-                            "runId": "pre-fix",
-                            "hypothesisId": "H_wait",
-                            "location": "python/yatzy_az/server/batcher.py:Batcher.run",
-                            "message": "batch wait (oldest item age)",
-                            "data": {
-                                "batch_len": int(len(batch)),
-                                "age_us": age_us,
-                                "max_wait_us": int(self._max_wait_s * 1_000_000),
-                                "queue_depth_after_form": int(self._q.qsize()),
-                                "flush_reason": "deadline_or_timeout",
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
-            # endregion agent log
-
-            self._apply_batch(batch)
+                    # Oldest item reached deadline; flush that model.
+                    self._flush_one(sample=True, force_model_id=oldest_mid)
+                    continue
 
     def stop(self) -> None:
         self._stop.set()
 
-    def _apply_batch(self, batch: list[_Queued]) -> None:
-        self._stats.batches_total += 1
-        self._stats.requests_total += len(batch)
-        self._stats.max_batch_seen = max(self._stats.max_batch_seen, len(batch))
-        self._stats.batch_hist[len(batch)] = self._stats.batch_hist.get(len(batch), 0) + 1
+    def _stage(self, item: _Queued) -> None:
+        dq = self._pending_by_model.get(int(item.req.model_id))
+        if dq is None:
+            dq = collections.deque()
+            self._pending_by_model[int(item.req.model_id)] = dq
+        dq.append(item)
+        self._pending_total += 1
 
-        # Route by model_id. We process each model_id group in one call to `infer_batch`.
-        groups: dict[int, list[_Queued]] = {}
-        for item in batch:
-            groups.setdefault(item.req.model_id, []).append(item)
-
-        for model_id, items in groups.items():
-            ms = self._stats.by_model.get(model_id)
-            if ms is None:
-                ms = ModelStats()
-                self._stats.by_model[model_id] = ms
-            ms.batches_total += 1
-            ms.requests_total += len(items)
-            ms.max_batch_seen = max(ms.max_batch_seen, len(items))
-            ms.batch_hist[len(items)] = ms.batch_hist.get(len(items), 0) + 1
-
-            model = self._models.get(model_id)
-            if model is None:
-                for item in items:
-                    if not item.fut.cancelled():
-                        item.fut.set_exception(ValueError(f"unknown model_id: {model_id}"))
-                continue
-
-            feats = [it.req.features for it in items]
-            masks = [it.req.legal_mask for it in items]
-            t0 = time.monotonic()
-            outs = model.infer_batch(feats, masks)
-            dt_ms = (time.monotonic() - t0) * 1000.0
-
-            # region agent log
+    def _drain_nowait(self, *, max_items: int = 4096) -> None:
+        # Drain up to max_items queued requests without awaiting.
+        # Safe: asyncio.Queue.get_nowait() is O(1).
+        for _ in range(max_items):
             try:
+                item = self._q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self._stage(item)
+
+    def _flush_one(self, *, sample: bool, force_model_id: int | None = None) -> None:
+        """Flush one per-model batch.\n\n        If force_model_id is provided, we flush that model (if any pending).\n        Otherwise, we flush the model whose oldest item has waited the longest.\n        """
+        if self._pending_total <= 0:
+            return
+
+        # Pick model to flush.
+        if force_model_id is not None:
+            model_id = int(force_model_id)
+            dq = self._pending_by_model.get(model_id)
+            if not dq:
+                return
+        else:
+            now = time.monotonic()
+            model_id = None
+            best_age = -1.0
+            for mid, dq2 in self._pending_by_model.items():
+                if not dq2:
+                    continue
+                age = now - dq2[0].t0
+                if age > best_age:
+                    best_age = age
+                    model_id = mid
+            if model_id is None:
+                return
+            dq = self._pending_by_model[model_id]
+
+        # Build batch up to max_batch.
+        batch: list[_Queued] = []
+        while dq and len(batch) < self._max_batch:
+            batch.append(dq.popleft())
+        self._pending_total -= len(batch)
+        if not dq:
+            # Keep dict small.
+            self._pending_by_model.pop(model_id, None)
+
+        if _dbg_enabled():
+            self._dbg_batch_ctr += 1
+            if not sample:
+                sample = (self._dbg_batch_ctr & 0x3F) == 0  # 1 / 64 flushes
+        else:
+            sample = False
+
+        # region agent log
+        if sample and _dbg_enabled():
+            try:
+                oldest_age_us = int((time.monotonic() - batch[0].t0) * 1_000_000) if batch else 0
+                _dbg_emit(
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H1",
+                        "location": "python/yatzy_az/server/batcher.py:Batcher._flush_one",
+                        "message": "flushing per-model batch",
+                        "data": {
+                            "model_id": int(model_id),
+                            "batch_len": int(len(batch)),
+                            "oldest_age_us": int(oldest_age_us),
+                            "queue_depth": int(self.queue_depth),
+                            "max_batch": int(self._max_batch),
+                            "max_wait_us": int(self._max_wait_s * 1_000_000),
+                        },
+                    }
+                )
+            except Exception:
+                pass
+        # endregion agent log
+
+        self._apply_model_batch(int(model_id), batch)
+
+    def _apply_model_batch(self, model_id: int, items: list[_Queued]) -> None:
+        if not items:
+            return
+
+        self._stats.batches_total += 1
+        self._stats.requests_total += len(items)
+        self._stats.max_batch_seen = max(self._stats.max_batch_seen, len(items))
+        self._stats.batch_hist[len(items)] = self._stats.batch_hist.get(len(items), 0) + 1
+
+        ms = self._stats.by_model.get(model_id)
+        if ms is None:
+            ms = ModelStats()
+            self._stats.by_model[model_id] = ms
+        ms.batches_total += 1
+        ms.requests_total += len(items)
+        ms.max_batch_seen = max(ms.max_batch_seen, len(items))
+        ms.batch_hist[len(items)] = ms.batch_hist.get(len(items), 0) + 1
+
+        model = self._models.get(model_id)
+        if model is None:
+            for item in items:
+                if not item.fut.cancelled():
+                    item.fut.set_exception(ValueError(f"unknown model_id: {model_id}"))
+            return
+
+        feats = [it.req.features for it in items]
+        masks = [it.req.legal_mask for it in items]
+        t0 = time.monotonic()
+        outs = model.infer_batch(feats, masks)
+        dt_ms = (time.monotonic() - t0) * 1000.0
+
+        # region agent log
+        if self._first_batch_logged is not None and model_id not in self._first_batch_logged:
+            self._first_batch_logged.add(int(model_id))
+            try:
+                payload = {
+                    "timestamp": int(time.time() * 1000),
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H_warmup",
+                    "location": "python/yatzy_az/server/batcher.py:_apply_model_batch",
+                    "message": "first infer_batch for model_id",
+                    "data": {
+                        "model_id": int(model_id),
+                        "items": int(len(items)),
+                        "dt_ms": float(dt_ms),
+                        "queue_depth": int(self.queue_depth),
+                    },
+                }
+                if _dbg_enabled():
+                    _dbg_emit(payload)
+            except Exception:
+                pass
+        try:
+            if _dbg_enabled():
                 _dbg_emit(
                     {
                         "timestamp": int(time.time() * 1000),
                         "sessionId": "debug-session",
                         "runId": "pre-fix",
                         "hypothesisId": "H_latency",
-                        "location": "python/yatzy_az/server/batcher.py:_apply_batch",
+                        "location": "python/yatzy_az/server/batcher.py:_apply_model_batch",
                         "message": "infer_batch timing",
                         "data": {
                             "model_id": int(model_id),
-                            "items": len(items),
-                            "dt_ms": dt_ms,
-                            "dt_per_item_ms": (dt_ms / max(1, len(items))),
-                            "queue_depth": int(self._q.qsize()),
+                            "items": int(len(items)),
+                            "dt_ms": float(dt_ms),
+                            "dt_per_item_ms": float(dt_ms / max(1, len(items))),
+                            "queue_depth": int(self.queue_depth),
                         },
                     }
                 )
-            except Exception:
-                pass
-            # endregion agent log
-            if len(outs) != len(items):
-                for item in items:
-                    if not item.fut.cancelled():
-                        item.fut.set_exception(RuntimeError("model returned wrong batch size"))
-                continue
+        except Exception:
+            pass
+        # endregion agent log
 
-            for item, out in zip(items, outs, strict=True):
-                if item.fut.cancelled():
-                    continue
-                item.fut.set_result(
-                    InferResponseV1(
-                        request_id=item.req.request_id,
-                        policy_logits=out.policy_logits,
-                        value=out.value,
-                        margin=out.margin,
-                    )
+        if len(outs) != len(items):
+            for item in items:
+                if not item.fut.cancelled():
+                    item.fut.set_exception(RuntimeError("model returned wrong batch size"))
+            return
+
+        for item, out in zip(items, outs, strict=True):
+            if item.fut.cancelled():
+                continue
+            item.fut.set_result(
+                InferResponseV1(
+                    request_id=item.req.request_id,
+                    policy_logits=out.policy_logits,
+                    value=out.value,
+                    margin=out.margin,
                 )
+            )
