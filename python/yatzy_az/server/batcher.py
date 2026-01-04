@@ -15,16 +15,16 @@ from .model import Model
 from .protocol_v1 import (
     ACTION_SPACE_A,
     FEATURE_LEN_V1,
-    InferRequestV1Packed,
-    InferResponseV1Packed,
+    InferRequestPacked,
+    InferResponsePacked,
 )
 from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
 
 
 @dataclass(slots=True)
 class _Queued:
-    req: InferRequestV1Packed
-    fut: asyncio.Future[InferResponseV1Packed]
+    req: InferRequestPacked
+    fut: asyncio.Future[InferResponsePacked]
     t0: float
 
 
@@ -100,9 +100,9 @@ class Batcher:
         self._models[model_id] = new_model
         self._reloads_total += 1
 
-    async def enqueue(self, req: InferRequestV1Packed) -> InferResponseV1Packed:
+    async def enqueue(self, req: InferRequestPacked) -> InferResponsePacked:
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[InferResponseV1Packed] = loop.create_future()
+        fut: asyncio.Future[InferResponsePacked] = loop.create_future()
         await self._q.put(_Queued(req=req, fut=fut, t0=time.monotonic()))
         return await fut
 
@@ -371,16 +371,13 @@ class Batcher:
             if item.fut.cancelled():
                 continue
             item.fut.set_result(
-                InferResponseV1Packed(
+                InferResponsePacked(
+                    protocol_version=int(item.req.protocol_version),
                     request_id=item.req.request_id,
                     policy_logits_f32=logits_mv[
                         i * ACTION_SPACE_A * 4 : (i + 1) * ACTION_SPACE_A * 4
                     ],
                     value_f32=values_mv[i * 4 : (i + 1) * 4],
-                    margin_f32=(
-                        None
-                        if margin_mv is None
-                        else margin_mv[i * 4 : (i + 1) * 4]
-                    ),
+                    margin_f32=None if margin_mv is None else margin_mv[i * 4 : (i + 1) * 4],
                 )
             )

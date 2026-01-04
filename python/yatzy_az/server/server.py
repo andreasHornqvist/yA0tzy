@@ -20,8 +20,8 @@ from .model import build_model
 from .protocol_v1 import (
     DecodeError,
     FEATURE_LEN_V1,
-    decode_request_v1_packed,
-    encode_response_v1_packed,
+    decode_request_packed,
+    encode_response_packed,
     read_frame,
     write_frame,
 )
@@ -192,7 +192,7 @@ async def _handle_conn(
                         pass
                 # endregion agent log
 
-                await out_q.put(encode_response_v1_packed(resp))
+                await out_q.put(encode_response_packed(resp))
             finally:
                 inflight_sem.release()
 
@@ -206,7 +206,7 @@ async def _handle_conn(
             payload = await read_frame(reader)
 
             try:
-                req = decode_request_v1_packed(payload)
+                req = decode_request_packed(payload)
             except DecodeError:
                 # Protocol violation: close the connection.
                 break
