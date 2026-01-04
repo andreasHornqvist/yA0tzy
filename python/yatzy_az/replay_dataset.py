@@ -28,8 +28,10 @@ from safetensors import safe_open
 # Optional torch base class: we still validate availability at runtime in `_require_torch`.
 try:  # pragma: no cover
     from torch.utils.data import IterableDataset as _TorchIterableDataset
+    from torch.utils.data import Dataset as _TorchDataset
 except Exception:  # noqa: BLE001
     _TorchIterableDataset = object  # type: ignore[misc,assignment]
+    _TorchDataset = object  # type: ignore[misc,assignment]
 
 # v1 ids (must match Rust yz-replay / PRD §10.3)
 PROTOCOL_VERSION: int = 1
@@ -261,7 +263,7 @@ class ReplayIterableDataset(_TorchIterableDataset):  # type: ignore[misc]
             yield x, legal_t, pi_t, z_t, zm_t
 
 
-class ReplayRandomAccessDataset(_TorchIterableDataset):  # type: ignore[misc]
+class ReplayRandomAccessDataset(_TorchDataset):  # type: ignore[misc]
     """Map-style dataset that supports true random sampling across all samples.
 
     This builds a global index over all samples in the selected shard set and implements

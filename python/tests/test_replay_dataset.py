@@ -69,3 +69,28 @@ def test_iter_samples_numpy_yields_expected_shapes(tmp_path: Path) -> None:
     assert pi.shape == (rd.ACTION_SPACE_A,)
     assert isinstance(z.item() if hasattr(z, "item") else z, (float, np.floating))
     assert z_margin is None
+
+
+def test_random_indexed_dataset_is_map_style_and_dataloader_shuffle_works(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    replay_dir = tmp_path / "replay"
+    _write_one_shard(replay_dir, schema_ok=True)
+
+    ds = rd.ReplayRandomAccessDataset(replay_dir, shard_files=["shard_000000.safetensors"], seed=0, cache_shards=1)
+    assert len(ds) == 3
+
+    x, legal, pi, z, zm = ds[0]
+    assert tuple(x.shape) == (rd.FEATURE_LEN,)
+    assert tuple(legal.shape) == (rd.ACTION_SPACE_A,)
+    assert tuple(pi.shape) == (rd.ACTION_SPACE_A,)
+    assert tuple(z.shape) == ()
+    assert tuple(zm.shape) == ()
+
+    dl = torch.utils.data.DataLoader(ds, batch_size=2, shuffle=True, num_workers=0, drop_last=False)
+    xb, legalb, pib, zb, zmb = next(iter(dl))
+    assert tuple(xb.shape) == (2, rd.FEATURE_LEN)
+    assert tuple(legalb.shape) == (2, rd.ACTION_SPACE_A)
+    assert tuple(pib.shape) == (2, rd.ACTION_SPACE_A)
+    assert tuple(zb.shape) == (2,)
+    assert tuple(zmb.shape) == (2,)
