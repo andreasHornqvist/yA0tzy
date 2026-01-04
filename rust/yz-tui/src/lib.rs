@@ -1335,7 +1335,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
                     // Header row
                     left.push(Line::from(Span::styled(
-                        " Iter   Decision   WinRate   Oracle    Loss (t/p/v)",
+                        " Iter   Decision   WinRate   Score(c/b)   Oracle    Loss (t/p/v)",
                         Style::default().fg(Color::DarkGray),
                     )));
 
@@ -1355,6 +1355,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                                 .win_rate
                                 .map(|x| format!("{x:.3}"))
                                 .unwrap_or_else(|| "-".to_string());
+                            let score_cb = match (it.gate.mean_cand_score, it.gate.mean_best_score) {
+                                (Some(c), Some(b)) => format!("{c:.1}/{b:.1}"),
+                                _ => "-".to_string(),
+                            };
                             let oracle = it
                                 .oracle
                                 .match_rate_overall
@@ -1383,7 +1387,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             };
                             left.push(Line::from(Span::styled(
                                 format!(
-                                    "{marker} {:>3}   {promo:>7}   {wr:>6}   {oracle:>6}   {lt:>5}/{lp:>5}/{lv:>5}",
+                                    "{marker} {:>3}   {promo:>7}   {wr:>6}   {score_cb:>9}   {oracle:>6}   {lt:>5}/{lp:>5}/{lv:>5}",
                                     it.idx
                                 ),
                                 row_style,

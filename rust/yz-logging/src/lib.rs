@@ -159,6 +159,12 @@ pub struct IterGateSummaryV1 {
     pub games_completed: u64,
     pub win_rate: Option<f64>,
     pub draw_rate: Option<f64>,
+    /// Mean final score of the candidate model across gating games.
+    #[serde(default)]
+    pub mean_cand_score: Option<f64>,
+    /// Mean final score of the best model across gating games.
+    #[serde(default)]
+    pub mean_best_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -377,6 +383,10 @@ pub struct MetricsGateSummaryV1 {
     pub win_rate: f64,
 
     pub mean_score_diff: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_cand_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_best_score: Option<f64>,
     pub score_diff_se: f64,
     pub score_diff_ci95_low: f64,
     pub score_diff_ci95_high: f64,
@@ -727,6 +737,8 @@ mod tests {
             draws: 0,
             win_rate: 0.5,
             mean_score_diff: 0.0,
+            mean_cand_score: None,
+            mean_best_score: None,
             score_diff_se: 1.0,
             score_diff_ci95_low: -2.0,
             score_diff_ci95_high: 2.0,

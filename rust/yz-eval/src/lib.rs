@@ -315,6 +315,8 @@ pub struct GatePartial {
     pub draws: u32,
     pub cand_score_diff_sum: i64,
     pub cand_score_diff_sumsq: f64, // sum of (diff^2)
+    pub cand_score_sum: i64,
+    pub best_score_sum: i64,
 }
 
 impl GatePartial {
@@ -325,6 +327,8 @@ impl GatePartial {
         self.draws = self.draws.saturating_add(other.draws);
         self.cand_score_diff_sum = self.cand_score_diff_sum.saturating_add(other.cand_score_diff_sum);
         self.cand_score_diff_sumsq += other.cand_score_diff_sumsq;
+        self.cand_score_sum = self.cand_score_sum.saturating_add(other.cand_score_sum);
+        self.best_score_sum = self.best_score_sum.saturating_add(other.best_score_sum);
     }
 
     pub fn into_report(self, plan: GatePlan) -> GateReport {
@@ -334,6 +338,8 @@ impl GatePartial {
         report.cand_losses = self.cand_losses;
         report.draws = self.draws;
         report.cand_score_diff_sum = self.cand_score_diff_sum;
+        report.cand_score_sum = self.cand_score_sum;
+        report.best_score_sum = self.best_score_sum;
         report.seeds = plan.seeds;
         report.seeds_hash = plan.seeds_hash;
         report.warnings = plan.warnings;
@@ -356,6 +362,8 @@ pub struct GateReport {
     pub cand_losses: u32,
     pub draws: u32,
     pub cand_score_diff_sum: i64,
+    pub cand_score_sum: i64,
+    pub best_score_sum: i64,
     pub seeds: Vec<u64>,
     pub seeds_hash: String,
     pub score_diff_std: f64,
@@ -385,6 +393,20 @@ impl GateReport {
             return 0.0;
         }
         (self.cand_score_diff_sum as f64) / (self.games as f64)
+    }
+
+    pub fn mean_cand_score(&self) -> f64 {
+        if self.games == 0 {
+            return 0.0;
+        }
+        (self.cand_score_sum as f64) / (self.games as f64)
+    }
+
+    pub fn mean_best_score(&self) -> f64 {
+        if self.games == 0 {
+            return 0.0;
+        }
+        (self.best_score_sum as f64) / (self.games as f64)
     }
 }
 
@@ -715,6 +737,8 @@ fn gate_schedule_subset_with_backends(
                             Outcome::Loss => partial.cand_losses += 1,
                             Outcome::Draw => partial.draws += 1,
                         }
+                        partial.cand_score_sum += tr.cand_score as i64;
+                        partial.best_score_sum += tr.best_score as i64;
                         let d = tr.cand_score - tr.best_score;
                         partial.cand_score_diff_sum += d as i64;
                         let x = d as f64;

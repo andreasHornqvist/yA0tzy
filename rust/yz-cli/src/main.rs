@@ -1359,6 +1359,8 @@ OPTIONS:
         draws: u32,
         cand_score_diff_sum: i64,
         cand_score_diff_sumsq: f64,
+        cand_score_sum: i64,
+        best_score_sum: i64,
     }
 
     let out_path = PathBuf::from(out_path);
@@ -1371,6 +1373,8 @@ OPTIONS:
         draws: partial.draws,
         cand_score_diff_sum: partial.cand_score_diff_sum,
         cand_score_diff_sumsq: partial.cand_score_diff_sumsq,
+        cand_score_sum: partial.cand_score_sum,
+        best_score_sum: partial.best_score_sum,
     };
     let bytes = serde_json::to_vec(&res).expect("serialize gate worker result");
     std::fs::write(&tmp, bytes).unwrap_or_else(|e| {
@@ -1580,6 +1584,8 @@ OPTIONS:
                         draws: report.draws,
                         win_rate: wr,
                         mean_score_diff: report.mean_score_diff(),
+                        mean_cand_score: Some(report.mean_cand_score()),
+                        mean_best_score: Some(report.mean_best_score()),
                         score_diff_se: report.score_diff_se,
                         score_diff_ci95_low: report.score_diff_ci95_low,
                         score_diff_ci95_high: report.score_diff_ci95_high,
