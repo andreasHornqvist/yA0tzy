@@ -530,7 +530,7 @@ pub fn run_iteration(
     )?;
 
     ctrl.set_phase(Phase::Train, "starting train")?;
-    run_train_subprocess(run_dir, python_exe, &ctrl, iter_idx)?;
+    run_train_subprocess(run_dir, &cfg, python_exe, &ctrl, iter_idx)?;
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     refresh_train_stats_from_run_json(run_dir, &mut manifest, iter_idx)?;
@@ -661,7 +661,7 @@ pub fn spawn_iteration(
                 manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
                 yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
 
-                run_train_subprocess(&run_dir, &python_exe, &ctrl, iter_idx)?;
+                run_train_subprocess(&run_dir, &cfg, &python_exe, &ctrl, iter_idx)?;
                 if ctrl.cancelled() {
                     let _ = ctrl.set_phase(Phase::Train, "shutting down...");
                     return Err(ControllerError::Cancelled);
@@ -1063,7 +1063,12 @@ fn tail_file(path: &Path, max_bytes: usize) -> Option<String> {
     }
 }
 
-fn build_train_command(run_dir: &Path, python_exe: &str, iter_idx: u32) -> std::process::Command {
+fn build_train_command(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    python_exe: &str,
+    iter_idx: u32,
+) -> std::process::Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
     // Fallback: invoke the provided python executable directly.
     let use_uv = (python_exe == "python")
@@ -1082,6 +1087,10 @@ fn build_train_command(run_dir: &Path, python_exe: &str, iter_idx: u32) -> std::
     // Use per-iteration replay snapshots so pruning/new shards never break training.
     // (Trainer will create this snapshot if missing; it is used to freeze the dataset for that iteration.)
     let snapshot_path = run_dir_abs.join(format!("replay_snapshot_iter_{iter_idx:03}.json"));
+    // IMPORTANT: pass model shape so the trainer can load best.pt even if config changes.
+    // Without this, the trainer defaults (--hidden=256 --blocks=2) can mismatch a run-local best.pt.
+    let hidden = cfg.model.hidden_dim.to_string();
+    let blocks = cfg.model.num_blocks.to_string();
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -1098,6 +1107,10 @@ fn build_train_command(run_dir: &Path, python_exe: &str, iter_idx: u32) -> std::
             best_pt.to_string_lossy().as_ref(),
             "--snapshot",
             snapshot_path.to_string_lossy().as_ref(),
+            "--hidden",
+            &hidden,
+            "--blocks",
+            &blocks,
         ]);
         cmd
     } else {
@@ -1115,6 +1128,10 @@ fn build_train_command(run_dir: &Path, python_exe: &str, iter_idx: u32) -> std::
             best_pt.to_string_lossy().as_ref(),
             "--snapshot",
             snapshot_path.to_string_lossy().as_ref(),
+            "--hidden",
+            &hidden,
+            "--blocks",
+            &blocks,
         ]);
         cmd
     }
@@ -1210,6 +1227,7 @@ fn ensure_best_pt(
 
 fn run_train_subprocess(
     run_dir: &Path,
+    cfg: &yz_core::Config,
     python_exe: &str,
     ctrl: &IterationController,
     iter_idx: u32,
@@ -1243,7 +1261,7 @@ fn run_train_subprocess(
     let stderr_f = std::fs::File::create(&stderr_path)?;
 
     // Minimal args. Trainer will update run.json and metrics.ndjson itself (E10.5S2).
-    let mut cmd = build_train_command(run_dir, python_exe, iter_idx);
+    let mut cmd = build_train_command(run_dir, cfg, python_exe, iter_idx);
     let child = cmd
         .stdout(std::process::Stdio::from(stdout_f))
         .stderr(std::process::Stdio::from(stderr_f))
@@ -2186,7 +2204,8 @@ mod cancel_tests {
         // E13.2S1: controller passes --best to trainer.
         let dir = tempfile::tempdir().unwrap();
         let run_dir = dir.path();
-        let cmd = build_train_command(run_dir, "python", 0);
+        let cfg = yz_core::Config::default();
+        let cmd = build_train_command(run_dir, &cfg, "python", 0);
 
         // Collect args as strings for easy searching.
         let args: Vec<String> = cmd
