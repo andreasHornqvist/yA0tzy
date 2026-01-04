@@ -893,6 +893,106 @@ However, the current server-side “models” are **dummy/stub** implementations
    * Note: the test is **opt-in** via `YZ_PY_E2E=1` to keep CI stable.
    * **AC:** `cargo test --workspace` includes at least one end-to-end test proving the real inference path works.
 
+---
+
+## Epic E6.6 — Inference perf + protocol evolution (Option 1 → Option 2 → bitpacking)
+
+**Goal:** reduce the end-to-end **inference-per-leaf cost** (especially Python decode/tensorization and response encoding) while keeping the dynamic batching architecture intact, and then evolve the wire protocol in a controlled way to support packed tensors and legal-mask bitpacking.
+
+**Background / motivation**
+
+We have a high-QPS inference workload driven by many concurrent MCTS leaf evaluations. In practice, the bottleneck is often **Python-side overhead per request**, not the model forward pass:
+
+* **Decode overhead:** materializing features as Python `list[float]` (or list-of-lists) and building tensors via `torch.as_tensor(...)` is slow and allocation-heavy.
+* **Encode overhead:** converting outputs to Python lists with `.tolist()` is similarly expensive.
+* **Batching correctness:** small batches (or broken batching) can dominate total runtime even if everything else is optimized; protocol changes must not regress batching.
+
+This epic explicitly sequences work into three steps:
+
+1) **Option 1:** keep the existing protocol, but make Python inference **buffer/tensor-native** internally (big ROI, low risk).
+2) **Option 2:** add a **Protocol v2** for packed `f32` payloads end-to-end (cleaner contract, further overhead reduction).
+3) **Bitpacking:** shrink `legal_mask` from bytes to a compact bitset (6 bytes for `A=47`) and update both ends.
+
+**Constraints / non-goals**
+
+* Do not change MCTS semantics, exploration, or in-flight caps; specifically: **no increase in in-flight virtual loss per game** (this is a protocol/perf change, not a search change).
+* Do not “fix” batching by increasing client-side in-flight; batching must remain primarily a **server-side** responsibility (`max_batch`/`max_wait_us`).
+* Keep rollout safe: we must be able to validate correctness + performance with targeted benchmarks and end-to-end runs.
+
+**Stories**
+
+1. **Option 1: Tensor-native decode/encode under Protocol v1 (no wire changes)**
+
+   * **Scope:**
+     * Keep the existing Rust↔Python framing and field shapes (features length `F`, action space `A=47`, legal mask format as currently shipped).
+     * Rewrite the Python server hot path so it never constructs Python float lists per request and never uses `.tolist()` for responses.
+     * Decode request payloads into **contiguous** buffers/views and build batched tensors efficiently.
+     * Encode responses by writing raw bytes (or writing into a preallocated buffer) instead of list conversions.
+   * **Implementation guidance:**
+     * Prefer `memoryview`/`numpy.frombuffer` (or equivalent) to create zero-copy views of incoming `f32` feature bytes.
+     * Build a batch tensor with one contiguous allocation (`[B, F]`) and a single copy from the input buffer(s) (or minimal copies).
+     * Ensure output encoding is also contiguous and cheap (avoid per-element Python loops).
+     * Preserve multi-model routing behavior (best/candidate) and existing batching invariants.
+   * **Observability / benchmarks:**
+     * Add a focused microbench that measures:
+       * decode+batch tensorization time (per item and per batch),
+       * model forward time,
+       * encode time,
+       * end-to-end request latency distribution under load.
+     * Ensure Prometheus metrics still reflect batch sizes correctly (and add optional timing counters if useful).
+   * **AC:**
+     * Correctness: outputs are bitwise-stable (or within expected floating-point tolerance) compared to the previous implementation for a fixed model + fixed inputs.
+     * Performance: measurable reduction in Python CPU time spent in decode/encode at the same QPS (measured via profiler and/or timing counters).
+     * No batching regression: median batch size under representative self-play load does not decrease; eval/sec does not regress.
+
+2. **Option 2: Protocol v2 for packed float tensors (features + logits/value) with safe rollout**
+
+   * **Scope:**
+     * Introduce a new protocol version (“v2”) where:
+       * features are sent as **packed little-endian float32 bytes** (contiguous),
+       * outputs are returned as **packed float32 bytes** for `policy_logits[A]` and `value` (and any future heads).
+     * Maintain backward compatibility during rollout:
+       * Python server accepts **both v1 and v2** requests (either via an explicit `protocol_version` field in the frame header, a capability handshake, or a per-connection negotiated mode).
+       * Rust client can be switched between v1 and v2 via config/flag, enabling A/B perf testing.
+   * **Implementation guidance:**
+     * Define a precise byte-level spec for v2:
+       * endianness, alignment expectations, exact tensor shapes, and how `F`/`A` are encoded/validated.
+     * Add strict validation:
+       * reject mismatched `feature_schema_id`, mismatched feature byte length, or mismatched action space id.
+     * Keep server batching behavior identical across v1 and v2 (a batch is still a list of requests with the same `model_id` and compatible schema).
+   * **Testing:**
+     * Roundtrip tests for v2 framing in Rust + Python.
+     * Mixed-mode test: start server, send interleaved v1 and v2 requests, ensure both work concurrently.
+   * **AC:**
+     * Correctness: v2 outputs match v1 outputs for identical inputs (within tolerance) for the same model weights.
+     * Rollout safety: server can run in “dual stack” mode; client can be toggled without code changes to the server.
+     * Performance: further reduction in per-request overhead vs Option 1 alone (especially at high QPS), demonstrated by microbench + E2E run.
+
+3. **Bitpacking: legal mask as a compact bitset (6 bytes for A=47), layered on top of Protocol v2**
+
+   * **Scope:**
+     * After v2 is stable, add bitpacking for the `legal_mask`:
+       * represent legal actions as a **bitset** of length `A=47` (6 bytes).
+       * define exact mapping: bit `i` corresponds to action index `i` (explicitly documented in the protocol spec).
+     * Update both ends:
+       * Rust: pack legal mask bits when sending; unpack (or apply bitset masking) when needed.
+       * Python: unpack to a boolean/uint8 mask (or directly apply bitset masking efficiently) for logits masking.
+   * **Compatibility strategy:**
+     * Either:
+       * define a v2 capability/flag `legal_mask=bitset`, or
+       * bump protocol to v3 for mask changes.
+     * Server should be able to accept:
+       * v2 with byte-mask, and
+       * v2 with bitset-mask (gated by flag/version),
+       during the transition.
+   * **Performance guidance:**
+     * Bitpacking is primarily about reducing bandwidth and memory traffic; it should not introduce expensive per-request Python loops.
+     * Prefer vectorized unpacking (e.g. `numpy.unpackbits`) or a small optimized routine.
+   * **AC:**
+     * Correctness: legality masking matches exactly (no illegal actions become legal, and vice versa) across a large randomized corpus of states.
+     * Performance: reduced bytes/request and no throughput regression; end-to-end eval/sec does not drop.
+     * Stability: no changes to MCTS in-flight limits; no increase in in-flight virtual loss per game.
+
 ## Epic E7 — Self-play runtime + replay + NDJSON logs (yz-runtime/yz-replay/yz-logging)
 
 **Goal:** first end-to-end pipeline without training.
