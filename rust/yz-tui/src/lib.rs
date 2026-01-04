@@ -596,6 +596,9 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 2
             };
         }
+        FieldId::InferLegalMaskBitset => {
+            app.cfg.inference.legal_mask_bitset = !app.cfg.inference.legal_mask_bitset;
+        }
         FieldId::MctsTempKind => {
             let t0 = match app.cfg.mcts.temperature_schedule {
                 TemperatureSchedule::Constant { t0 } => t0,
@@ -671,6 +674,15 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
             } else {
                 Err("inference.protocol_version must be 1|2".to_string())
             }
+        }
+        FieldId::InferLegalMaskBitset => {
+            let b = match buf.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => true,
+                "false" | "0" | "no" | "n" => false,
+                _ => return Err("inference.legal_mask_bitset must be true|false".to_string()),
+            };
+            cfg.inference.legal_mask_bitset = b;
+            Ok(())
         }
         FieldId::InferMaxBatch => {
             cfg.inference.max_batch = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
@@ -894,6 +906,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::InferBind => cfg.inference.bind.clone(),
         FieldId::InferDevice => cfg.inference.device.clone(),
         FieldId::InferProtocolVersion => cfg.inference.protocol_version.to_string(),
+        FieldId::InferLegalMaskBitset => cfg.inference.legal_mask_bitset.to_string(),
         FieldId::InferMaxBatch => cfg.inference.max_batch.to_string(),
         FieldId::InferMaxWaitUs => cfg.inference.max_wait_us.to_string(),
         FieldId::InferTorchThreads => cfg

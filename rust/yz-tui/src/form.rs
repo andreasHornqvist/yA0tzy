@@ -37,6 +37,7 @@ pub enum FieldId {
     InferBind,
     InferDevice,
     InferProtocolVersion,
+    InferLegalMaskBitset,
     InferMaxBatch,
     InferMaxWaitUs,
     InferTorchThreads,
@@ -93,6 +94,7 @@ impl FieldId {
             FieldId::InferBind
             | FieldId::InferDevice
             | FieldId::InferProtocolVersion
+            | FieldId::InferLegalMaskBitset
             | FieldId::InferMaxBatch
             | FieldId::InferMaxWaitUs
             | FieldId::InferTorchThreads
@@ -142,6 +144,7 @@ impl FieldId {
             FieldId::InferBind => "inference.bind",
             FieldId::InferDevice => "inference.device",
             FieldId::InferProtocolVersion => "inference.protocol_version",
+            FieldId::InferLegalMaskBitset => "inference.legal_mask_bitset",
             FieldId::InferMaxBatch => "inference.max_batch",
             FieldId::InferMaxWaitUs => "inference.max_wait_us",
             FieldId::InferTorchThreads => "inference.torch_threads",
@@ -241,6 +244,7 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::InferBind,
     FieldId::InferDevice,
     FieldId::InferProtocolVersion,
+    FieldId::InferLegalMaskBitset,
     FieldId::InferMaxBatch,
     FieldId::InferMaxWaitUs,
     FieldId::InferTorchThreads,

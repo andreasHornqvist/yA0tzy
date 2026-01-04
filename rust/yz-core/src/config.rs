@@ -84,6 +84,9 @@ pub struct InferenceConfig {
     /// - 2: packed f32 tensors (E6.6 Option 2)
     #[serde(default = "default_inference_protocol_version")]
     pub protocol_version: u32,
+    /// If true and protocol_version==2, encode legal_mask as a compact 6-byte bitset (A=47).
+    #[serde(default)]
+    pub legal_mask_bitset: bool,
     /// Maximum batch size before flushing.
     pub max_batch: u32,
     /// Maximum wait time in microseconds before flushing a partial batch.
@@ -286,6 +289,7 @@ impl Default for Config {
                 bind: "unix:///tmp/yatzy_infer.sock".to_string(),
                 device: "cpu".to_string(),
                 protocol_version: default_inference_protocol_version(),
+                legal_mask_bitset: false,
                 max_batch: 32,
                 max_wait_us: 1000,
                 torch_threads: None,

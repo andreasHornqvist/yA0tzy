@@ -120,6 +120,8 @@ pub struct ClientOptions {
     pub request_id_start: u64,
     /// Protocol version to use for encoding requests (v1 default; v2 opt-in).
     pub protocol_version: u32,
+    /// If true and protocol_version==2, encode legal_mask as a compact bitset (6 bytes for A=47).
+    pub legal_mask_bitset: bool,
 }
 
 impl Default for ClientOptions {
@@ -133,6 +135,7 @@ impl Default for ClientOptions {
             max_outbound_queue: 256,
             request_id_start: 1,
             protocol_version: crate::protocol::PROTOCOL_VERSION_V1,
+            legal_mask_bitset: false,
         }
     }
 }
@@ -368,7 +371,12 @@ impl InferenceClient {
         };
 
         let t_enc0 = Instant::now();
-        encode_request_into(&mut payload, &req, self.opts.protocol_version);
+        encode_request_into(
+            &mut payload,
+            &req,
+            self.opts.protocol_version,
+            self.opts.legal_mask_bitset,
+        );
         let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
 
         let tx = self.outbound_tx.as_ref().ok_or(ClientError::Disconnected)?;

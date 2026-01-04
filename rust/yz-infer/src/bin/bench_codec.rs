@@ -40,7 +40,7 @@ fn main() {
     let mut out = Vec::with_capacity(512);
     let t0 = Instant::now();
     for _ in 0..n {
-        encode_request_v1_into(&mut out, &req);
+    encode_request_v1_into(&mut out, &req);
         std::hint::black_box(&out);
     }
     let dt = t0.elapsed().as_secs_f64();
@@ -50,7 +50,7 @@ fn main() {
     let mut out2 = Vec::with_capacity(512);
     let t0 = Instant::now();
     for _ in 0..n {
-        encode_request_v2_into(&mut out2, &req);
+        encode_request_v2_into(&mut out2, &req, false);
         std::hint::black_box(&out2);
     }
     let dt = t0.elapsed().as_secs_f64();

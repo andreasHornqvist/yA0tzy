@@ -254,7 +254,11 @@ OPTIONS:
         process::exit(1);
     });
 
-    let backend = connect_infer_backend(&infer, cfg.inference.protocol_version);
+    let backend = connect_infer_backend(
+        &infer,
+        cfg.inference.protocol_version,
+        cfg.inference.legal_mask_bitset,
+    );
 
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
@@ -783,7 +787,11 @@ OPTIONS:
         process::exit(1);
     });
 
-    let backend = connect_infer_backend(&infer, cfg.inference.protocol_version);
+    let backend = connect_infer_backend(
+        &infer,
+        cfg.inference.protocol_version,
+        cfg.inference.legal_mask_bitset,
+    );
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
         out_dir: replay_dir.clone(),
         max_samples_per_shard,
@@ -1084,6 +1092,7 @@ OPTIONS:
         max_outbound_queue: 256,
         request_id_start: 1,
         protocol_version: cfg.inference.protocol_version,
+        legal_mask_bitset: cfg.inference.legal_mask_bitset && cfg.inference.protocol_version == 2,
     };
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
@@ -1477,6 +1486,7 @@ OPTIONS:
         max_outbound_queue: 256,
         request_id_start: 1,
         protocol_version: cfg.inference.protocol_version,
+        legal_mask_bitset: cfg.inference.legal_mask_bitset && cfg.inference.protocol_version == 2,
     };
 
     let mcts_cfg = yz_mcts::MctsConfig {
@@ -1677,13 +1687,18 @@ fn write_gate_report_atomic(path: &PathBuf, report: &GateReportJson) -> std::io:
     Ok(())
 }
 
-fn connect_infer_backend(endpoint: &str, protocol_version: u32) -> yz_mcts::InferBackend {
+fn connect_infer_backend(
+    endpoint: &str,
+    protocol_version: u32,
+    legal_mask_bitset: bool,
+) -> yz_mcts::InferBackend {
     // Use bounded inflight to prevent flooding the inference server.
     let opts = yz_infer::ClientOptions {
         max_inflight_total: 64,
         max_outbound_queue: 256,
         request_id_start: 1,
         protocol_version,
+        legal_mask_bitset: legal_mask_bitset && protocol_version == 2,
     };
     if let Some(rest) = endpoint.strip_prefix("unix://") {
         #[cfg(unix)]

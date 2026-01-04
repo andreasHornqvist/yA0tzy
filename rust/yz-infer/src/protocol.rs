@@ -12,6 +12,12 @@ pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_V1;
 /// Fixed action space size (PRD §5.2).
 pub const ACTION_SPACE_A: u32 = 47;
 
+/// v2 request header flags.
+pub const FLAG_LEGAL_MASK_BITSET: u8 = 0x01;
+
+/// Packed legal mask size in bytes for A=47 (48 bits).
+pub const LEGAL_MASK_BITSET_BYTES: usize = 6;
+
 /// Feature schema id currently supported (PRD Epic E3/E3.5).
 pub const FEATURE_SCHEMA_ID_V1: u32 = 1;
 
