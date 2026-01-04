@@ -1091,6 +1091,8 @@ fn build_train_command(
     // Without this, the trainer defaults (--hidden=256 --blocks=2) can mismatch a run-local best.pt.
     let hidden = cfg.model.hidden_dim.to_string();
     let blocks = cfg.model.num_blocks.to_string();
+    let num_workers = cfg.training.dataloader_workers.to_string();
+    let sample_mode = cfg.training.sample_mode.as_str();
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -1111,6 +1113,10 @@ fn build_train_command(
             &hidden,
             "--blocks",
             &blocks,
+            "--num-workers",
+            &num_workers,
+            "--sample-mode",
+            sample_mode,
         ]);
         cmd
     } else {
@@ -1132,6 +1138,10 @@ fn build_train_command(
             &hidden,
             "--blocks",
             &blocks,
+            "--num-workers",
+            &num_workers,
+            "--sample-mode",
+            sample_mode,
         ]);
         cmd
     }
@@ -1772,6 +1782,8 @@ fn run_gate(
         draws: u32,
         cand_score_diff_sum: i64,
         cand_score_diff_sumsq: f64,
+        cand_score_sum: i64,
+        best_score_sum: i64,
     }
 
     let mut partial = yz_eval::GatePartial::default();
@@ -1787,6 +1799,8 @@ fn run_gate(
         p.draws = r.draws;
         p.cand_score_diff_sum = r.cand_score_diff_sum;
         p.cand_score_diff_sumsq = r.cand_score_diff_sumsq;
+        p.cand_score_sum = r.cand_score_sum;
+        p.best_score_sum = r.best_score_sum;
         partial.merge(&p);
     }
 
@@ -1916,6 +1930,8 @@ fn run_gate(
                 draws: report.draws,
                 win_rate: wr,
                 mean_score_diff: report.mean_score_diff(),
+                mean_cand_score: Some(report.mean_cand_score()),
+                mean_best_score: Some(report.mean_best_score()),
                 score_diff_se: report.score_diff_se,
                 score_diff_ci95_low: report.score_diff_ci95_low,
                 score_diff_ci95_high: report.score_diff_ci95_high,
@@ -1936,6 +1952,8 @@ fn run_gate(
         it.gate.games_completed = report.games as u64;
         it.gate.win_rate = Some(wr);
         it.gate.draw_rate = Some(report.draw_rate);
+        it.gate.mean_cand_score = Some(report.mean_cand_score());
+        it.gate.mean_best_score = Some(report.mean_best_score());
         it.gate.ended_ts_ms = Some(yz_logging::now_ms());
         it.oracle.match_rate_overall = Some(oracle_overall);
         it.oracle.match_rate_mark = Some(oracle_mark);

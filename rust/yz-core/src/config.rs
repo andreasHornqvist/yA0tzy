@@ -173,6 +173,19 @@ pub struct TrainingConfig {
     /// Optional number of optimizer steps per iteration (takes precedence over epochs).
     #[serde(default)]
     pub steps_per_iteration: Option<u32>,
+    /// Replay sampling mode for training.
+    ///
+    /// - "sequential": stream samples in shard order (less random, more correlated).
+    /// - "random_indexed": build a global index and let DataLoader shuffle indices (recommended).
+    #[serde(default = "default_training_sample_mode")]
+    pub sample_mode: String,
+    /// Torch DataLoader worker processes used by the trainer (0 disables multiprocessing).
+    #[serde(default)]
+    pub dataloader_workers: u32,
+}
+
+fn default_training_sample_mode() -> String {
+    "random_indexed".to_string()
 }
 
 /// Replay retention configuration.
@@ -290,6 +303,8 @@ impl Default for Config {
                 weight_decay: 0.0,
                 epochs: 1,
                 steps_per_iteration: None,
+                sample_mode: default_training_sample_mode(),
+                dataloader_workers: 0,
             },
             gating: GatingConfig {
                 games: 50,

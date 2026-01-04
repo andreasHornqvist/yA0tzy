@@ -28,6 +28,21 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--batch-size", type=int, default=None, help="Batch size (overrides config)")
     p.add_argument("--num-workers", type=int, default=0, help="Torch DataLoader workers")
     p.add_argument(
+        "--sample-mode",
+        default=None,
+        choices=["sequential", "random_indexed"],
+        help=(
+            "Replay sampling mode. "
+            "sequential streams samples in shard order; random_indexed builds a global index and uses DataLoader shuffle."
+        ),
+    )
+    p.add_argument(
+        "--cache-shards",
+        type=int,
+        default=4,
+        help="Shard cache size per DataLoader worker process (random_indexed mode).",
+    )
+    p.add_argument(
         "--steps",
         type=int,
         default=None,
@@ -350,7 +365,7 @@ def _update_run_manifest_train_scalars(
 def run_from_args(args: argparse.Namespace) -> int:
     # Note: torch is imported later, after we resolve deterministic step semantics.
     # This allows epochs-mode policy errors to be raised even if torch isn't installed.
-    from ..replay_dataset import ReplayIterableDataset
+    from ..replay_dataset import ReplayIterableDataset, ReplayRandomAccessDataset
 
     replay_dir = Path(args.replay)
 
@@ -378,6 +393,14 @@ def run_from_args(args: argparse.Namespace) -> int:
             args.lr = float(cfg.training.learning_rate)
         if args.weight_decay is None:
             args.weight_decay = float(cfg.training.weight_decay)
+        if args.sample_mode is None:
+            # Default to config if present; otherwise we prefer random_indexed for stability.
+            args.sample_mode = getattr(cfg.training, "sample_mode", None)
+        if int(args.num_workers) == 0:
+            # Allow config to control DataLoader workers (0 remains a valid explicit CLI choice).
+            dw = getattr(cfg.training, "dataloader_workers", None)
+            if dw is not None:
+                args.num_workers = int(dw)
 
     # Final defaults (backwards compatible when no config is present).
     if args.batch_size is None:
@@ -386,6 +409,8 @@ def run_from_args(args: argparse.Namespace) -> int:
         args.lr = 1e-3
     if args.weight_decay is None:
         args.weight_decay = 0.0
+    if args.sample_mode is None:
+        args.sample_mode = "random_indexed"
 
     shard_files = None
     snap: dict[str, Any] | None = None
@@ -466,14 +491,38 @@ def run_from_args(args: argparse.Namespace) -> int:
         RULESET_ID,
     )
 
-    ds = ReplayIterableDataset(
-        replay_dir,
-        shard_files=shard_files,
-        shuffle_shards=bool(args.shuffle_shards),
-        seed=int(args.seed),
-        repeat=not bool(args.no_repeat),
-    )
-    dl = DataLoader(ds, batch_size=int(args.batch_size), num_workers=int(args.num_workers))
+    sample_mode = str(args.sample_mode)
+    if sample_mode == "random_indexed":
+        ds = ReplayRandomAccessDataset(
+            replay_dir,
+            shard_files=shard_files,
+            seed=int(args.seed),
+            cache_shards=int(args.cache_shards),
+        )
+        dl = DataLoader(
+            ds,
+            batch_size=int(args.batch_size),
+            num_workers=int(args.num_workers),
+            shuffle=True,
+            drop_last=False,
+            persistent_workers=bool(int(args.num_workers) > 0),
+        )
+    else:
+        ds = ReplayIterableDataset(
+            replay_dir,
+            shard_files=shard_files,
+            shuffle_shards=bool(args.shuffle_shards),
+            seed=int(args.seed),
+            repeat=not bool(args.no_repeat),
+        )
+        dl = DataLoader(
+            ds,
+            batch_size=int(args.batch_size),
+            num_workers=int(args.num_workers),
+            shuffle=False,
+            drop_last=False,
+            persistent_workers=bool(int(args.num_workers) > 0),
+        )
 
     device = torch.device(str(args.device))
     torch.manual_seed(int(args.seed))

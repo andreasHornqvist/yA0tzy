@@ -84,6 +84,17 @@ class TrainingConfig(BaseModel):
             "If set, takes precedence over epochs."
         ),
     )
+    sample_mode: str = Field(
+        default="random_indexed",
+        description=(
+            "Replay sampling mode for training. "
+            "sequential streams samples in shard order; random_indexed uses a global index + DataLoader shuffle."
+        ),
+    )
+    dataloader_workers: int = Field(
+        default=0,
+        description="Torch DataLoader worker processes (0 disables multiprocessing).",
+    )
 
 
 class ReplayConfig(BaseModel):
