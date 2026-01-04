@@ -128,6 +128,7 @@ fn python_infer_server_real_checkpoint_e2e_opt_in() {
             max_inflight_total: 4096,
             max_outbound_queue: 4096,
             request_id_start: 1,
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();

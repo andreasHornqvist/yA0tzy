@@ -57,6 +57,7 @@ fn scheduler_multiplexes_many_games_without_deadlock() {
             max_inflight_total: 4096,
             max_outbound_queue: 4096,
             request_id_start: 1,
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();
@@ -106,6 +107,7 @@ fn scheduler_writes_ndjson_iteration_and_root_logs() {
             max_inflight_total: 4096,
             max_outbound_queue: 4096,
             request_id_start: 1,
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();

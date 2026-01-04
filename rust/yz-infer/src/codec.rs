@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use crate::protocol::PROTOCOL_VERSION_V2;
 use crate::protocol::{
     InferRequestV1, InferResponseV1, MsgKind, ACTION_SPACE_A, FEATURE_LEN_V1, FEATURE_SCHEMA_ID_V1,
     PROTOCOL_VERSION,
@@ -23,6 +24,10 @@ pub enum DecodeError {
     BadLegalLen { got: u32, expected: u32 },
     #[error("invalid vector length for policy_logits: got {got}, expected {expected}")]
     BadPolicyLen { got: u32, expected: u32 },
+    #[error("invalid byte length for features: got {got}, expected {expected}")]
+    BadFeaturesByteLen { got: u32, expected: u32 },
+    #[error("invalid byte length for policy_logits: got {got}, expected {expected}")]
+    BadPolicyByteLen { got: u32, expected: u32 },
     #[error("invalid boolean byte in legal_mask: {0}")]
     BadLegalByte(u8),
 }
@@ -57,6 +62,47 @@ pub fn encode_request_v1_into(out: &mut Vec<u8>, req: &InferRequestV1) {
     out.extend_from_slice(&features_len.to_le_bytes());
     for &f in &req.features {
         out.extend_from_slice(&f.to_le_bytes());
+    }
+
+    let legal_len: u32 = req.legal_mask.len() as u32;
+    out.extend_from_slice(&legal_len.to_le_bytes());
+    out.extend_from_slice(&req.legal_mask);
+}
+
+pub fn encode_request_into(out: &mut Vec<u8>, req: &InferRequestV1, protocol_version: u32) {
+    match protocol_version {
+        PROTOCOL_VERSION => encode_request_v1_into(out, req),
+        PROTOCOL_VERSION_V2 => encode_request_v2_into(out, req),
+        _ => encode_request_v1_into(out, req), // fallback
+    }
+}
+
+pub fn encode_request_v2_into(out: &mut Vec<u8>, req: &InferRequestV1) {
+    out.clear();
+    // header (8) + ids (16) + lens (8) + features bytes + legal bytes
+    let features_bytes_len = (req.features.len() * 4) as usize;
+    out.reserve(32 + features_bytes_len + req.legal_mask.len());
+
+    out.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
+    out.push(MsgKind::Request as u8);
+    out.push(0); // flags
+    out.extend_from_slice(&[0, 0]); // reserved
+
+    out.extend_from_slice(&req.request_id.to_le_bytes());
+    out.extend_from_slice(&req.model_id.to_le_bytes());
+    out.extend_from_slice(&req.feature_schema_id.to_le_bytes());
+
+    let features_byte_len: u32 = (req.features.len() as u32) * 4;
+    out.extend_from_slice(&features_byte_len.to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        out.extend_from_slice(bytemuck::cast_slice::<f32, u8>(&req.features));
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &f in &req.features {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
     }
 
     let legal_len: u32 = req.legal_mask.len() as u32;
@@ -151,6 +197,39 @@ pub fn encode_response_v1(resp: &InferResponseV1) -> Vec<u8> {
     out
 }
 
+pub fn encode_response_v2(resp: &InferResponseV1) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + (resp.policy_logits.len() * 4));
+    out.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
+    out.push(MsgKind::Response as u8);
+    out.push(0); // flags
+    out.extend_from_slice(&[0, 0]); // reserved
+
+    out.extend_from_slice(&resp.request_id.to_le_bytes());
+
+    let policy_byte_len: u32 = (resp.policy_logits.len() as u32) * 4;
+    out.extend_from_slice(&policy_byte_len.to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        out.extend_from_slice(bytemuck::cast_slice::<f32, u8>(&resp.policy_logits));
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &f in &resp.policy_logits {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+
+    out.extend_from_slice(&resp.value.to_le_bytes());
+    match resp.margin {
+        Some(m) => {
+            out.push(1);
+            out.extend_from_slice(&m.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
 pub fn decode_response_v1(bytes: &[u8]) -> Result<InferResponseV1, DecodeError> {
     let mut c = Cursor::new(bytes);
 
@@ -193,6 +272,78 @@ pub fn decode_response_v1(bytes: &[u8]) -> Result<InferResponseV1, DecodeError> 
         value,
         margin,
     })
+}
+
+pub fn decode_response_any(bytes: &[u8]) -> Result<InferResponseV1, DecodeError> {
+    if bytes.len() < 4 {
+        return Err(DecodeError::TooShort);
+    }
+    let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if version == PROTOCOL_VERSION {
+        return decode_response_v1(bytes);
+    }
+    if version == PROTOCOL_VERSION_V2 {
+        return decode_response_v2(bytes);
+    }
+    Err(DecodeError::BadVersion(version))
+}
+
+pub fn decode_response_v2(bytes: &[u8]) -> Result<InferResponseV1, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let version = c.read_u32()?;
+    if version != PROTOCOL_VERSION_V2 {
+        return Err(DecodeError::BadVersion(version));
+    }
+    let kind = c.read_u8()?;
+    if kind != (MsgKind::Response as u8) {
+        return Err(DecodeError::BadKind(kind));
+    }
+    let _flags = c.read_u8()?;
+    c.skip(2)?;
+
+    let request_id = c.read_u64()?;
+
+    let policy_byte_len = c.read_u32()?;
+    let expected = ACTION_SPACE_A * 4;
+    if policy_byte_len != expected {
+        return Err(DecodeError::BadPolicyByteLen {
+            got: policy_byte_len,
+            expected,
+        });
+    }
+    let logits_bytes = c.take(policy_byte_len as usize)?;
+    let policy_logits = decode_f32_le_slice(logits_bytes)?;
+
+    let value = c.read_f32()?;
+    let has_margin = c.read_u8()?;
+    let margin = if has_margin == 1 { Some(c.read_f32()?) } else { None };
+
+    Ok(InferResponseV1 {
+        request_id,
+        policy_logits,
+        value,
+        margin,
+    })
+}
+
+fn decode_f32_le_slice(bytes: &[u8]) -> Result<Vec<f32>, DecodeError> {
+    if bytes.len() % 4 != 0 {
+        return Err(DecodeError::TooShort);
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let s: &[f32] = bytemuck::cast_slice(bytes);
+        return Ok(s.to_vec());
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(bytes.len() / 4);
+        for i in 0..(bytes.len() / 4) {
+            let j = i * 4;
+            out.push(f32::from_le_bytes([bytes[j], bytes[j + 1], bytes[j + 2], bytes[j + 3]]));
+        }
+        Ok(out)
+    }
 }
 
 struct Cursor<'a> {
@@ -243,5 +394,49 @@ impl<'a> Cursor<'a> {
         let b = self.take(out.len())?;
         out.copy_from_slice(b);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    use crate::protocol::{InferRequestV1, InferResponseV1, ACTION_SPACE_A, FEATURE_LEN_V1, FEATURE_SCHEMA_ID_V1};
+
+    #[test]
+    fn encode_request_v2_has_expected_lengths() {
+        let req = InferRequestV1 {
+            request_id: 1,
+            model_id: 7,
+            feature_schema_id: FEATURE_SCHEMA_ID_V1,
+            features: vec![0.0; FEATURE_LEN_V1 as usize],
+            legal_mask: vec![1u8; ACTION_SPACE_A as usize],
+        };
+        let mut out = Vec::new();
+        encode_request_v2_into(&mut out, &req);
+        // version
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), PROTOCOL_VERSION_V2);
+        // features_byte_len field is at offset:
+        // header 8 + ids 16 = 24
+        // request_id u64 at 8..16; model_id 16..20; schema 20..24; then features_byte_len 24..28
+        let features_byte_len = u32::from_le_bytes(out[24..28].try_into().unwrap());
+        assert_eq!(features_byte_len, FEATURE_LEN_V1 * 4);
+    }
+
+    #[test]
+    fn roundtrip_decode_response_any_accepts_v1_and_v2() {
+        let resp = InferResponseV1 {
+            request_id: 42,
+            policy_logits: vec![0.5; ACTION_SPACE_A as usize],
+            value: -0.25,
+            margin: None,
+        };
+        let p1 = encode_response_v1(&resp);
+        let p2 = encode_response_v2(&resp);
+        let r1 = decode_response_any(&p1).unwrap();
+        let r2 = decode_response_any(&p2).unwrap();
+        assert_eq!(r1.request_id, 42);
+        assert_eq!(r2.request_id, 42);
+        assert_eq!(r2.policy_logits.len(), ACTION_SPACE_A as usize);
+        assert!((r2.value - (-0.25)).abs() < 1e-6);
     }
 }

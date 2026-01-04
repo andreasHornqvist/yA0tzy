@@ -1107,6 +1107,7 @@ gating:
                     max_inflight_total: 1024,
                     max_outbound_queue: 1024,
                     request_id_start: 1,
+                    protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
                 },
                 mcts_cfg: MctsConfig {
                     c_puct: 1.5,

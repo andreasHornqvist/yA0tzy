@@ -105,6 +105,7 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
             max_inflight_total: 4096,
             max_outbound_queue: 4096,
             request_id_start: 1,
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();

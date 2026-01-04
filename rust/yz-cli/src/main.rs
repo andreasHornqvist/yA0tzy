@@ -254,7 +254,7 @@ OPTIONS:
         process::exit(1);
     });
 
-    let backend = connect_infer_backend(&infer);
+    let backend = connect_infer_backend(&infer, cfg.inference.protocol_version);
 
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
@@ -783,7 +783,7 @@ OPTIONS:
         process::exit(1);
     });
 
-    let backend = connect_infer_backend(&infer);
+    let backend = connect_infer_backend(&infer, cfg.inference.protocol_version);
     let mut writer = yz_replay::ShardWriter::new(yz_replay::ShardWriterConfig {
         out_dir: replay_dir.clone(),
         max_samples_per_shard,
@@ -1083,6 +1083,7 @@ OPTIONS:
         max_inflight_total: 64,
         max_outbound_queue: 256,
         request_id_start: 1,
+        protocol_version: cfg.inference.protocol_version,
     };
     let mcts_cfg = yz_mcts::MctsConfig {
         c_puct: cfg.mcts.c_puct,
@@ -1475,6 +1476,7 @@ OPTIONS:
         max_inflight_total: 64,
         max_outbound_queue: 256,
         request_id_start: 1,
+        protocol_version: cfg.inference.protocol_version,
     };
 
     let mcts_cfg = yz_mcts::MctsConfig {
@@ -1675,12 +1677,13 @@ fn write_gate_report_atomic(path: &PathBuf, report: &GateReportJson) -> std::io:
     Ok(())
 }
 
-fn connect_infer_backend(endpoint: &str) -> yz_mcts::InferBackend {
+fn connect_infer_backend(endpoint: &str, protocol_version: u32) -> yz_mcts::InferBackend {
     // Use bounded inflight to prevent flooding the inference server.
     let opts = yz_infer::ClientOptions {
         max_inflight_total: 64,
         max_outbound_queue: 256,
         request_id_start: 1,
+        protocol_version,
     };
     if let Some(rest) = endpoint.strip_prefix("unix://") {
         #[cfg(unix)]

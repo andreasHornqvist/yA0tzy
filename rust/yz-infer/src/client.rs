@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::codec::{decode_response_v1, encode_request_v1_into, DecodeError};
+use crate::codec::{decode_response_any, encode_request_into, DecodeError};
 use crate::frame::{read_frame, write_frame, FrameError};
 use crate::protocol::{InferRequestV1, InferResponseV1};
 
@@ -118,6 +118,8 @@ pub struct ClientOptions {
     pub max_outbound_queue: usize,
     /// Request id starting value (useful for tests).
     pub request_id_start: u64,
+    /// Protocol version to use for encoding requests (v1 default; v2 opt-in).
+    pub protocol_version: u32,
 }
 
 impl Default for ClientOptions {
@@ -130,6 +132,7 @@ impl Default for ClientOptions {
             max_inflight_total: 64,
             max_outbound_queue: 256,
             request_id_start: 1,
+            protocol_version: crate::protocol::PROTOCOL_VERSION_V1,
         }
     }
 }
@@ -365,7 +368,7 @@ impl InferenceClient {
         };
 
         let t_enc0 = Instant::now();
-        encode_request_v1_into(&mut payload, &req);
+        encode_request_into(&mut payload, &req, self.opts.protocol_version);
         let enc_ms = t_enc0.elapsed().as_secs_f64() * 1000.0;
 
         let tx = self.outbound_tx.as_ref().ok_or(ClientError::Disconnected)?;
@@ -548,7 +551,7 @@ fn reader_loop(
                 break;
             }
         };
-        let resp = match decode_response_v1(&payload) {
+        let resp = match decode_response_any(&payload) {
             Ok(r) => r,
             Err(e) => {
                 stats.lock().unwrap().on_error();

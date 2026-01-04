@@ -78,6 +78,12 @@ pub struct InferenceConfig {
     pub bind: String,
     /// Device to run inference on ("cpu" or "cuda").
     pub device: String,
+    /// Protocol version to use for the Rust↔Python inference protocol.
+    ///
+    /// - 1: legacy v1 (float lists / per-f32 codec)
+    /// - 2: packed f32 tensors (E6.6 Option 2)
+    #[serde(default = "default_inference_protocol_version")]
+    pub protocol_version: u32,
     /// Maximum batch size before flushing.
     pub max_batch: u32,
     /// Maximum wait time in microseconds before flushing a partial batch.
@@ -96,6 +102,10 @@ pub struct InferenceConfig {
 
 fn default_metrics_bind() -> String {
     "127.0.0.1:18080".to_string()
+}
+
+fn default_inference_protocol_version() -> u32 {
+    1
 }
 
 /// MCTS algorithm configuration.
@@ -275,6 +285,7 @@ impl Default for Config {
             inference: InferenceConfig {
                 bind: "unix:///tmp/yatzy_infer.sock".to_string(),
                 device: "cpu".to_string(),
+                protocol_version: default_inference_protocol_version(),
                 max_batch: 32,
                 max_wait_us: 1000,
                 torch_threads: None,

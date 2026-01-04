@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 thiserror = "1"
 serde_json = "1"
+bytemuck = "1"
 

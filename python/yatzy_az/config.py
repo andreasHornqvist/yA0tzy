@@ -17,6 +17,14 @@ class InferenceConfig(BaseModel):
         description='Bind address (e.g., "unix:///tmp/yatzy_infer.sock" or "tcp://host:port")'
     )
     device: str = Field(description='Device: "cpu" or "cuda"')
+    protocol_version: int = Field(
+        default=1,
+        description=(
+            "Inference protocol version for Rust↔Python.\n"
+            "- 1: v1 (legacy)\n"
+            "- 2: v2 (packed f32 tensors)"
+        ),
+    )
     max_batch: int = Field(description="Maximum batch size before flushing")
     max_wait_us: int = Field(
         description="Maximum wait time (microseconds) before flushing a partial batch"

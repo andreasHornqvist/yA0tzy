@@ -162,6 +162,7 @@ fn main() {
             max_inflight_total: 8192,
             max_outbound_queue: 8192,
             request_id_start: 1,
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .expect("connect backend");

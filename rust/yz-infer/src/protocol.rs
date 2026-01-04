@@ -2,8 +2,12 @@
 //!
 //! This module defines the on-wire contract and sizes to validate against.
 
-/// Protocol version (PRD §9).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Protocol version constants (PRD §9 / E6.6).
+pub const PROTOCOL_VERSION_V1: u32 = 1;
+pub const PROTOCOL_VERSION_V2: u32 = 2;
+
+/// Default protocol version (backwards compatible).
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_V1;
 
 /// Fixed action space size (PRD §5.2).
 pub const ACTION_SPACE_A: u32 = 47;

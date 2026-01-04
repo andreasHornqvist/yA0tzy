@@ -55,6 +55,7 @@ fn client_routes_out_of_order_tcp() {
             max_inflight_total: 4096,
             max_outbound_queue: 4096,
             request_id_start: 1,
+            protocol_version: crate::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();
@@ -139,6 +140,7 @@ mod uds {
                 max_inflight_total: 4096,
                 max_outbound_queue: 4096,
                 request_id_start: 1,
+                protocol_version: crate::protocol::PROTOCOL_VERSION_V1,
             },
         )
         .unwrap();
@@ -197,6 +199,7 @@ fn client_backpressure_inflight_cap() {
             max_inflight_total: n,
             max_outbound_queue: 1024,
             request_id_start: 1,
+            protocol_version: crate::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();
@@ -229,6 +232,7 @@ fn client_handles_thousands_inflight_tcp() {
             max_inflight_total: n + 16,
             max_outbound_queue: n + 16,
             request_id_start: 1,
+            protocol_version: crate::protocol::PROTOCOL_VERSION_V1,
         },
     )
     .unwrap();
