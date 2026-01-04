@@ -19,9 +19,9 @@ from .metrics_server import ReloadResult, start_metrics_server
 from .model import build_model
 from .protocol_v1 import (
     DecodeError,
-    InferResponseV1,
-    decode_request_v1,
-    encode_response_v1,
+    FEATURE_LEN_V1,
+    decode_request_v1_packed,
+    encode_response_v1_packed,
     read_frame,
     write_frame,
 )
@@ -161,7 +161,7 @@ async def _handle_conn(
                         pass
                 # endregion agent log
 
-                resp: InferResponseV1 = await batcher.enqueue(req)  # type: ignore[arg-type]
+                resp = await batcher.enqueue(req)  # type: ignore[arg-type]
 
                 # region agent log
                 if t_dec_by_id is not None and _dbg_enabled():
@@ -192,7 +192,7 @@ async def _handle_conn(
                         pass
                 # endregion agent log
 
-                await out_q.put(encode_response_v1(resp))
+                await out_q.put(encode_response_v1_packed(resp))
             finally:
                 inflight_sem.release()
 
@@ -206,7 +206,7 @@ async def _handle_conn(
             payload = await read_frame(reader)
 
             try:
-                req = decode_request_v1(payload)
+                req = decode_request_v1_packed(payload)
             except DecodeError:
                 # Protocol violation: close the connection.
                 break
@@ -228,7 +228,7 @@ async def _handle_conn(
                                 "data": {
                                     "request_id": int(req.request_id),
                                     "model_id": int(req.model_id),
-                                    "features_len": len(req.features),
+                                    "features_len": int(FEATURE_LEN_V1),
                                     "legal_len": len(req.legal_mask),
                                     "queue_depth": int(batcher.queue_depth),
                                     "req_q": int(req_q.qsize()),

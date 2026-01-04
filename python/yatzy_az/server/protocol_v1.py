@@ -30,6 +30,10 @@ class DecodeError(ProtocolError):
     pass
 
 
+class EncodeError(ProtocolError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class InferRequestV1:
     request_id: int
@@ -40,11 +44,39 @@ class InferRequestV1:
 
 
 @dataclass(frozen=True, slots=True)
+class InferRequestV1Packed:
+    """Protocol-v1 compatible request representation that avoids Python float lists.
+
+    `features_f32` is a bytes-like view of exactly FEATURE_LEN_V1 * 4 bytes (little-endian f32).
+    """
+
+    request_id: int
+    model_id: int
+    feature_schema_id: int
+    features_f32: memoryview  # len=F*4
+    legal_mask: bytes  # len=A, each byte 0/1
+
+
+@dataclass(frozen=True, slots=True)
 class InferResponseV1:
     request_id: int
     policy_logits: list[float]  # len=A
     value: float
     margin: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class InferResponseV1Packed:
+    """Protocol-v1 compatible response representation that avoids Python float lists.
+
+    `policy_logits_f32` is a bytes-like view of exactly ACTION_SPACE_A * 4 bytes (little-endian f32).
+    `value_f32` is a bytes-like view of exactly 4 bytes (little-endian f32).
+    """
+
+    request_id: int
+    policy_logits_f32: memoryview  # len=A*4
+    value_f32: memoryview  # len=4
+    margin_f32: memoryview | None
 
 
 def encode_frame(payload: bytes) -> bytes:
@@ -157,6 +189,56 @@ def decode_request_v1(payload: bytes) -> InferRequestV1:
     )
 
 
+def decode_request_v1_packed(payload: bytes) -> InferRequestV1Packed:
+    """Decode a v1 request without constructing Python float lists (hot path)."""
+    off = 0
+
+    def take(n: int) -> memoryview:
+        nonlocal off
+        if off + n > len(payload):
+            raise DecodeError("payload too short")
+        mv = memoryview(payload)[off : off + n]
+        off += n
+        return mv
+
+    version = struct.unpack("<I", take(4))[0]
+    if version != PROTOCOL_VERSION:
+        raise DecodeError(f"bad version: {version}")
+    kind = struct.unpack("<B", take(1))[0]
+    if kind != 1:
+        raise DecodeError(f"bad kind: {kind}")
+    _flags = struct.unpack("<B", take(1))[0]
+    take(2)  # reserved
+
+    request_id = struct.unpack("<Q", take(8))[0]
+    model_id = struct.unpack("<I", take(4))[0]
+    feature_schema_id = struct.unpack("<I", take(4))[0]
+    if feature_schema_id != FEATURE_SCHEMA_ID_V1:
+        raise DecodeError(f"bad schema: {feature_schema_id}")
+
+    features_len = struct.unpack("<I", take(4))[0]
+    if features_len != FEATURE_LEN_V1:
+        raise DecodeError(f"bad features len: got {features_len}, expected {FEATURE_LEN_V1}")
+    features_f32 = take(int(features_len) * 4)
+
+    legal_len = struct.unpack("<I", take(4))[0]
+    if legal_len != ACTION_SPACE_A:
+        raise DecodeError(f"bad legal len: got {legal_len}, expected {ACTION_SPACE_A}")
+    legal_mv = take(int(legal_len))
+    legal_mask = bytes(legal_mv)
+    for b in legal_mask:
+        if b not in (0, 1):
+            raise DecodeError(f"bad legal byte: {b}")
+
+    return InferRequestV1Packed(
+        request_id=request_id,
+        model_id=model_id,
+        feature_schema_id=feature_schema_id,
+        features_f32=features_f32,
+        legal_mask=legal_mask,
+    )
+
+
 def encode_response_v1(resp: InferResponseV1) -> bytes:
     out = bytearray()
     out += struct.pack("<I", PROTOCOL_VERSION)
@@ -177,6 +259,37 @@ def encode_response_v1(resp: InferResponseV1) -> bytes:
         out += struct.pack("<B", 1)
         out += struct.pack("<f", float(resp.margin))
 
+    return bytes(out)
+
+
+def encode_response_v1_packed(resp: InferResponseV1Packed) -> bytes:
+    """Encode a v1 response from packed float32 bytes (hot path)."""
+    if len(resp.policy_logits_f32) != ACTION_SPACE_A * 4:
+        raise EncodeError(
+            f"bad policy_logits_f32 len: got {len(resp.policy_logits_f32)}, expected {ACTION_SPACE_A * 4}"
+        )
+    if len(resp.value_f32) != 4:
+        raise EncodeError(f"bad value_f32 len: got {len(resp.value_f32)}, expected 4")
+    if resp.margin_f32 is not None and len(resp.margin_f32) != 4:
+        raise EncodeError(f"bad margin_f32 len: got {len(resp.margin_f32)}, expected 4")
+
+    out = bytearray()
+    out += struct.pack("<I", PROTOCOL_VERSION)
+    out += struct.pack("<B", 2)  # MsgKind::Response
+    out += struct.pack("<B", 0)  # flags
+    out += b"\x00\x00"  # reserved
+    out += struct.pack("<Q", int(resp.request_id))
+
+    out += struct.pack("<I", ACTION_SPACE_A)
+    out += resp.policy_logits_f32
+
+    out += resp.value_f32
+
+    if resp.margin_f32 is None:
+        out += struct.pack("<B", 0)
+    else:
+        out += struct.pack("<B", 1)
+        out += resp.margin_f32
     return bytes(out)
 
 

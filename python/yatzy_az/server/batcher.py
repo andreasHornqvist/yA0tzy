@@ -9,15 +9,22 @@ import json as _json
 from dataclasses import dataclass
 from typing import Final
 
+import numpy as np
+
 from .model import Model
-from .protocol_v1 import InferRequestV1, InferResponseV1
+from .protocol_v1 import (
+    ACTION_SPACE_A,
+    FEATURE_LEN_V1,
+    InferRequestV1Packed,
+    InferResponseV1Packed,
+)
 from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
 
 
 @dataclass(slots=True)
 class _Queued:
-    req: InferRequestV1
-    fut: asyncio.Future[InferResponseV1]
+    req: InferRequestV1Packed
+    fut: asyncio.Future[InferResponseV1Packed]
     t0: float
 
 
@@ -93,9 +100,9 @@ class Batcher:
         self._models[model_id] = new_model
         self._reloads_total += 1
 
-    async def enqueue(self, req: InferRequestV1) -> InferResponseV1:
+    async def enqueue(self, req: InferRequestV1Packed) -> InferResponseV1Packed:
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[InferResponseV1] = loop.create_future()
+        fut: asyncio.Future[InferResponseV1Packed] = loop.create_future()
         await self._q.put(_Queued(req=req, fut=fut, t0=time.monotonic()))
         return await fut
 
@@ -285,10 +292,14 @@ class Batcher:
                     item.fut.set_exception(ValueError(f"unknown model_id: {model_id}"))
             return
 
-        feats = [it.req.features for it in items]
+        bsz = len(items)
+        x_np = np.empty((bsz, FEATURE_LEN_V1), dtype=np.float32)
+        for i, it in enumerate(items):
+            row = np.frombuffer(it.req.features_f32, dtype=np.float32, count=FEATURE_LEN_V1)
+            x_np[i, :] = row
         masks = [it.req.legal_mask for it in items]
         t0 = time.monotonic()
-        outs = model.infer_batch(feats, masks)
+        logits_bytes, values_bytes, margin_bytes = model.infer_batch_packed(x_np, masks)
         dt_ms = (time.monotonic() - t0) * 1000.0
 
         # region agent log
@@ -336,20 +347,40 @@ class Batcher:
             pass
         # endregion agent log
 
-        if len(outs) != len(items):
+        if len(logits_bytes) != bsz * ACTION_SPACE_A * 4:
             for item in items:
                 if not item.fut.cancelled():
-                    item.fut.set_exception(RuntimeError("model returned wrong batch size"))
+                    item.fut.set_exception(RuntimeError("model returned wrong logits byte size"))
+            return
+        if len(values_bytes) != bsz * 4:
+            for item in items:
+                if not item.fut.cancelled():
+                    item.fut.set_exception(RuntimeError("model returned wrong value byte size"))
+            return
+        if margin_bytes is not None and len(margin_bytes) != bsz * 4:
+            for item in items:
+                if not item.fut.cancelled():
+                    item.fut.set_exception(RuntimeError("model returned wrong margin byte size"))
             return
 
-        for item, out in zip(items, outs, strict=True):
+        logits_mv = memoryview(logits_bytes)
+        values_mv = memoryview(values_bytes)
+        margin_mv = memoryview(margin_bytes) if margin_bytes is not None else None
+
+        for i, item in enumerate(items):
             if item.fut.cancelled():
                 continue
             item.fut.set_result(
-                InferResponseV1(
+                InferResponseV1Packed(
                     request_id=item.req.request_id,
-                    policy_logits=out.policy_logits,
-                    value=out.value,
-                    margin=out.margin,
+                    policy_logits_f32=logits_mv[
+                        i * ACTION_SPACE_A * 4 : (i + 1) * ACTION_SPACE_A * 4
+                    ],
+                    value_f32=values_mv[i * 4 : (i + 1) * 4],
+                    margin_f32=(
+                        None
+                        if margin_mv is None
+                        else margin_mv[i * 4 : (i + 1) * 4]
+                    ),
                 )
             )

@@ -7,22 +7,17 @@ from pathlib import Path
 import time as _time
 import json as _json
 
+import numpy as np
+
 from .checkpoint import load_checkpoint
 from .debug_log import emit as _dbg_emit, enabled as _dbg_enabled
 from .protocol_v1 import ACTION_SPACE_A
 
 
-@dataclass(frozen=True, slots=True)
-class InferOutput:
-    policy_logits: list[float]  # len=A
-    value: float
-    margin: float | None = None
-
-
 class Model:
-    def infer_batch(
-        self, features_batch: list[list[float]], legal_mask_batch: list[bytes]
-    ) -> list[InferOutput]:
+    def infer_batch_packed(
+        self, x_np: np.ndarray, legal_mask_batch: list[bytes]
+    ) -> tuple[bytes, bytes, bytes | None]:
         raise NotImplementedError
 
 
@@ -57,9 +52,9 @@ class TorchModel(Model):
 
         self._model = m
 
-    def infer_batch(
-        self, features_batch: list[list[float]], legal_mask_batch: list[bytes]
-    ) -> list[InferOutput]:
+    def infer_batch_packed(
+        self, x_np: np.ndarray, legal_mask_batch: list[bytes]
+    ) -> tuple[bytes, bytes, bytes | None]:
         # NOTE: we keep legal_mask_batch in the interface for protocol compatibility, but do not
         # apply masking here (Rust is responsible for masking + softmax).
         _ = legal_mask_batch
@@ -68,12 +63,16 @@ class TorchModel(Model):
         except Exception as e:  # noqa: BLE001
             raise RuntimeError("TorchModel requires torch") from e
 
-        if len(features_batch) == 0:
-            return []
+        if x_np.size == 0:
+            return (b"", b"", None)
 
         t0 = _time.monotonic()
         # One conversion per batch. For GPU, do a single host->device transfer per batch.
-        x = torch.as_tensor(features_batch, dtype=torch.float32)
+        if x_np.dtype != np.float32:
+            x_np = x_np.astype(np.float32, copy=False)
+        if not x_np.flags["C_CONTIGUOUS"]:
+            x_np = np.ascontiguousarray(x_np, dtype=np.float32)
+        x = torch.from_numpy(x_np)
         t_as_tensor = _time.monotonic()
         if x.ndim != 2:
             raise RuntimeError(f"bad features tensor rank: {x.ndim} (expected 2)")
@@ -94,15 +93,17 @@ class TorchModel(Model):
         logits_cpu = logits.detach().to("cpu")
         v_cpu = v.detach().to("cpu")
         t_to_cpu = _time.monotonic()
-        logits_list: list[list[float]] = logits_cpu.tolist()
-        v_list: list[float] = v_cpu.tolist()
-        t_tolist = _time.monotonic()
+        logits_bytes = (
+            logits_cpu.contiguous().numpy().astype(np.float32, copy=False).tobytes()
+        )
+        values_bytes = v_cpu.contiguous().numpy().astype(np.float32, copy=False).tobytes()
+        t_pack = _time.monotonic()
 
         # region agent log
         if _dbg_enabled():
             try:
-                total_ms = (t_tolist - t0) * 1000.0
-                sampled = (int(t_tolist * 1000) & 0x3F) == 0  # ~1/64
+                total_ms = (t_pack - t0) * 1000.0
+                sampled = (int(t_pack * 1000) & 0x3F) == 0  # ~1/64
                 if total_ms >= 5.0 or sampled:
                     _dbg_emit(
                         {
@@ -114,13 +115,13 @@ class TorchModel(Model):
                             "message": "torch timings",
                             "data": {
                                 "device": str(self._device),
-                                "batch": len(features_batch),
+                                "batch": int(x_np.shape[0]),
                                 "sampled": bool(sampled),
                                 "as_tensor_ms": (t_as_tensor - t0) * 1000.0,
                                 "to_device_ms": (t_to_dev - t_as_tensor) * 1000.0,
                                 "forward_ms": (t_fwd - t_to_dev) * 1000.0,
                                 "to_cpu_ms": (t_to_cpu - t_fwd) * 1000.0,
-                                "tolist_ms": (t_tolist - t_to_cpu) * 1000.0,
+                                "pack_ms": (t_pack - t_to_cpu) * 1000.0,
                                 "total_ms": total_ms,
                             },
                         }
@@ -128,13 +129,7 @@ class TorchModel(Model):
             except Exception:
                 pass
         # endregion agent log
-
-        out: list[InferOutput] = []
-        for ls, vv in zip(logits_list, v_list, strict=True):
-            out.append(
-                InferOutput(policy_logits=[float(z) for z in ls], value=float(vv), margin=None)
-            )
-        return out
+        return (logits_bytes, values_bytes, None)
 
 
 def parse_model_spec(spec: str) -> tuple[str, float | None]:
@@ -169,17 +164,17 @@ class DummyModel(Model):
     def __init__(self, *, value: float = 0.0) -> None:
         self._value = float(value)
 
-    def infer_batch(
-        self, features_batch: list[list[float]], legal_mask_batch: list[bytes]
-    ) -> list[InferOutput]:
-        out: list[InferOutput] = []
-        for _features, legal in zip(features_batch, legal_mask_batch, strict=True):
-            logits = [0.0] * ACTION_SPACE_A
-            for i, b in enumerate(legal):
-                if b == 0:
-                    logits[i] = -1.0e9
-            out.append(InferOutput(policy_logits=logits, value=self._value, margin=None))
-        return out
+    def infer_batch_packed(
+        self, x_np: np.ndarray, legal_mask_batch: list[bytes]
+    ) -> tuple[bytes, bytes, bytes | None]:
+        # For dummy we ignore features (but keep shape checks minimal).
+        bsz = int(x_np.shape[0])
+        logits = np.zeros((bsz, ACTION_SPACE_A), dtype=np.float32)
+        for i, legal in enumerate(legal_mask_batch):
+            m = np.frombuffer(legal, dtype=np.uint8, count=ACTION_SPACE_A)
+            logits[i, m == 0] = -1.0e9
+        values = np.full((bsz,), float(self._value), dtype=np.float32)
+        return (logits.tobytes(), values.tobytes(), None)
 
 
 def build_model(spec: str, *, device: str) -> Model:
