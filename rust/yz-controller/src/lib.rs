@@ -77,6 +77,10 @@ struct ServerCapabilities {
     max_batch: Option<u32>,
     #[serde(default)]
     max_wait_us: Option<u64>,
+    #[serde(default)]
+    print_stats_every_s: Option<f64>,
+    #[serde(default)]
+    debug_log: Option<bool>,
 }
 
 struct InferServerChild {
@@ -276,10 +280,11 @@ fn build_infer_server_command(
     let max_wait_us = cfg.inference.max_wait_us.to_string();
     let torch_threads = cfg.inference.torch_threads.map(|x| x.to_string());
     let torch_interop_threads = cfg.inference.torch_interop_threads.map(|x| x.to_string());
-    let print_stats_every_s = if matches!(
+    let env_print_stats = matches!(
         std::env::var("YZ_INFER_PRINT_STATS").as_deref(),
         Ok("1" | "true" | "yes")
-    ) {
+    );
+    let print_stats_every_s = if cfg.inference.print_stats || env_print_stats {
         "2.0"
     } else {
         "0"
@@ -288,6 +293,12 @@ fn build_infer_server_command(
     if use_uv {
         let mut cmd = Command::new("uv");
         cmd.current_dir(py_dir);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
+        if cfg.inference.print_stats {
+            cmd.env("YZ_INFER_PRINT_STATS", "1");
+        }
         cmd.args(["run", "python", "-m", "yatzy_az", "infer-server"]);
         cmd.args(["--best", "dummy", "--cand", "dummy"]);
         cmd.args(["--bind", &bind]);
@@ -306,6 +317,12 @@ fn build_infer_server_command(
     } else {
         let mut cmd = Command::new(python_exe);
         cmd.current_dir(py_dir);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
+        if cfg.inference.print_stats {
+            cmd.env("YZ_INFER_PRINT_STATS", "1");
+        }
         cmd.args(["-m", "yatzy_az", "infer-server"]);
         cmd.args(["--best", "dummy", "--cand", "dummy"]);
         cmd.args(["--bind", &bind]);
@@ -335,12 +352,17 @@ fn ensure_infer_server(
     if let Ok(caps) = get_server_capabilities(&cfg.inference.metrics_bind) {
         if caps.hot_reload {
             let caps_is_v2 = caps.version.trim() == "2";
+            let want_print_stats = if cfg.inference.print_stats { Some(2.0) } else { Some(0.0) };
+            let want_debug_log = Some(cfg.inference.debug_log);
             let cfg_matches = caps_is_v2
                 && caps.device.as_deref() == Some(cfg.inference.device.as_str())
                 && caps.bind.as_deref() == Some(cfg.inference.bind.as_str())
                 && caps.metrics_bind.as_deref() == Some(cfg.inference.metrics_bind.as_str())
                 && caps.max_batch == Some(cfg.inference.max_batch)
-                && caps.max_wait_us == Some(cfg.inference.max_wait_us);
+                && caps.max_wait_us == Some(cfg.inference.max_wait_us)
+                // If server doesn't report these (older), force restart to apply TUI toggles.
+                && caps.print_stats_every_s.or(Some(-1.0)) == want_print_stats
+                && caps.debug_log.or(Some(false)) == want_debug_log;
             if cfg_matches {
                 return Ok(None);
             }
@@ -1156,6 +1178,9 @@ fn build_train_command(
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
         cmd.current_dir(py_dir);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
         cmd.args(["run", "python", "-m", "yatzy_az", "train"]);
         cmd.args([
             "--replay",
@@ -1181,6 +1206,9 @@ fn build_train_command(
     } else {
         let mut cmd = std::process::Command::new(python_exe);
         cmd.current_dir(py_dir);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
         cmd.args(["-m", "yatzy_az", "train"]);
         cmd.args([
             "--replay",
@@ -1228,6 +1256,9 @@ fn build_model_init_command(
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
         cmd.current_dir(py_dir);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
         cmd.args(["run", "python", "-m", "yatzy_az", "model-init"]);
         cmd.args([
             "--out",
@@ -1241,6 +1272,9 @@ fn build_model_init_command(
     } else {
         let mut cmd = std::process::Command::new(python_exe);
         cmd.current_dir(py_dir);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
         cmd.args(["-m", "yatzy_az", "model-init"]);
         cmd.args([
             "--out",
@@ -1410,6 +1444,9 @@ fn run_selfplay(
             continue;
         }
         let mut cmd = Command::new(&exe);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
         cmd.arg("selfplay-worker");
         cmd.arg("--run-dir").arg(run_dir);
         cmd.arg("--infer").arg(infer_endpoint);
@@ -1736,6 +1773,9 @@ fn run_gate(
         std::fs::write(&sched_path, bytes)?;
 
         let mut cmd = Command::new(&exe);
+        if cfg.inference.debug_log {
+            cmd.env("YZ_DEBUG_LOG", "1");
+        }
         cmd.arg("gate-worker");
         cmd.arg("--run-dir").arg(run_dir);
         cmd.arg("--infer").arg(infer_endpoint);
@@ -2041,7 +2081,7 @@ mod cancel_tests {
                 run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
                 run_id: "test".to_string(),
                 created_ts_ms: yz_logging::now_ms(),
-                protocol_version: 1,
+                protocol_version: 2,
                 feature_schema_id: 1,
                 action_space_id: "oracle_keepmask_v1".to_string(),
                 ruleset_id: "swedish_scandinavian_v1".to_string(),

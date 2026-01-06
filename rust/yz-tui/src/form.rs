@@ -42,6 +42,8 @@ pub enum FieldId {
     InferMaxWaitUs,
     InferTorchThreads,
     InferTorchInteropThreads,
+    InferDebugLog,
+    InferPrintStats,
 
     // mcts
     MctsCPuct,
@@ -98,7 +100,9 @@ impl FieldId {
             | FieldId::InferMaxBatch
             | FieldId::InferMaxWaitUs
             | FieldId::InferTorchThreads
-            | FieldId::InferTorchInteropThreads => Section::System,
+            | FieldId::InferTorchInteropThreads
+            | FieldId::InferDebugLog
+            | FieldId::InferPrintStats => Section::System,
 
             // Search: MCTS algorithm params
             FieldId::MctsCPuct
@@ -149,6 +153,8 @@ impl FieldId {
             FieldId::InferMaxWaitUs => "inference.max_wait_us",
             FieldId::InferTorchThreads => "inference.torch_threads",
             FieldId::InferTorchInteropThreads => "inference.torch_interop_threads",
+            FieldId::InferDebugLog => "inference.debug_log (YZ_DEBUG_LOG)",
+            FieldId::InferPrintStats => "inference.print_stats (YZ_INFER_PRINT_STATS)",
 
             FieldId::MctsCPuct => "mcts.c_puct",
             FieldId::MctsBudgetReroll => "mcts.budget_reroll",
@@ -249,6 +255,8 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::InferMaxWaitUs,
     FieldId::InferTorchThreads,
     FieldId::InferTorchInteropThreads,
+    FieldId::InferDebugLog,
+    FieldId::InferPrintStats,
     // Search: MCTS algorithm params
     FieldId::MctsCPuct,
     FieldId::MctsBudgetReroll,

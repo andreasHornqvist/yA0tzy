@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import time as _time
 import json as _json
 
@@ -69,6 +70,17 @@ class TorchModel(Model):
         self._device = torch.device(str(device))
         if self._device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("device=cuda requested but torch.cuda.is_available() is false")
+        if self._device.type == "mps":
+            # Fail fast: we do not allow silent CPU fallback for MPS runs.
+            # Users can explicitly select device=cpu if they want CPU inference.
+            env_fb = str(os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "")).strip().lower()
+            if env_fb in {"1", "true", "yes", "y"}:
+                raise RuntimeError(
+                    "device=mps requested but PYTORCH_ENABLE_MPS_FALLBACK is enabled; "
+                    "refusing to run because this can silently execute ops on CPU"
+                )
+            if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
+                raise RuntimeError("device=mps requested but torch.backends.mps.is_available() is false")
 
         m = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks))
         m.load_state_dict(ckpt.model, strict=True)
@@ -109,6 +121,14 @@ class TorchModel(Model):
         with torch.inference_mode():
             logits, v = self._model(x)
         t_fwd = _time.monotonic()
+
+        # If MPS is selected, assert outputs are actually on MPS (best-effort fallback detection).
+        if self._device.type == "mps":
+            if logits.device.type != "mps" or v.device.type != "mps":
+                raise RuntimeError(
+                    f"MPS fallback detected: model outputs are on {logits.device.type}/{v.device.type} "
+                    "(expected mps). Refusing to continue."
+                )
 
         if logits.ndim != 2 or logits.shape[0] != x.shape[0] or logits.shape[1] != ACTION_SPACE_A:
             raise RuntimeError(f"bad logits shape: {tuple(logits.shape)} (expected [B,{ACTION_SPACE_A}])")

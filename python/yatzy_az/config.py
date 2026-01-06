@@ -16,9 +16,9 @@ class InferenceConfig(BaseModel):
     bind: str = Field(
         description='Bind address (e.g., "unix:///tmp/yatzy_infer.sock" or "tcp://host:port")'
     )
-    device: str = Field(description='Device: "cpu" or "cuda"')
+    device: str = Field(description='Device: "cpu", "mps", or "cuda"')
     protocol_version: int = Field(
-        default=1,
+        default=2,
         description=(
             "Inference protocol version for Rust↔Python.\n"
             "- 1: v1 (legacy)\n"
@@ -40,6 +40,20 @@ class InferenceConfig(BaseModel):
     )
     torch_interop_threads: int | None = Field(
         default=None, description="Optional: torch inter-op threads (CPU perf stability)"
+    )
+    debug_log: bool = Field(
+        default=False,
+        description=(
+            "Enable debug logging across Rust/Python components for this run "
+            "(maps to YZ_DEBUG_LOG=1 for spawned subprocesses)."
+        ),
+    )
+    print_stats: bool = Field(
+        default=False,
+        description=(
+            "Make infer-server print periodic throughput/batching stats "
+            "(maps to YZ_INFER_PRINT_STATS=1 / --print-stats-every-s)."
+        ),
     )
     metrics_bind: str = Field(
         default="127.0.0.1:18080",

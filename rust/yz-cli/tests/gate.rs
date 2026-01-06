@@ -11,7 +11,7 @@ fn start_dummy_infer_server_tcp() -> (std::net::SocketAddr, std::thread::JoinHan
     use std::net::TcpListener;
     use std::thread;
 
-    use yz_infer::codec::{decode_request_v1, encode_response_v1};
+    use yz_infer::codec::{decode_request_v1, encode_response_v1, encode_response_v2};
     use yz_infer::frame::{read_frame, write_frame};
     use yz_infer::protocol::{InferResponseV1, ACTION_SPACE_A};
 
@@ -25,25 +25,87 @@ fn start_dummy_infer_server_tcp() -> (std::net::SocketAddr, std::thread::JoinHan
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let req = match decode_request_v1(&payload) {
-                    Ok(r) => r,
-                    Err(_) => break,
+                // Test helper: accept both v1 and v2 requests.
+                // Gate code should use v2 by default now, but other tests may still send v1.
+                let version = if payload.len() >= 4 {
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+                } else {
+                    break;
+                };
+                let is_v2 = version == yz_infer::protocol::PROTOCOL_VERSION_V2;
+
+                // For this test's purposes, decode v1 fully (includes legal mask).
+                // For v2, decode a minimal subset: request_id + legal_mask.
+                let (request_id, legal_mask) = if !is_v2 {
+                    let req = match decode_request_v1(&payload) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    (req.request_id, req.legal_mask)
+                } else {
+                    // v2 frame layout:
+                    // u32 version, u8 kind, u8 flags, u16 reserved,
+                    // u64 request_id, u32 model_id, u32 feature_schema_id,
+                    // u32 features_byte_len, [features bytes],
+                    // u32 legal_len, [legal bytes]
+                    if payload.len() < 4 + 1 + 1 + 2 + 8 + 4 + 4 + 4 {
+                        break;
+                    }
+                    // request_id starts at offset 8
+                    let rid_off = 8;
+                    let request_id = u64::from_le_bytes(
+                        payload[rid_off..rid_off + 8].try_into().unwrap(),
+                    );
+                    let mut off = 4 + 1 + 1 + 2 + 8 + 4 + 4;
+                    let features_byte_len =
+                        u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+                    off += 4;
+                    if payload.len() < off + features_byte_len + 4 {
+                        break;
+                    }
+                    off += features_byte_len;
+                    let legal_len = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+                    off += 4;
+                    if payload.len() < off + legal_len {
+                        break;
+                    }
+                    let legal = &payload[off..off + legal_len];
+                    let mut legal_mask: yz_infer::protocol::LegalMask = 0;
+                    if legal_len == yz_infer::protocol::LEGAL_MASK_BITSET_BYTES {
+                        // LSB-first, 6 bytes
+                        let mut b = [0u8; 8];
+                        b[0..6].copy_from_slice(legal);
+                        legal_mask = u64::from_le_bytes(b);
+                    } else if legal_len == ACTION_SPACE_A as usize {
+                        for (i, &b) in legal.iter().enumerate() {
+                            if b == 1 {
+                                legal_mask |= 1u64 << i;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                    (request_id, legal_mask)
                 };
 
                 let mut logits = vec![0.0f32; ACTION_SPACE_A as usize];
                 for i in 0..(ACTION_SPACE_A as usize) {
-                    if ((req.legal_mask >> i) & 1) == 0 {
+                    if ((legal_mask >> i) & 1) == 0 {
                         logits[i] = -1.0e9;
                     }
                 }
 
                 let resp = InferResponseV1 {
-                    request_id: req.request_id,
+                    request_id,
                     policy_logits: logits,
                     value: 0.0,
                     margin: None,
                 };
-                let out = encode_response_v1(&resp);
+                let out = if is_v2 {
+                    encode_response_v2(&resp)
+                } else {
+                    encode_response_v1(&resp)
+                };
                 if write_frame(&mut sock, &out).is_err() {
                     break;
                 }
@@ -67,7 +129,7 @@ fn gate_runs_and_updates_manifest() {
         run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
         run_id: "run".to_string(),
         created_ts_ms: yz_logging::now_ms(),
-        protocol_version: 1,
+        protocol_version: 2,
         feature_schema_id: 1,
         action_space_id: "oracle_keepmask_v1".to_string(),
         ruleset_id: "swedish_scandinavian_v1".to_string(),

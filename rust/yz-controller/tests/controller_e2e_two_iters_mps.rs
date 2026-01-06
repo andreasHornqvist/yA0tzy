@@ -14,31 +14,9 @@ fn repo_root() -> PathBuf {
         .expect("failed to compute repo root")
 }
 
-fn pick_python_exe_with_deps(root: &Path) -> Option<OsString> {
-    // Prefer explicit override.
-    if let Ok(s) = std::env::var("YATZY_AZ_PYTHON") {
-        let exe = OsString::from(s);
-        if python_can_import(&exe) {
-            return Some(exe);
-        }
-    }
-
-    // Prefer repo venv.
-    let venv = root.join("python").join(".venv").join("bin").join("python");
-    if venv.exists() {
-        let exe = venv.into_os_string();
-        if python_can_import(&exe) {
-            return Some(exe);
-        }
-    }
-
-    // Fallback to python3 (avoid controller's special-casing for "python").
-    let exe = OsString::from("python3");
-    if python_can_import(&exe) {
-        return Some(exe);
-    }
-
-    None
+fn free_local_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    l.local_addr().expect("local_addr").port()
 }
 
 fn python_can_import(exe: &OsString) -> bool {
@@ -50,24 +28,56 @@ fn python_can_import(exe: &OsString) -> bool {
         .unwrap_or(false)
 }
 
-fn free_local_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    l.local_addr().expect("local_addr").port()
+fn python_has_mps(exe: &OsString) -> bool {
+    Command::new(exe)
+        .args([
+            "-c",
+            "import torch; assert hasattr(torch.backends, 'mps'); assert torch.backends.mps.is_available()",
+        ])
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
+fn pick_python_exe_with_deps_and_mps(root: &Path) -> Option<OsString> {
+    // Prefer explicit override.
+    if let Ok(s) = std::env::var("YATZY_AZ_PYTHON") {
+        let exe = OsString::from(s);
+        if python_can_import(&exe) && python_has_mps(&exe) {
+            return Some(exe);
+        }
+    }
+
+    // Prefer repo venv.
+    let venv = root.join("python").join(".venv").join("bin").join("python");
+    if venv.exists() {
+        let exe = venv.into_os_string();
+        if python_can_import(&exe) && python_has_mps(&exe) {
+            return Some(exe);
+        }
+    }
+
+    // Fallback to python3 (avoid controller's special-casing for "python").
+    let exe = OsString::from("python3");
+    if python_can_import(&exe) && python_has_mps(&exe) {
+        return Some(exe);
+    }
+
+    None
 }
 
 #[test]
-fn controller_two_iterations_e2e_opt_in() {
-    if std::env::var("YZ_PY_E2E").ok().as_deref() != Some("1") {
-        eprintln!("skipping (set YZ_PY_E2E=1 to enable)");
+fn controller_two_iterations_e2e_mps_opt_in() {
+    if std::env::var("YZ_MPS_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping (set YZ_MPS_E2E=1 to enable)");
         return;
     }
 
     let root = repo_root();
-    let python = match pick_python_exe_with_deps(&root) {
+    let python = match pick_python_exe_with_deps_and_mps(&root) {
         Some(p) => p,
         None => {
-            eprintln!("skipping (no python found that can import torch+safetensors)");
-            return;
+            panic!("YZ_MPS_E2E=1 but no python found with torch+safetensors and torch.backends.mps.is_available()==true");
         }
     };
 
@@ -81,14 +91,11 @@ fn controller_two_iterations_e2e_opt_in() {
     let metrics_port = free_local_port();
     let metrics_bind = format!("127.0.0.1:{metrics_port}");
 
-    // Tiny config to keep E2E fast. We want to cover:
-    // - selfplay writing replay
-    // - trainer using random_indexed dataset
-    // - gating completing
+    // Tiny config to keep E2E fast, but covers two full iterations.
     let cfg_yaml = r#"
 inference:
   bind: unix:///tmp/will_be_overridden
-  device: cpu
+  device: mps
   protocol_version: 2
   legal_mask_bitset: true
   max_batch: 32
@@ -98,8 +105,8 @@ inference:
   metrics_bind: 127.0.0.1:18080
 mcts:
   c_puct: 1.5
-  budget_reroll: 16
-  budget_mark: 16
+  budget_reroll: 12
+  budget_mark: 12
   max_inflight_per_game: 4
   dirichlet_alpha: 0.3
   dirichlet_epsilon: 0.25
@@ -107,7 +114,7 @@ mcts:
     kind: constant
     t0: 1.0
 selfplay:
-  games_per_iteration: 10
+  games_per_iteration: 6
   workers: 1
   threads_per_worker: 1
 training:
@@ -115,12 +122,11 @@ training:
   learning_rate: 0.001
   weight_decay: 0.0001
   epochs: 1
-  steps_per_iteration: 5
+  steps_per_iteration: 4
   sample_mode: random_indexed
   dataloader_workers: 0
-  cache_shards: 2
 gating:
-  games: 10
+  games: 6
   seed: 0
   seed_set_id: dev_v1
   win_rate_threshold: 0.0
@@ -161,8 +167,8 @@ model:
     for (i, it) in m.iterations.iter().take(2).enumerate() {
         assert!(it.ended_ts_ms.is_some(), "iter {i} missing ended_ts_ms");
 
-        assert_eq!(it.selfplay.games_target, 10);
-        assert_eq!(it.selfplay.games_completed, 10);
+        assert_eq!(it.selfplay.games_target, 6);
+        assert_eq!(it.selfplay.games_completed, 6);
         assert!(it.selfplay.ended_ts_ms.is_some(), "iter {i} selfplay not ended");
 
         assert!(it.train.ended_ts_ms.is_some(), "iter {i} train not ended");
@@ -171,8 +177,8 @@ model:
             "iter {i} missing train last_loss_total"
         );
 
-        assert_eq!(it.gate.games_target, 10);
-        assert_eq!(it.gate.games_completed, 10);
+        assert_eq!(it.gate.games_target, 6);
+        assert_eq!(it.gate.games_completed, 6);
         assert!(it.gate.ended_ts_ms.is_some(), "iter {i} gate not ended");
         assert!(it.gate.win_rate.is_some(), "iter {i} missing gate win_rate");
     }

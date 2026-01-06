@@ -6,8 +6,8 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if cfg.inference.bind.trim().is_empty() {
         return Err("inference.bind must be non-empty".to_string());
     }
-    if cfg.inference.device != "cpu" && cfg.inference.device != "cuda" {
-        return Err("inference.device must be 'cpu' or 'cuda'".to_string());
+    if cfg.inference.device != "cpu" && cfg.inference.device != "cuda" && cfg.inference.device != "mps" {
+        return Err("inference.device must be 'cpu', 'cuda', or 'mps'".to_string());
     }
     if cfg.inference.max_batch < 1 {
         return Err("inference.max_batch must be >= 1".to_string());

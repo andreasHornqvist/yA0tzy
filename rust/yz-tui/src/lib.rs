@@ -52,6 +52,10 @@ struct App {
     dashboard_err: Option<String>,
     dashboard_planned_total_iterations: Option<u32>,
     dashboard_planned_loaded_for_run: Option<String>,
+    /// Scroll offset (in rows) for the dashboard Performance iteration list.
+    dashboard_iter_scroll: usize,
+    /// If true, keep the current iteration row visible (auto-follow). Any manual scroll disables it.
+    dashboard_iter_follow: bool,
 
     iter: Option<yz_controller::IterationHandle>,
 
@@ -79,6 +83,8 @@ impl App {
             dashboard_err: None,
             dashboard_planned_total_iterations: None,
             dashboard_planned_loaded_for_run: None,
+            dashboard_iter_scroll: 0,
+            dashboard_iter_follow: true,
             iter: None,
             shutdown_requested: false,
             shutdown_exit_after: false,
@@ -230,10 +236,14 @@ impl App {
         }
         self.refresh_dashboard();
         self.screen = Screen::Dashboard;
+        // Default behavior: follow the current iteration so the latest rows are visible.
+        self.dashboard_iter_follow = true;
         if self.shutdown_requested {
             self.status = "cancelling… waiting for shutdown | r refresh".to_string();
         } else {
-            self.status = "r refresh | x cancel | Esc back | q quit".to_string();
+            self.status =
+                "r refresh | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                    .to_string();
         }
     }
 
@@ -432,6 +442,29 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::Char('r') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
+                        KeyCode::Up => {
+                            app.dashboard_iter_follow = false;
+                            app.dashboard_iter_scroll = app.dashboard_iter_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.dashboard_iter_follow = false;
+                            app.dashboard_iter_scroll = app.dashboard_iter_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            app.dashboard_iter_follow = false;
+                            app.dashboard_iter_scroll = app.dashboard_iter_scroll.saturating_sub(10);
+                        }
+                        KeyCode::PageDown => {
+                            app.dashboard_iter_follow = false;
+                            app.dashboard_iter_scroll = app.dashboard_iter_scroll.saturating_add(10);
+                        }
+                        KeyCode::Home => {
+                            app.dashboard_iter_follow = false;
+                            app.dashboard_iter_scroll = 0;
+                        }
+                        KeyCode::End => {
+                            app.dashboard_iter_follow = true;
+                        }
                         _ => {}
                     },
                 }
@@ -582,11 +615,12 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
             app.cfg.gating.deterministic_chance = !app.cfg.gating.deterministic_chance;
         }
         FieldId::InferDevice => {
-            if app.cfg.inference.device == "cpu" {
-                app.cfg.inference.device = "cuda".to_string();
-            } else {
-                app.cfg.inference.device = "cpu".to_string();
-            }
+            // Cycle: cpu → mps → cuda → cpu
+            app.cfg.inference.device = match app.cfg.inference.device.as_str() {
+                "cpu" => "mps".to_string(),
+                "mps" => "cuda".to_string(),
+                _ => "cpu".to_string(),
+            };
         }
         FieldId::InferProtocolVersion => {
             // Toggle between v1 and v2.
@@ -598,6 +632,12 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
         }
         FieldId::InferLegalMaskBitset => {
             app.cfg.inference.legal_mask_bitset = !app.cfg.inference.legal_mask_bitset;
+        }
+        FieldId::InferDebugLog => {
+            app.cfg.inference.debug_log = !app.cfg.inference.debug_log;
+        }
+        FieldId::InferPrintStats => {
+            app.cfg.inference.print_stats = !app.cfg.inference.print_stats;
         }
         FieldId::MctsTempKind => {
             let t0 = match app.cfg.mcts.temperature_schedule {
@@ -659,11 +699,11 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
             Ok(())
         }
         FieldId::InferDevice => {
-            if buf == "cpu" || buf == "cuda" {
+            if buf == "cpu" || buf == "cuda" || buf == "mps" {
                 cfg.inference.device = buf.to_string();
                 Ok(())
             } else {
-                Err("inference.device must be cpu|cuda".to_string())
+                Err("inference.device must be cpu|cuda|mps".to_string())
             }
         }
         FieldId::InferProtocolVersion => {
@@ -707,6 +747,24 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
             } else {
                 Some(buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?)
             };
+            Ok(())
+        }
+        FieldId::InferDebugLog => {
+            let b = match buf.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => true,
+                "false" | "0" | "no" | "n" => false,
+                _ => return Err("inference.debug_log must be true|false".to_string()),
+            };
+            cfg.inference.debug_log = b;
+            Ok(())
+        }
+        FieldId::InferPrintStats => {
+            let b = match buf.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => true,
+                "false" | "0" | "no" | "n" => false,
+                _ => return Err("inference.print_stats must be true|false".to_string()),
+            };
+            cfg.inference.print_stats = b;
             Ok(())
         }
 
@@ -919,6 +977,8 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             .torch_interop_threads
             .map(|x| x.to_string())
             .unwrap_or_default(),
+        FieldId::InferDebugLog => cfg.inference.debug_log.to_string(),
+        FieldId::InferPrintStats => cfg.inference.print_stats.to_string(),
 
         FieldId::MctsCPuct => format!("{:.4}", cfg.mcts.c_puct),
         FieldId::MctsBudgetReroll => cfg.mcts.budget_reroll.to_string(),
@@ -1335,6 +1395,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             let mut left: Vec<Line> = Vec::new();
             match (&app.dashboard_manifest, &app.dashboard_err) {
                 (Some(m), _) => {
+                    // Visible height inside the left block (minus borders).
+                    let left_view_h = cols[0].height.saturating_sub(2) as usize;
+
                     // Iteration-level AvgIter + ETA (completed iterations only).
                     if let Some(total_planned) = app.dashboard_planned_total_iterations {
                         let mut completed_durs_ms: Vec<u64> = Vec::new();
@@ -1375,6 +1438,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         left.push(Line::from(""));
                         left.push(Line::from(" (no iterations yet)"));
                     } else {
+                        // Build iteration rows separately so we can slice for scrolling.
+                        let mut iter_rows: Vec<Line> = Vec::new();
                         for it in &m.iterations {
                             let marker = if it.idx == cur_idx { "▸" } else { " " };
                             let promo = it
@@ -1416,13 +1481,41 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             } else {
                                 Style::default()
                             };
-                            left.push(Line::from(Span::styled(
+                            iter_rows.push(Line::from(Span::styled(
                                 format!(
                                     "{marker} {:>3}   {promo:>7}   {wr:>6}   {score_cb:>9}   {oracle:>6}   {lt:>5}/{lp:>5}/{lv:>5}",
                                     it.idx
                                 ),
                                 row_style,
                             )));
+                        }
+
+                        // Determine how many rows we can show (keep the lines already in `left` fixed).
+                        let fixed_len = left.len();
+                        let view_rows = left_view_h.saturating_sub(fixed_len).max(1);
+
+                        // Compute effective scroll start.
+                        let max_start = iter_rows.len().saturating_sub(view_rows);
+                        let mut start = if app.dashboard_iter_follow {
+                            // Keep current iteration visible (similar to config view).
+                            let cur_pos = m
+                                .iterations
+                                .iter()
+                                .position(|it| it.idx == cur_idx)
+                                .unwrap_or(iter_rows.len().saturating_sub(1));
+                            if cur_pos < view_rows {
+                                0
+                            } else {
+                                cur_pos.saturating_sub(view_rows * 2 / 3)
+                            }
+                        } else {
+                            app.dashboard_iter_scroll
+                        };
+                        start = start.min(max_start);
+                        let end = (start + view_rows).min(iter_rows.len());
+
+                        for line in &iter_rows[start..end] {
+                            left.push(line.clone());
                         }
                     }
                 }

@@ -101,6 +101,10 @@ cargo run -p yz-cli --bin yz -- tui
 # Inference server (Python)
 cd python
 uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best dummy --cand dummy
+# Apple GPU (MPS) inference (optional):
+# - requires torch with MPS support (`torch.backends.mps.is_available()==true`)
+# - yA0tzy hard-fails if PyTorch fallback-to-CPU is enabled (see PYTORCH_ENABLE_MPS_FALLBACK)
+uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device mps --best dummy --cand dummy
 # Real checkpoints (E6.5):
 uv run python -m yatzy_az model-init --out runs/<id>/models/best.pt --hidden 256 --blocks 2
 uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best path:runs/<id>/models/best.pt --cand path:runs/<id>/models/candidate.pt
@@ -196,6 +200,20 @@ If you touch the infer-server, batcher, protocol, or scheduler loops, use this l
 - The same YAML file loads in both Rust and Python
 - Config files are passed to both `yz` and `yatzy_az` CLIs
 
+#### Inference device selection
+`inference.device` supports:
+- `cpu` (default)
+- `mps` (Apple GPU via Metal; local Macs only)
+- `cuda` (NVIDIA GPU)
+
+When `inference.device=mps` we **fail fast** if:
+- MPS is not available (`torch.backends.mps.is_available()==false`), or
+- `PYTORCH_ENABLE_MPS_FALLBACK` is enabled (prevents silent CPU execution).
+
+If infer-server fails to start, check:
+- `runs/<id>/logs/infer_server.log` (log tail is surfaced in the TUI error message)
+- `runs/<id>/run.json: controller_error`
+
 ### Data Flow
 ```
 ┌─────────────┐     UDS/TCP      ┌─────────────┐
@@ -221,6 +239,7 @@ If you touch the infer-server, batcher, protocol, or scheduler loops, use this l
 - **`YZ_INFER_PRINT_STATS`**: make the controller start infer-server with periodic batch/rps prints (debug aid).
 - **`YZ_PYTHON_EXE`**: override Python executable used by controller/TUI for infer-server and training.
 - **`YZ_USE_UV`**: if set, controller uses `uv run python ...` when spawning Python subprocesses.
+- **`PYTORCH_ENABLE_MPS_FALLBACK`**: PyTorch MPS fallback knob. **yA0tzy hard-fails when `inference.device=mps` and this is enabled**, because fallback can silently run ops on CPU.
 
 ---
 

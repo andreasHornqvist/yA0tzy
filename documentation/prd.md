@@ -1461,3 +1461,84 @@ If you want a next artifact that directly accelerates implementation, I can also
 * `configs/local_cpu.yaml` and `configs/runpod_gpu.yaml` templates with reasonable starting knobs,
 * the concrete byte-level protocol definition (“Protocol v1”) and request/response structs,
 * and the exact `GameTask::step()` pseudocode for the scheduler + inflight inference pipeline.
+
+---
+
+## Epic E6.7 — MCTS reuse + transpositions (CPU throughput lever; stochastic-safe)
+
+**Goal:** reduce **inference calls per move** and total MCTS work on CPU by reusing search work across moves, without changing the core semantics of the search (PUCT, virtual loss caps, temperature/noise rules).
+
+**Background / motivation**
+
+We have already reduced Rust↔Python protocol overhead (v2 packed tensors + optional legal-mask bitset). On CPU, the dominant cost is still typically **inference-per-leaf** and the surrounding MCTS loops. A common next lever is to **reuse** portions of the search tree between consecutive decisions (\"root reuse\"), and/or to deduplicate identical states inside a search via a **transposition table**.
+
+Yatzy is stochastic (dice), so reuse must be **stochastic-safe**:
+* after applying an action, the realized next state depends on chance
+* reuse should only occur when the **exact realized child state** exists in the previous tree
+* if reuse misses, fall back to fresh-root behavior (no correctness regression)
+
+**Constraints / non-goals**
+* Do not increase `mcts.max_inflight_per_game` or change virtual loss behavior (this is a reuse optimization, not a semantics change).
+* Self-play exploration rules unchanged: Dirichlet noise root-only; temperature affects only executed action sampling; gating remains deterministic (when configured) with `T=0`, no noise.
+* Maintain oracle-compatibility invariants (state/action mapping and deterministic chance mode).
+
+### Story 1 — Instrumentation: measure reuse opportunities and expected ROI
+
+**Scope**
+* Add always-on counters to quantify:
+  * **root_reuse_attempts**, **root_reuse_hits**
+  * distribution of reused-root strength: e.g. `reused_child_root_visits` (child `N_sum` at reuse time)
+  * inference request volume: `infer_sent` per game (already present); add a per-game or per-move breakdown if needed
+* Log the above in a low-volume way (per-worker aggregated stats in `progress.json` and/or periodic `worker_stats.ndjson` events).
+
+**AC**
+* A single short run can answer:
+  * \"What % of moves could reuse the exact realized child?\"
+  * \"When reuse hits, how warm is the child subtree (visit count distribution)?\"
+  * \"Does reuse plausibly reduce inference calls per move?\"
+
+### Story 2 — Root/tree reuse across moves (safe fallback)
+
+**Scope**
+* Implement \"advance root\" after executing a move:
+  * after choosing action `a*` and applying it to obtain the realized next state `s'`,
+    attempt to locate an existing child node for `(root_id, a*, state_key(s'))`
+  * on hit: set the child as the new root and **retain** the reachable subtree
+  * on miss: fall back to current behavior (fresh root / reset tree)
+* Ensure root-only behaviors remain correct:
+  * Dirichlet noise is applied only at the current root (self-play only)
+  * temperature affects only executed action sampling, not stored targets
+* Pruning strategy:
+  * simplest safe first version: keep arena/children map but treat unreachable nodes as garbage (periodic rebuild optional later)
+
+**AC**
+* Correctness: gating/eval determinism is unchanged for a fixed seed set.
+* Safety: if reuse misses, behavior matches current baseline.
+* Performance: instrumentation shows `root_reuse_hits > 0` on representative self-play runs.
+
+### Story 3 — Eval caching / transpositions
+
+**Phase 1 (low risk): inference-result cache**
+* Cache inference outputs keyed by `state_key(state)` (must include all state needed to identify the exact observation: dice, rerolls_left, avail_mask, player_to_move, totals).
+* Cache stores **raw logits + value** (never Dirichlet-noised priors).
+* Scope: per-game cache first (bounded), optionally worker-local LRU later.
+
+**Phase 2 (higher complexity): transposition table / DAG MCTS**
+* Share nodes by state-key within a search (dedupe expansions and optionally share visit stats).
+* Requires careful accounting to avoid double counting across multiple parents.
+
+**AC**
+* Phase 1: measurable reduction in inference calls on workloads with repeated states (even low single-digit %).
+* Phase 2 (if implemented): measurable reduction in node count / expansions without correctness regressions.
+
+### Story 4 — CPU perf regression harness for reuse changes
+
+**Scope**
+* Add a repeatable micro+E2E perf harness that reports:
+  * secs/game, infer_sent/game, median batch size (server), p50/p95 inference latency
+  * reuse hit rate and reused-root visit strength
+* Document \"expected ranges\" and add a guardrail checklist (\"do not break batching again\" style) for reuse changes.
+
+**AC**
+* One command can run a small, reproducible benchmark and print the above metrics.
+* Reuse changes do not regress throughput on CPU beyond noise, and ideally reduce secs/game.

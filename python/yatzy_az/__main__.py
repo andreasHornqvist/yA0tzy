@@ -68,7 +68,7 @@ def main() -> int:
     )
     p_infer.add_argument("--model", default="best.pt", help="Model checkpoint path")
     p_infer.add_argument("--bind", default="unix:///tmp/yatzy_infer.sock", help="Bind address")
-    p_infer.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
+    p_infer.add_argument("--device", default="cpu", help="Device (cpu/mps/cuda)")
     infer_server.add_args(p_infer)
     p_infer.set_defaults(func=cmd_infer_server)
 

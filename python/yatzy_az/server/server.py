@@ -19,6 +19,7 @@ from .metrics_server import ReloadResult, start_metrics_server
 from .model import build_model
 from .protocol_v1 import (
     DecodeError,
+    ACTION_SPACE_A,
     FEATURE_LEN_V1,
     decode_request_packed,
     encode_response_packed,
@@ -93,6 +94,29 @@ def _apply_torch_thread_settings(cfg: ServerConfig) -> None:
     # endregion agent log
 
 
+def _preflight_device(cfg: ServerConfig) -> None:
+    """Fail fast for unsupported device configurations."""
+    dev = str(cfg.device).strip().lower()
+    if dev != "mps":
+        return
+
+    # Hard-fail policy: do not allow silent CPU fallback when user explicitly requests MPS.
+    fb = str(os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "")).strip().lower()
+    if fb in {"1", "true", "yes", "y"}:
+        raise RuntimeError(
+            "device=mps requested but PYTORCH_ENABLE_MPS_FALLBACK is enabled; "
+            "refusing to run because this can silently execute ops on CPU"
+        )
+
+    try:
+        import torch
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("device=mps requested but torch could not be imported") from e
+
+    if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
+        raise RuntimeError("device=mps requested but torch.backends.mps.is_available() is false")
+
+
 async def _handle_conn(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, batcher: Batcher
 ) -> None:
@@ -120,7 +144,10 @@ async def _handle_conn(
             payload = await out_q.get()
             if payload == b"":
                 return
-            await write_frame(writer, payload)
+            try:
+                await write_frame(writer, payload)
+            except (ConnectionResetError, BrokenPipeError):
+                return
 
     async def _worker_loop(worker_id: int) -> None:
         while True:
@@ -268,12 +295,26 @@ async def serve(config: ServerConfig) -> None:
     scheme, addr = _parse_bind(config.bind)
 
     start_s = now_s()
+    _preflight_device(config)
     model_by_id = {
         int(config.best_id): build_model(config.best_spec, device=config.device),
         int(config.cand_id): build_model(config.cand_spec, device=config.device),
     }
     batcher = Batcher(model_by_id, max_batch=config.max_batch, max_wait_us=config.max_wait_us)
     batcher_task = asyncio.create_task(batcher.run())
+
+    # Optional warmup: for MPS, trigger a tiny forward pass before accepting connections so
+    # unsupported ops (or other device errors) fail fast and are visible in infer_server.log.
+    if str(config.device).strip().lower() == "mps":
+        import numpy as np
+
+        x = np.zeros((1, FEATURE_LEN_V1), dtype=np.float32)
+        legal = bytes([1]) * ACTION_SPACE_A
+        for mid, m in model_by_id.items():
+            try:
+                _ = m.infer_batch_packed(x, [legal])
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"MPS warmup failed for model_id={mid}: {e}") from e
 
     def snapshot() -> MetricsSnapshot:
         return MetricsSnapshot(
@@ -402,6 +443,9 @@ async def serve(config: ServerConfig) -> None:
                         "device": config.device,
                         "max_batch": int(config.max_batch),
                         "max_wait_us": int(config.max_wait_us),
+                        "mps_fallback_env": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"),
+                        "print_stats_every_s": float(config.print_stats_every_s),
+                        "debug_log": bool(_dbg_enabled()),
                     }
 
                 metrics_srv = await start_metrics_server(

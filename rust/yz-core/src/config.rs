@@ -76,7 +76,7 @@ impl Default for ModelConfig {
 pub struct InferenceConfig {
     /// Bind address (e.g., "unix:///tmp/yatzy_infer.sock" or "tcp://0.0.0.0:9000").
     pub bind: String,
-    /// Device to run inference on ("cpu" or "cuda").
+    /// Device to run inference on ("cpu", "mps", or "cuda").
     pub device: String,
     /// Protocol version to use for the Rust↔Python inference protocol.
     ///
@@ -97,6 +97,17 @@ pub struct InferenceConfig {
     /// Optional: torch inter-op threads (Python server CPU perf stability).
     #[serde(default)]
     pub torch_interop_threads: Option<u32>,
+    /// If true, enable debug logging across Rust/Python components for this run.
+    ///
+    /// This maps to setting `YZ_DEBUG_LOG=1` for spawned subprocesses.
+    #[serde(default)]
+    pub debug_log: bool,
+    /// If true, make infer-server print periodic throughput/batching stats.
+    ///
+    /// This maps to setting `YZ_INFER_PRINT_STATS=1` and enables
+    /// `--print-stats-every-s` on the infer-server process.
+    #[serde(default)]
+    pub print_stats: bool,
     /// Metrics/control HTTP bind address (e.g., "127.0.0.1:18080").
     /// Used for hot-reloading models (E13.2S4).
     #[serde(default = "default_metrics_bind")]
@@ -108,7 +119,7 @@ fn default_metrics_bind() -> String {
 }
 
 fn default_inference_protocol_version() -> u32 {
-    1
+    2
 }
 
 /// MCTS algorithm configuration.
@@ -294,6 +305,8 @@ impl Default for Config {
                 max_wait_us: 1000,
                 torch_threads: None,
                 torch_interop_threads: None,
+                debug_log: false,
+                print_stats: false,
                 metrics_bind: default_metrics_bind(),
             },
             mcts: MctsConfig {
