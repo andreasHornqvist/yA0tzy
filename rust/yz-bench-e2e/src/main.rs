@@ -194,7 +194,13 @@ fn main() {
             },
             ChanceMode::Rng { .. } => ChanceMode::Rng { seed: 123 ^ i },
         };
-        tasks.push(GameTask::new(i, state, per_game_mode, mcts_cfg));
+        tasks.push(GameTask::new(
+            i,
+            state,
+            per_game_mode,
+            yz_core::config::TemperatureSchedule::Constant { t0: 0.0 },
+            mcts_cfg,
+        ));
     }
 
     let start_stats = backend.stats_snapshot();
@@ -244,7 +250,13 @@ fn main() {
                             },
                             ChanceMode::Rng { .. } => ChanceMode::Rng { seed: 123 ^ gid },
                         };
-                        *t = GameTask::new(gid, s, new_mode, mcts_cfg);
+                        *t = GameTask::new(
+                            gid,
+                            s,
+                            new_mode,
+                            yz_core::config::TemperatureSchedule::Constant { t0: 0.0 },
+                            mcts_cfg,
+                        );
                     }
                 }
                 Err(_) => terminal += 1,

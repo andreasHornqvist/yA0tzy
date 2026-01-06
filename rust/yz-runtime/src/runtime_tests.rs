@@ -77,6 +77,7 @@ fn scheduler_multiplexes_many_games_without_deadlock() {
             i,
             state,
             ChanceMode::Rng { seed: 1234 ^ i },
+            yz_core::config::TemperatureSchedule::Constant { t0: 0.0 },
             mcts_cfg,
         ));
     }
@@ -142,6 +143,7 @@ fn scheduler_writes_ndjson_iteration_and_root_logs() {
             i,
             state,
             ChanceMode::Rng { seed: 1234 ^ i },
+            yz_core::config::TemperatureSchedule::Constant { t0: 0.0 },
             mcts_cfg,
         ));
     }

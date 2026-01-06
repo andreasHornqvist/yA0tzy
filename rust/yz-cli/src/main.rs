@@ -397,6 +397,7 @@ OPTIONS:
             yz_mcts::ChanceMode::Rng {
                 seed: seed_base ^ (0xBADC0DE ^ game_id),
             },
+            cfg.mcts.temperature_schedule.clone(),
             mcts_cfg,
         ));
     }
@@ -514,6 +515,7 @@ OPTIONS:
                     yz_mcts::ChanceMode::Rng {
                         seed: seed_base ^ (0xBADC0DE ^ game_id),
                     },
+                    cfg.mcts.temperature_schedule.clone(),
                     mcts_cfg,
                 );
             }
@@ -824,6 +826,7 @@ OPTIONS:
             yz_mcts::ChanceMode::Rng {
                 seed: 0xBADC0DE ^ gid,
             },
+            cfg.mcts.temperature_schedule.clone(),
             mcts_cfg,
         ));
     }
@@ -893,6 +896,7 @@ OPTIONS:
                     yz_mcts::ChanceMode::Rng {
                         seed: 0xBADC0DE ^ next_game_id,
                     },
+                    cfg.mcts.temperature_schedule.clone(),
                     mcts_cfg,
                 );
                 next_game_id += 1;

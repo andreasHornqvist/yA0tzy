@@ -3,6 +3,10 @@ use yz_core::{apply_action, index_to_action, is_terminal, legal_action_mask, Gam
 use yz_features::schema::F;
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchDriver};
 use yz_replay::ReplaySample;
+use yz_core::config::TemperatureSchedule;
+use rand::Rng;
+use rand_chacha::ChaCha8Rng;
+use rand_core::SeedableRng;
 
 #[derive(Debug, Error)]
 pub enum GameTaskError {
@@ -61,6 +65,7 @@ pub struct GameTask {
     pub ply: u32,
     pub state: GameState,
     pub mode: ChanceMode,
+    pub temperature_schedule: TemperatureSchedule,
 
     mcts: Mcts,
     search: Option<SearchDriver>,
@@ -68,17 +73,68 @@ pub struct GameTask {
 }
 
 impl GameTask {
-    pub fn new(game_id: u64, state: GameState, mode: ChanceMode, mcts_cfg: MctsConfig) -> Self {
+    pub fn new(
+        game_id: u64,
+        state: GameState,
+        mode: ChanceMode,
+        temperature_schedule: TemperatureSchedule,
+        mcts_cfg: MctsConfig,
+    ) -> Self {
         let mcts = Mcts::new(mcts_cfg).expect("valid mcts cfg");
         Self {
             game_id,
             ply: 0,
             state,
             mode,
+            temperature_schedule,
             mcts,
             search: None,
             traj: Vec::new(),
         }
+    }
+
+    fn temperature_for_ply(&self) -> f32 {
+        match self.temperature_schedule {
+            TemperatureSchedule::Constant { t0 } => t0,
+            TemperatureSchedule::Step { t0, t1, cutoff_ply } => {
+                if self.ply < cutoff_ply {
+                    t0
+                } else {
+                    t1
+                }
+            }
+        }
+    }
+
+    fn sample_exec_action(&self, exec_pi: &[f32; yz_core::A]) -> u8 {
+        // Deterministic per-game/per-ply sampling: seed derived from game mode + ply.
+        let base: u64 = match self.mode {
+            ChanceMode::Deterministic { episode_seed } => episode_seed,
+            ChanceMode::Rng { seed } => seed,
+        };
+        let seed = base ^ (self.ply as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1E7_C437_9E37_79B9;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let r: f32 = rng.gen::<f32>(); // [0,1)
+        let mut acc = 0.0f32;
+        for (i, &p) in exec_pi.iter().enumerate() {
+            if p <= 0.0 {
+                continue;
+            }
+            acc += p;
+            if r <= acc {
+                return i as u8;
+            }
+        }
+        // Numeric edge case: fallback to argmax.
+        let mut best_i: usize = 0;
+        let mut best_v: f32 = f32::NEG_INFINITY;
+        for (i, &p) in exec_pi.iter().enumerate() {
+            if p > best_v {
+                best_v = p;
+                best_i = i;
+            }
+        }
+        best_i as u8
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -115,14 +171,25 @@ impl GameTask {
             let res = search.tick(&mut self.mcts, backend, max_work);
             work_done = max_work;
             if let Some(sr) = res {
-                // Choose executed action (v1: greedy argmax of pi).
-                let (best_a, _best_p) = sr
-                    .pi
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .unwrap();
-                let chosen_action = best_a as u8;
+                // Choose executed action using temperature schedule (PRD §7.3).
+                // NOTE: this does NOT change the stored replay `pi` target (visit distribution).
+                let legal_b = legal_action_mask(
+                    self.state.players[self.state.player_to_move as usize].avail_mask,
+                    self.state.rerolls_left,
+                );
+                let t = self.temperature_for_ply();
+                let exec_pi = yz_mcts::apply_temperature(&sr.pi, legal_b, t);
+                let chosen_action = if t == 0.0 {
+                    // apply_temperature already returns a one-hot distribution in this case.
+                    exec_pi
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as u8)
+                        .unwrap_or(0)
+                } else {
+                    self.sample_exec_action(&exec_pi)
+                };
                 let action = index_to_action(chosen_action);
                 let pi = sr.pi;
                 let search = SearchSummary {
@@ -148,10 +215,6 @@ impl GameTask {
 
                 // Emit replay sample (features/legal/pi) before state transition, z assigned at terminal.
                 let feats = yz_features::encode_state_v1(&self.state);
-                let legal_b = legal_action_mask(
-                    self.state.players[self.state.player_to_move as usize].avail_mask,
-                    self.state.rerolls_left,
-                );
                 let legal = yz_core::legal_mask_to_u8_array(legal_b);
                 self.traj.push(PendingSample {
                     features: feats,
