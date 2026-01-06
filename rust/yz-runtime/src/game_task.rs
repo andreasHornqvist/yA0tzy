@@ -1,5 +1,5 @@
 use thiserror::Error;
-use yz_core::{apply_action, index_to_action, is_terminal, legal_action_mask, GameState};
+use yz_core::{apply_action, index_to_action, is_terminal, GameState};
 use yz_features::schema::F;
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchDriver};
 use yz_replay::ReplaySample;
@@ -173,10 +173,7 @@ impl GameTask {
             if let Some(sr) = res {
                 // Choose executed action using temperature schedule (PRD §7.3).
                 // NOTE: this does NOT change the stored replay `pi` target (visit distribution).
-                let legal_b = legal_action_mask(
-                    self.state.players[self.state.player_to_move as usize].avail_mask,
-                    self.state.rerolls_left,
-                );
+                let legal_b = yz_mcts::legal_action_mask_for_mode(&self.state, self.mode);
                 let t = self.temperature_for_ply();
                 let exec_pi = yz_mcts::apply_temperature(&sr.pi, legal_b, t);
                 let chosen_action = if t == 0.0 {

@@ -1,5 +1,5 @@
 use crate::{apply_temperature, ChanceMode, InferBackend, Mcts, MctsConfig, UniformInference};
-use yz_core::{LegalMask, A};
+use yz_core::{GameState, LegalMask, PlayerState, A, FULL_MASK};
 use yz_infer::ClientOptions;
 
 struct BadInference;
@@ -341,4 +341,70 @@ fn virtual_loss_reduces_pending_collisions() {
         r0.stats.pending_collisions,
         r1.stats.pending_collisions
     );
+}
+
+#[test]
+fn keepmask_canonicalization_no_duplicates_keeps_all_masks_in_rng() {
+    // No duplicates => all KeepMask(0..=30) remain legal in self-play mode.
+    let s = GameState {
+        players: [
+            PlayerState {
+                avail_mask: FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+            PlayerState {
+                avail_mask: FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+        ],
+        dice_sorted: [1, 2, 3, 4, 6],
+        rerolls_left: 2,
+        player_to_move: 0,
+    };
+
+    let legal = crate::legal_action_mask_for_mode(&s, ChanceMode::Rng { seed: 123 });
+    for mask in 0u8..=30u8 {
+        assert!(
+            ((legal >> (mask as u64)) & 1) != 0,
+            "expected KeepMask({mask}) to be legal for no-duplicate dice"
+        );
+    }
+    // KeepMask(31) is always illegal (dominated).
+    assert!(((legal >> 31) & 1) == 0);
+}
+
+#[test]
+fn keepmask_canonicalization_duplicates_prunes_equivalents_in_rng_only() {
+    let s = GameState {
+        players: [
+            PlayerState {
+                avail_mask: FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+            PlayerState {
+                avail_mask: FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+        ],
+        dice_sorted: [1, 1, 3, 4, 6],
+        rerolls_left: 2,
+        player_to_move: 0,
+    };
+
+    // Rng mode prunes redundant KeepMasks (keep the rightmost duplicate).
+    let legal_rng = crate::legal_action_mask_for_mode(&s, ChanceMode::Rng { seed: 123 });
+    // Keeping exactly one of the two '1's has two index-masks: 0b10000 (idx 16) and 0b01000 (idx 8).
+    // Canonicalization keeps the rightmost occurrence => idx 8 stays, idx 16 is pruned.
+    assert!(((legal_rng >> 8) & 1) != 0);
+    assert!(((legal_rng >> 16) & 1) == 0);
+
+    // Deterministic mode leaves legality unchanged (both are legal).
+    let legal_det =
+        crate::legal_action_mask_for_mode(&s, ChanceMode::Deterministic { episode_seed: 1 });
+    assert!(((legal_det >> 8) & 1) != 0);
+    assert!(((legal_det >> 16) & 1) != 0);
 }

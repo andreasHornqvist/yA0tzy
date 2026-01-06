@@ -16,7 +16,8 @@ pub mod state_key;
 pub use infer::{Inference, UniformInference};
 pub use infer_client::{InferBackend, InferBackendError};
 pub use mcts::{
-    apply_temperature, ChanceMode, Mcts, MctsConfig, SearchDriver, SearchResult, SearchStats,
+    apply_temperature, legal_action_mask_for_mode, ChanceMode, Mcts, MctsConfig, SearchDriver,
+    SearchResult, SearchStats,
 };
 
 #[cfg(feature = "bench")]

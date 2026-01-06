@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use thiserror::Error;
-use yz_core::{index_to_action, legal_action_mask, GameState, LegalMask, A};
+use yz_core::{index_to_action, GameState, LegalMask, A};
 
 // region agent log
 #[inline]
@@ -104,6 +104,104 @@ pub enum ChanceMode {
     Rng { seed: u64 },
     /// Eval/gating style: deterministic event-keyed chance stream (PRD §6.1).
     Deterministic { episode_seed: u64 },
+}
+
+// --- KeepMask symmetry canonicalization (self-play only) ---------------------
+//
+// Motivation: KeepMask actions are position masks over `dice_sorted`. When dice contain duplicates,
+// multiple masks are semantically equivalent (keep the same multiset) but occupy different action
+// indices. This inflates branching and injects policy-target noise. We prune redundant KeepMasks
+// only in self-play (ChanceMode::Rng), preserving eval/gating behavior and the oracle action space.
+
+const KEEP_MASK_ACTIONS_MASK: u64 = (1u64 << 32) - 1; // actions 0..31
+const ALL_ACTIONS_MASK: u64 = (1u64 << 47) - 1; // actions 0..46
+const MARK_ACTIONS_MASK: u64 = ALL_ACTIONS_MASK ^ KEEP_MASK_ACTIONS_MASK; // actions 32..46
+
+#[inline]
+fn dice_key(dice_sorted: [u8; 5]) -> u32 {
+    // dice are in 1..=6, fit in 3 bits each.
+    (dice_sorted[0] as u32)
+        | ((dice_sorted[1] as u32) << 3)
+        | ((dice_sorted[2] as u32) << 6)
+        | ((dice_sorted[3] as u32) << 9)
+        | ((dice_sorted[4] as u32) << 12)
+}
+
+#[inline]
+fn canonicalize_keepmask(dice_sorted: [u8; 5], mask: u8) -> u8 {
+    debug_assert!(dice_sorted.windows(2).all(|w| w[0] <= w[1]));
+    debug_assert!(mask < 32);
+
+    // Count kept faces.
+    let mut need = [0u8; 6];
+    for i in 0..5usize {
+        let bit = 1u8 << (4 - i);
+        if (mask & bit) != 0 {
+            let face = dice_sorted[i] as usize;
+            debug_assert!((1..=6).contains(&face));
+            need[face - 1] = need[face - 1].saturating_add(1);
+        }
+    }
+
+    // Reconstruct canonical mask by keeping the rightmost occurrences for each face.
+    let mut out: u8 = 0;
+    for i in (0..5usize).rev() {
+        let bit = 1u8 << (4 - i);
+        let face = dice_sorted[i] as usize;
+        let slot = face - 1;
+        if need[slot] > 0 {
+            need[slot] -= 1;
+            out |= bit;
+        }
+    }
+    out
+}
+
+fn allowed_canonical_keepmask_bits(dice_sorted: [u8; 5]) -> u32 {
+    static MAP: OnceLock<FxHashMap<u32, u32>> = OnceLock::new();
+    let m = MAP.get_or_init(|| {
+        let mut out: FxHashMap<u32, u32> = FxHashMap::default();
+        // Enumerate all sorted dice multisets (252 combos).
+        for a in 1u8..=6 {
+            for b in a..=6 {
+                for c in b..=6 {
+                    for d in c..=6 {
+                        for e in d..=6 {
+                            let dice = [a, b, c, d, e];
+                            let mut bits: u32 = 0;
+                            // KeepMask(31) is illegal (dominated); only consider 0..=30.
+                            for mask in 0u8..=30u8 {
+                                if canonicalize_keepmask(dice, mask) == mask {
+                                    bits |= 1u32 << (mask as u32);
+                                }
+                            }
+                            out.insert(dice_key(dice), bits);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    });
+    *m.get(&dice_key(dice_sorted)).unwrap_or(&0)
+}
+
+/// Legal action mask, with KeepMask symmetry pruning in self-play mode only.
+pub fn legal_action_mask_for_mode(state: &GameState, mode: ChanceMode) -> LegalMask {
+    let base = yz_core::legal_action_mask(
+        state.players[state.player_to_move as usize].avail_mask,
+        state.rerolls_left,
+    );
+    if state.rerolls_left == 0 {
+        return base;
+    }
+    if !matches!(mode, ChanceMode::Rng { .. }) {
+        return base;
+    }
+    let allowed = allowed_canonical_keepmask_bits(state.dice_sorted) as u64;
+    let keep = (base & KEEP_MASK_ACTIONS_MASK) & allowed;
+    let marks = base & MARK_ACTIONS_MASK;
+    keep | marks
 }
 
 #[derive(Clone, Copy)]
@@ -269,7 +367,7 @@ impl Mcts {
 
         // Expand root immediately (priors available for PUCT).
         let (raw_priors, _v_root, used_fallback_priors) =
-            self.expand_node(root_id, &root_state, infer);
+            self.expand_node(root_id, &root_state, mode, infer);
         if used_fallback_priors {
             self.force_uniform_root_pi = true;
         }
@@ -281,10 +379,7 @@ impl Mcts {
         if let ChanceMode::Rng { seed } = mode {
             // Use a deterministic PRNG derived from the episode seed for noise itself.
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xD1E7_C437_9E37_79B9u64);
-            let legal = legal_action_mask(
-                root_state.players[root_state.player_to_move as usize].avail_mask,
-                root_state.rerolls_left,
-            );
+            let legal = legal_action_mask_for_mode(&root_state, mode);
             if self.cfg.dirichlet_epsilon > 0.0 {
                 let noisy = apply_root_dirichlet_noise(
                     &raw_priors,
@@ -338,10 +433,7 @@ impl Mcts {
             }
 
             if let Some(pe) = pending.pop_front() {
-                let legal = legal_action_mask(
-                    pe.leaf_state.players[pe.leaf_state.player_to_move as usize].avail_mask,
-                    pe.leaf_state.rerolls_left,
-                );
+                let legal = legal_action_mask_for_mode(&pe.leaf_state, mode);
                 let features = yz_features::encode_state_v1(&pe.leaf_state);
                 let (logits, v) = infer.eval(&features, legal);
                 let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
@@ -357,7 +449,7 @@ impl Mcts {
             }
         }
 
-        let (pi, root_value) = self.root_pi_value(root_id, &root_state);
+        let (pi, root_value) = self.root_pi_value(root_id, &root_state, mode);
 
         SearchResult {
             pi,
@@ -416,10 +508,7 @@ impl Mcts {
         let root_id = self.arena.push(Node::new(root_state.player_to_move));
         self.stats.node_count = self.arena.len();
 
-        let legal = legal_action_mask(
-            root_state.players[root_state.player_to_move as usize].avail_mask,
-            root_state.rerolls_left,
-        );
+        let legal = legal_action_mask_for_mode(&root_state, mode);
         let root_ticket = backend.submit(&root_state, legal).ok(); // if submit fails, we'll fallback in tick()
 
         SearchDriver {
@@ -479,10 +568,7 @@ impl Mcts {
                 return LeafSelection::Pending(pe);
             }
 
-            let legal = legal_action_mask(
-                state.players[state.player_to_move as usize].avail_mask,
-                state.rerolls_left,
-            );
+            let legal = legal_action_mask_for_mode(&state, mode);
             let a_idx = self.select_action(node_id, legal, mode) as usize;
             let action = index_to_action(a_idx as u8);
             let next_state = match yz_core::apply_action(state, action, ctx) {
@@ -541,12 +627,10 @@ impl Mcts {
         &mut self,
         node_id: NodeId,
         state: &GameState,
+        mode: ChanceMode,
         infer: &impl Inference,
     ) -> ([f32; A], f32, bool) {
-        let legal = legal_action_mask(
-            state.players[state.player_to_move as usize].avail_mask,
-            state.rerolls_left,
-        );
+        let legal = legal_action_mask_for_mode(state, mode);
         let features = yz_features::encode_state_v1(state);
         let (logits, v) = infer.eval(&features, legal);
 
@@ -566,12 +650,10 @@ impl Mcts {
         leaf_node: NodeId,
         leaf_state: &GameState,
         path: &[(NodeId, usize, u8, u8)],
+        mode: ChanceMode,
         resp: yz_infer::protocol::InferResponseV1,
     ) {
-        let legal = legal_action_mask(
-            leaf_state.players[leaf_state.player_to_move as usize].avail_mask,
-            leaf_state.rerolls_left,
-        );
+        let legal = legal_action_mask_for_mode(leaf_state, mode);
         let logits = vec_logits_to_array(&resp.policy_logits);
         let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
 
@@ -650,12 +732,9 @@ impl Mcts {
         }
     }
 
-    fn root_pi_value(&self, root_id: NodeId, state: &GameState) -> ([f32; A], f32) {
+    fn root_pi_value(&self, root_id: NodeId, state: &GameState, mode: ChanceMode) -> ([f32; A], f32) {
         let root = self.arena.get(root_id);
-        let legal = legal_action_mask(
-            state.players[state.player_to_move as usize].avail_mask,
-            state.rerolls_left,
-        );
+        let legal = legal_action_mask_for_mode(state, mode);
 
         if self.force_uniform_root_pi {
             // Guardrail: if priors were invalid at root (fallback), return uniform-over-legal `pi`.
@@ -926,10 +1005,7 @@ impl SearchDriver {
                         // endregion agent log
                     }
                     LeafSelection::Pending(pe) => {
-                        let legal = legal_action_mask(
-                            pe.leaf_state.players[pe.leaf_state.player_to_move as usize].avail_mask,
-                            pe.leaf_state.rerolls_left,
-                        );
+                        let legal = legal_action_mask_for_mode(&pe.leaf_state, self.mode);
                         let ticket = match backend.submit(&pe.leaf_state, legal) {
                             Ok(t) => t,
                             Err(_) => {
@@ -990,7 +1066,13 @@ impl SearchDriver {
                 let pe = self.pending.pop_front().expect("pending non-empty");
                 match pe.ticket.try_recv() {
                     Ok(Some(resp)) => {
-                        mcts.apply_infer_response(pe.leaf_node, &pe.leaf_state, &pe.path, resp);
+                        mcts.apply_infer_response(
+                            pe.leaf_node,
+                            &pe.leaf_state,
+                            &pe.path,
+                            self.mode,
+                            resp,
+                        );
                         self.completed += 1;
                         processed = true;
                         // region agent log
@@ -1059,10 +1141,7 @@ impl SearchDriver {
 
     fn poll_root(&mut self, mcts: &mut Mcts) -> bool {
         // If root submit failed, fallback to uniform priors and proceed.
-        let legal = legal_action_mask(
-            self.root_state.players[self.root_state.player_to_move as usize].avail_mask,
-            self.root_state.rerolls_left,
-        );
+        let legal = legal_action_mask_for_mode(&self.root_state, self.mode);
 
         let Some(ticket) = &self.root_ticket else {
             mcts.stats.fallbacks += 1;
@@ -1131,7 +1210,7 @@ impl SearchDriver {
     }
 
     fn finish(&self, mcts: &Mcts) -> SearchResult {
-        let (pi, root_value) = mcts.root_pi_value(self.root_id, &self.root_state);
+        let (pi, root_value) = mcts.root_pi_value(self.root_id, &self.root_state, self.mode);
         SearchResult {
             pi,
             root_value,
