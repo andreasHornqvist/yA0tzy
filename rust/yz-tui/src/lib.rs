@@ -126,6 +126,18 @@ struct LearnSummaryNdjsonV1 {
     #[serde(default)]
     pi_entropy_gap_mean: Option<f64>,
 
+    // Illegal-mass diagnostics (fractions in [0,1]).
+    // - pi_illegal_*: mass in the *replay target* pi on illegal actions (before trainer masking)
+    // - p_illegal_*: mass in the *model policy* on illegal actions
+    #[serde(default)]
+    pi_illegal_mass_mean: Option<f64>,
+    #[serde(default)]
+    pi_illegal_mass_p95: Option<f64>,
+    #[serde(default)]
+    p_illegal_mass_mean: Option<f64>,
+    #[serde(default)]
+    p_illegal_mass_p95: Option<f64>,
+
     // Calibration bins (for a tiny reliability diagram).
     #[serde(default)]
     calibration_bins: Option<Vec<LearnCalibBinV1>>,
@@ -2211,13 +2223,13 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
         },
         0,
     );
-    let pi_kl = carry_series(
+    let top1_p95 = carry_series(
         max_iter,
         |i| {
             app.learn_by_iter
                 .get(&(i as u32))
-                .and_then(|x| x.pi_kl_mean)
-                .map(|v| (v.max(0.0) * 1000.0) as u64)
+                .and_then(|x| x.pi_top1_p95)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
         },
         0,
     );
@@ -2250,8 +2262,8 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
     );
     f.render_widget(
         Sparkline::default()
-            .block(Block::default().title("pi KL mean").borders(Borders::ALL))
-            .data(&pi_kl),
+            .block(Block::default().title("top1 p95 (target)").borders(Borders::ALL))
+            .data(&top1_p95),
         left[1],
     );
     f.render_widget(
@@ -2282,25 +2294,29 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
     const W_WR: usize = 7;
     const W_STALE: usize = 7;
     const W_PI: usize = 5;
+    const W_TOP1: usize = 5;
     const W_KL: usize = 5;
     const W_OVR: usize = 5;
     const W_VMEAN: usize = 5;
     const W_ECE: usize = 5;
+    const W_ILL: usize = 5;
     const W_SPS: usize = 6;
     const W_MPS: usize = 6;
 
     lines.push(Line::from(Span::styled(
         format!(
-            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {sps:>W_SPS$}  {mps:>W_MPS$}",
+            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {top1:>W_TOP1$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {ill:>W_ILL$}  {sps:>W_SPS$}  {mps:>W_MPS$}",
             idx = "Iter",
             dec = "Decision",
             wr = "WinRate",
             stale = "Stale95",
             pi = "PiEnt",
+            top1 = "Top1%",
             kl = "KL",
             ovr = "Ovr%",
             vmean = "Vmean",
             ece = "ECE",
+            ill = "Ill%",
             sps = "Samp/s",
             mps = "Move/s",
         ),
@@ -2357,10 +2373,12 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 let ss = app.selfplay_by_iter.get(&it.idx);
                 let stale95 = fmt_opt_u0(ls.and_then(|x| x.age_wall_s_p95), W_STALE);
                 let pi_ent = fmt_opt_f64(ls.and_then(|x| x.pi_entropy_mean), W_PI, 2);
+                let top1 = fmt_opt_pct(ls.and_then(|x| x.pi_top1_p95), W_TOP1);
                 let kl = fmt_opt_f64(ls.and_then(|x| x.pi_kl_mean), W_KL, 2);
                 let ovr = fmt_opt_pct(ss.and_then(|x| x.prior_argmax_overturn_rate), W_OVR);
                 let vmean = fmt_opt_f64(ls.and_then(|x| x.v_pred_mean), W_VMEAN, 2);
                 let ece = fmt_opt_f64(ls.and_then(|x| x.ece), W_ECE, 3);
+                let ill = fmt_opt_pct(ls.and_then(|x| x.p_illegal_mass_mean), W_ILL);
                 let sps = fmt_opt_u0(ls.and_then(|x| x.samples_s_mean), W_SPS);
                 let mps = fmt_opt_u0(ss.and_then(|x| x.moves_s_mean), W_MPS);
 
@@ -2410,13 +2428,15 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 }
                 rows.push(Line::from(Span::styled(
                     format!(
-                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {kl}  {ovr}  {vmean}  {ece}  {sps}  {mps}",
+                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {top1}  {kl}  {ovr}  {vmean}  {ece}  {ill}  {sps}  {mps}",
                         idx = it.idx,
                         dec = promo,
                         stale = stale95,
                         pi = pi_ent,
+                        top1 = top1,
                         kl = kl,
                         ovr = ovr,
+                        ill = ill,
                     ),
                     row_style,
                 )));
@@ -2444,6 +2464,12 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 if let Some(v) = ss.moves_s_mean {
                     detail.push(Line::from(format!("selfplay: {v:.0} moves/s")));
                 }
+                if let Some(v) = ss.pi_max_p_p95 {
+                    detail.push(Line::from(format!(
+                        "max_p95_visit: {:.1}%",
+                        v.clamp(0.0, 1.0) * 100.0
+                    )));
+                }
                 if let Some(v) = ss.prior_argmax_overturn_rate {
                     detail.push(Line::from(format!("overturn: {:.0}%", v * 100.0)));
                 }
@@ -2463,6 +2489,24 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 }
                 if let Some(v) = ls.pi_entropy_mean {
                     detail.push(Line::from(format!("pi_ent_tgt: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_top1_p95 {
+                    detail.push(Line::from(format!("top1_p95_tgt: {:.1}%", v.clamp(0.0, 1.0) * 100.0)));
+                }
+                if let Some(v) = ls.pi_eff_actions_p50 {
+                    detail.push(Line::from(format!("effA_p50_tgt: {v:.1}")));
+                }
+                if let Some(v) = ls.pi_illegal_mass_mean {
+                    detail.push(Line::from(format!(
+                        "pi_illegal_tgt: {:.2}%",
+                        v.clamp(0.0, 1.0) * 100.0
+                    )));
+                }
+                if let Some(v) = ls.p_illegal_mass_mean {
+                    detail.push(Line::from(format!(
+                        "p_illegal_model: {:.2}%",
+                        v.clamp(0.0, 1.0) * 100.0
+                    )));
                 }
                 if let Some(v) = ls.pi_model_entropy_mean {
                     detail.push(Line::from(format!("pi_ent_model: {v:.3}")));

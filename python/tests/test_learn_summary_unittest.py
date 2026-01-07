@@ -32,6 +32,13 @@ class TestLearnSummaryHelpers(unittest.TestCase):
             ],
             dtype=torch.float32,
         )
+        legal = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 1.0],  # action 1 illegal
+                [1.0, 1.0, 1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
         v = torch.tensor([-1.0, 1.0], dtype=torch.float32)
         z = torch.tensor([-1.0, 1.0], dtype=torch.float32)
         # Dummy model log-probs (log softmax output), normalized distributions.
@@ -43,9 +50,10 @@ class TestLearnSummaryHelpers(unittest.TestCase):
             dtype=torch.float32,
         )
         logp = torch.log(p_model.clamp_min(1e-12))
+        pi_illegal_mass = (pi * (1.0 - legal)).sum(dim=1)
 
         agg.record_step_ms(10.0)
-        agg.update_batch(pi=pi, v_pred=v, z=z, logp=logp)
+        agg.update_batch(pi=pi, v_pred=v, z=z, logp=logp, pi_illegal_mass=pi_illegal_mass, legal=legal)
         out = agg.finalize()
 
         # Has core keys.
@@ -55,6 +63,8 @@ class TestLearnSummaryHelpers(unittest.TestCase):
         self.assertIn("pi_model_entropy_mean", out)
         self.assertIn("pi_kl_mean", out)
         self.assertIn("pi_entropy_gap_mean", out)
+        self.assertIn("pi_illegal_mass_mean", out)
+        self.assertIn("p_illegal_mass_mean", out)
         self.assertIn("v_pred_mean", out)
         self.assertIn("v_pred_sat_frac", out)
         self.assertIn("calibration_bins", out)

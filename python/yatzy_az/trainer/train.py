@@ -530,6 +530,16 @@ class _LearnSummaryAgg:
         self.pi_kl_sum: float = 0.0
         self.pi_kl_n: int = 0
 
+        # Illegal-mass diagnostics (per-sample).
+        # - pi_illegal_*: illegal mass in the replay target pi BEFORE masking (data quality)
+        # - p_illegal_*: illegal mass in the model policy distribution (should be ~0 if model respects legality)
+        self.pi_illegal = _Reservoir(20_000, seed=seed ^ 0x111111)
+        self.p_illegal = _Reservoir(20_000, seed=seed ^ 0x222222)
+        self.pi_illegal_sum: float = 0.0
+        self.pi_illegal_n: int = 0
+        self.p_illegal_sum: float = 0.0
+        self.p_illegal_n: int = 0
+
         # Value prediction metrics (per-sample).
         self.v_res = _Reservoir(20_000, seed=seed ^ 0x515151)
         self.v_sum: float = 0.0
@@ -546,7 +556,7 @@ class _LearnSummaryAgg:
     def record_step_ms(self, dt_ms: float) -> None:
         self.step_ms.append(float(dt_ms))
 
-    def update_batch(self, *, pi, v_pred, z, logp=None) -> None:
+    def update_batch(self, *, pi, v_pred, z, logp=None, pi_illegal_mass=None, legal=None) -> None:
         """Update from torch tensors (on any device)."""
         import torch
 
@@ -581,6 +591,24 @@ class _LearnSummaryAgg:
                 self.pi_model_entropy_n += int(ent_model.numel())
                 self.pi_kl_sum += float(kl.sum().item())
                 self.pi_kl_n += int(kl.numel())
+
+                # Model illegal mass (requires legal mask).
+                if legal is not None:
+                    legal_f = legal.to(dtype=torch.float32)
+                    illegal_f = (1.0 - legal_f).clamp(0.0, 1.0)
+                    p_illegal = (p_model * illegal_f).sum(dim=1)  # [B]
+                    p_illegal_cpu = p_illegal.detach().float().cpu().tolist()
+                    self.p_illegal.add_many(p_illegal_cpu)
+                    self.p_illegal_sum += float(p_illegal.sum().item())
+                    self.p_illegal_n += int(p_illegal.numel())
+
+            # Target illegal mass (from replay, before masking).
+            if pi_illegal_mass is not None:
+                pim = pi_illegal_mass.detach().float().cpu()
+                pim_list = pim.tolist()
+                self.pi_illegal.add_many([float(x) for x in pim_list])
+                self.pi_illegal_sum += float(pim.sum().item())
+                self.pi_illegal_n += int(pim.numel())
 
             v = v_pred.detach().float().cpu()
             zc = z.detach().float().cpu()
@@ -649,6 +677,16 @@ class _LearnSummaryAgg:
                 (self.pi_entropy_sum / float(max(1, self.pi_entropy_n)))
                 - (self.pi_model_entropy_sum / float(max(1, self.pi_model_entropy_n)))
             )
+
+        # Illegal mass diagnostics (optional).
+        if self.pi_illegal_n > 0:
+            out["pi_illegal_mass_mean"] = float(self.pi_illegal_sum / float(max(1, self.pi_illegal_n)))
+            (_p50, p95) = self.pi_illegal.percentiles([0.50, 0.95])
+            out["pi_illegal_mass_p95"] = float(p95)
+        if self.p_illegal_n > 0:
+            out["p_illegal_mass_mean"] = float(self.p_illegal_sum / float(max(1, self.p_illegal_n)))
+            (_p50, p95) = self.p_illegal.percentiles([0.50, 0.95])
+            out["p_illegal_mass_p95"] = float(p95)
 
         # Value stats.
         if self.v_n > 0:
@@ -1005,6 +1043,7 @@ def run_from_args(args: argparse.Namespace) -> int:
 
         # Safety: if pi has any mass on illegal, renormalize over legal to avoid NaNs.
         legal_f = legal.to(dtype=torch.float32)
+        pi_illegal_mass = (pi * (1.0 - legal_f).clamp(0.0, 1.0)).sum(dim=1)  # [B]
         pi = pi * legal_f
         pi_sum = pi.sum(dim=1, keepdim=True).clamp_min(1e-12)
         pi = pi / pi_sum
@@ -1024,7 +1063,7 @@ def run_from_args(args: argparse.Namespace) -> int:
 
         # Learning summary aggregates (low overhead: mostly tensor reductions + small reservoir).
         learn.record_step_ms((time.perf_counter() - t_step0) * 1000.0)
-        learn.update_batch(pi=pi, v_pred=v, z=z, logp=logp)
+        learn.update_batch(pi=pi, v_pred=v, z=z, logp=logp, pi_illegal_mass=pi_illegal_mass, legal=legal)
 
         if step % int(args.log_every) == 0 or step == 1:
             with torch.no_grad():

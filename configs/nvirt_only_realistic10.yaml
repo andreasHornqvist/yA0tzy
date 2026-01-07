@@ -1,0 +1,67 @@
+# Realistic 10-iteration run with virtual-loss mode = n_virtual_only.
+# Notes:
+# - Uses non-default infer bind/metrics port so it can run alongside other runs.
+
+inference:
+  bind: "unix:///tmp/yatzy_infer_nvirt_only.sock"
+  metrics_bind: "127.0.0.1:18081"
+  device: "cpu"
+  protocol_version: 2
+  legal_mask_bitset: false
+  max_batch: 32
+  max_wait_us: 1000
+  torch_threads: 6
+  torch_interop_threads: 2
+  debug_log: false
+  print_stats: false
+
+mcts:
+  c_puct: 1.5
+  budget_reroll: 400
+  budget_mark: 400
+  max_inflight_per_game: 8
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.25
+  temperature_schedule:
+    kind: step
+    t0: 1.0
+    t1: 0.01
+    cutoff_ply: 10
+  virtual_loss_mode: n_virtual_only
+  virtual_loss: 1.0
+
+selfplay:
+  games_per_iteration: 100
+  workers: 10
+  threads_per_worker: 2
+  root_sample_every_n: 10
+
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 10
+  steps_per_iteration: null
+  sample_mode: random_indexed
+  dataloader_workers: 0
+
+gating:
+  games: 100
+  seed: 0
+  seed_set_id: "dev_v1"
+  win_rate_threshold: 0.55
+  paired_seed_swap: true
+  deterministic_chance: true
+  threads_per_worker: null
+
+replay:
+  capacity_shards: 20
+
+controller:
+  total_iterations: 10
+
+model:
+  hidden_dim: 256
+  num_blocks: 2
+  kind: residual
+
