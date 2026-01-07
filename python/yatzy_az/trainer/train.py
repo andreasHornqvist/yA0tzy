@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -367,6 +369,386 @@ def _append_metrics_train_step(
         f.write(json.dumps(ev) + "\n")
 
 
+def _read_run_manifest_iter_idx(run_root: Path) -> int | None:
+    """Best-effort: current iteration index as tracked by the controller (0-based)."""
+    try:
+        run_json = Path(run_root) / "run.json"
+        if not run_json.exists():
+            return None
+        d = json.loads(run_json.read_text())
+        v = d.get("controller_iteration_idx", None)
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+def _weighted_quantile(values: list[float], weights: list[float], q: float) -> float:
+    """Weighted quantile for q in [0,1]."""
+    if not values or not weights or len(values) != len(weights):
+        return float("nan")
+    pairs = sorted(zip(values, weights), key=lambda t: t[0])
+    total = float(sum(w for _, w in pairs))
+    if total <= 0:
+        return float("nan")
+    target = q * total
+    acc = 0.0
+    for v, w in pairs:
+        acc += float(w)
+        if acc >= target:
+            return float(v)
+    return float(pairs[-1][0])
+
+
+def _parse_shard_idx(name: str) -> int | None:
+    # Expected: shard_{idx:06}.safetensors
+    try:
+        if not name.startswith("shard_"):
+            return None
+        rest = name[len("shard_") :]
+        rest = rest.split(".", 1)[0]
+        if not rest.isdigit():
+            return None
+        return int(rest)
+    except Exception:
+        return None
+
+
+def _snapshot_staleness_summary(
+    *, replay_dir: Path, snapshot: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Compute staleness from snapshot shard list using file mtimes + shard indices."""
+    if not isinstance(snapshot, dict):
+        return {}
+    shards = snapshot.get("shards", None)
+    if not isinstance(shards, list) or not shards:
+        return {}
+
+    now = time.time()
+    wall_ages: list[float] = []
+    wall_w: list[float] = []
+    idx_ages: list[float] = []
+    idx_w: list[float] = []
+
+    idxs: list[int] = []
+    for e in shards:
+        if not isinstance(e, dict):
+            continue
+        st_name = str(e.get("safetensors", ""))
+        n = float(e.get("num_samples", 0) or 0)
+        if not st_name or n <= 0:
+            continue
+        idx = _parse_shard_idx(st_name)
+        if idx is not None:
+            idxs.append(idx)
+        p = Path(replay_dir) / st_name
+        try:
+            mtime = float(p.stat().st_mtime)
+            wall_ages.append(max(0.0, now - mtime))
+            wall_w.append(n)
+        except Exception:
+            # Missing stat -> ignore.
+            pass
+
+    if idxs:
+        max_idx = max(idxs)
+        for e in shards:
+            if not isinstance(e, dict):
+                continue
+            st_name = str(e.get("safetensors", ""))
+            n = float(e.get("num_samples", 0) or 0)
+            if not st_name or n <= 0:
+                continue
+            idx = _parse_shard_idx(st_name)
+            if idx is None:
+                continue
+            idx_ages.append(float(max_idx - idx))
+            idx_w.append(n)
+
+    out: dict[str, Any] = {}
+    if wall_ages:
+        out["age_wall_s_p50"] = float(_weighted_quantile(wall_ages, wall_w, 0.50))
+        out["age_wall_s_p95"] = float(_weighted_quantile(wall_ages, wall_w, 0.95))
+    if idx_ages:
+        out["age_shard_idx_p50"] = float(_weighted_quantile(idx_ages, idx_w, 0.50))
+        out["age_shard_idx_p95"] = float(_weighted_quantile(idx_ages, idx_w, 0.95))
+    return out
+
+
+class _Reservoir:
+    """Small reservoir sampler for percentiles without storing all samples."""
+
+    def __init__(self, cap: int, *, seed: int = 0) -> None:
+        self.cap = int(cap)
+        self.rng = random.Random(int(seed))
+        self.n_seen: int = 0
+        self.buf: list[float] = []
+
+    def add_many(self, xs: list[float]) -> None:
+        for x in xs:
+            self.add(float(x))
+
+    def add(self, x: float) -> None:
+        self.n_seen += 1
+        if len(self.buf) < self.cap:
+            self.buf.append(float(x))
+            return
+        j = self.rng.randrange(self.n_seen)
+        if j < self.cap:
+            self.buf[j] = float(x)
+
+    def percentiles(self, ps: list[float]) -> list[float]:
+        if not self.buf:
+            return [float("nan") for _ in ps]
+        xs = sorted(self.buf)
+        out: list[float] = []
+        for p in ps:
+            p = float(p)
+            p = 0.0 if p < 0.0 else 1.0 if p > 1.0 else p
+            k = int(round(p * (len(xs) - 1)))
+            out.append(float(xs[k]))
+        return out
+
+
+class _LearnSummaryAgg:
+    def __init__(self, *, seed: int, bins: int = 9) -> None:
+        self.step_ms: list[float] = []
+
+        # Policy target metrics (per-sample).
+        self.pi_entropy = _Reservoir(20_000, seed=seed ^ 0xA11CE)
+        self.pi_top1 = _Reservoir(20_000, seed=seed ^ 0xBADC0DE)
+        self.pi_eff = _Reservoir(20_000, seed=seed ^ 0xC0FFEE)
+        self.pi_entropy_sum: float = 0.0
+        self.pi_entropy_n: int = 0
+
+        # Policy alignment metrics (per-sample): model entropy and KL(target || model).
+        self.pi_model_entropy = _Reservoir(20_000, seed=seed ^ 0xD15EA5E)
+        self.pi_kl = _Reservoir(20_000, seed=seed ^ 0xB16B00B5)
+        self.pi_model_entropy_sum: float = 0.0
+        self.pi_model_entropy_n: int = 0
+        self.pi_kl_sum: float = 0.0
+        self.pi_kl_n: int = 0
+
+        # Value prediction metrics (per-sample).
+        self.v_res = _Reservoir(20_000, seed=seed ^ 0x515151)
+        self.v_sum: float = 0.0
+        self.v_sum2: float = 0.0
+        self.v_n: int = 0
+        self.v_sat_n: int = 0
+
+        # Calibration bins over v_pred in [-1,1].
+        self.bins = int(bins)
+        self.bin_count = [0 for _ in range(self.bins)]
+        self.bin_sum_pred = [0.0 for _ in range(self.bins)]
+        self.bin_sum_z = [0.0 for _ in range(self.bins)]
+
+    def record_step_ms(self, dt_ms: float) -> None:
+        self.step_ms.append(float(dt_ms))
+
+    def update_batch(self, *, pi, v_pred, z, logp=None) -> None:
+        """Update from torch tensors (on any device)."""
+        import torch
+
+        with torch.no_grad():
+            # pi: [B,A] already normalized over legal
+            ent = -(pi * torch.log(pi.clamp_min(1e-12))).sum(dim=1)  # [B]
+            top1 = pi.max(dim=1).values  # [B]
+            eff = 1.0 / (pi.square().sum(dim=1).clamp_min(1e-12))  # [B]
+
+            ent_cpu = ent.detach().float().cpu().tolist()
+            top1_cpu = top1.detach().float().cpu().tolist()
+            eff_cpu = eff.detach().float().cpu().tolist()
+            self.pi_entropy.add_many(ent_cpu)
+            self.pi_top1.add_many(top1_cpu)
+            self.pi_eff.add_many(eff_cpu)
+            self.pi_entropy_sum += float(ent.sum().item())
+            self.pi_entropy_n += int(ent.numel())
+
+            # Optional policy alignment metrics (require model log-probs).
+            if logp is not None:
+                logp = logp.detach()
+                p_model = torch.exp(logp)
+                ent_model = -(p_model * logp).sum(dim=1)  # [B]
+                ce = -(pi * logp).sum(dim=1)  # [B]
+                kl = (ce - ent).clamp_min(0.0)  # [B]
+
+                entm_cpu = ent_model.detach().float().cpu().tolist()
+                kl_cpu = kl.detach().float().cpu().tolist()
+                self.pi_model_entropy.add_many(entm_cpu)
+                self.pi_kl.add_many(kl_cpu)
+                self.pi_model_entropy_sum += float(ent_model.sum().item())
+                self.pi_model_entropy_n += int(ent_model.numel())
+                self.pi_kl_sum += float(kl.sum().item())
+                self.pi_kl_n += int(kl.numel())
+
+            v = v_pred.detach().float().cpu()
+            zc = z.detach().float().cpu()
+            v_list = v.tolist()
+            self.v_res.add_many([float(x) for x in v_list])
+            self.v_sum += float(v.sum().item())
+            self.v_sum2 += float((v * v).sum().item())
+            self.v_n += int(v.numel())
+            self.v_sat_n += int((v.abs() > 0.9).sum().item())
+
+            # Calibration bins.
+            # Map v in [-1,1] to bins [0..bins-1].
+            # Use clamp to handle rare numerical drift beyond [-1,1].
+            vb = v.clamp(-1.0, 1.0)
+            idx = ((vb + 1.0) * 0.5 * float(self.bins)).floor().to(dtype=torch.int64)
+            idx = idx.clamp(0, self.bins - 1)
+            for i_bin in range(self.bins):
+                mask = idx == i_bin
+                c = int(mask.sum().item())
+                if c <= 0:
+                    continue
+                self.bin_count[i_bin] += c
+                self.bin_sum_pred[i_bin] += float(vb[mask].sum().item())
+                self.bin_sum_z[i_bin] += float(zc[mask].sum().item())
+
+    def finalize(self) -> dict[str, Any]:
+        import numpy as np
+
+        out: dict[str, Any] = {}
+
+        # Step time percentiles.
+        if self.step_ms:
+            xs = np.array(self.step_ms, dtype=np.float64)
+            out["step_ms_p50"] = float(np.percentile(xs, 50))
+            out["step_ms_p95"] = float(np.percentile(xs, 95))
+
+        # Policy stats.
+        out["pi_entropy_mean"] = (
+            float(self.pi_entropy_sum) / float(max(1, self.pi_entropy_n))
+        )
+        p50, p95 = self.pi_entropy.percentiles([0.50, 0.95])
+        out["pi_entropy_p50"] = float(p50)
+        out["pi_entropy_p95"] = float(p95)
+        t1, t2 = self.pi_top1.percentiles([0.50, 0.95])
+        out["pi_top1_p50"] = float(t1)
+        out["pi_top1_p95"] = float(t2)
+        e1, e2 = self.pi_eff.percentiles([0.50, 0.95])
+        out["pi_eff_actions_p50"] = float(e1)
+        out["pi_eff_actions_p95"] = float(e2)
+
+        # Policy alignment (optional; available when logp was provided).
+        if self.pi_model_entropy_n > 0:
+            out["pi_model_entropy_mean"] = float(
+                self.pi_model_entropy_sum / float(max(1, self.pi_model_entropy_n))
+            )
+            m50, m95 = self.pi_model_entropy.percentiles([0.50, 0.95])
+            out["pi_model_entropy_p50"] = float(m50)
+            out["pi_model_entropy_p95"] = float(m95)
+        if self.pi_kl_n > 0:
+            out["pi_kl_mean"] = float(self.pi_kl_sum / float(max(1, self.pi_kl_n)))
+            k50, k95 = self.pi_kl.percentiles([0.50, 0.95])
+            out["pi_kl_p50"] = float(k50)
+            out["pi_kl_p95"] = float(k95)
+        if self.pi_entropy_n > 0 and self.pi_model_entropy_n > 0:
+            out["pi_entropy_gap_mean"] = float(
+                (self.pi_entropy_sum / float(max(1, self.pi_entropy_n)))
+                - (self.pi_model_entropy_sum / float(max(1, self.pi_model_entropy_n)))
+            )
+
+        # Value stats.
+        if self.v_n > 0:
+            mu = self.v_sum / float(self.v_n)
+            var = self.v_sum2 / float(self.v_n) - mu * mu
+            out["v_pred_mean"] = float(mu)
+            out["v_pred_std"] = float(math.sqrt(max(0.0, var)))
+            out["v_pred_sat_frac"] = float(self.v_sat_n) / float(self.v_n)
+        p05, p50, p95 = self.v_res.percentiles([0.05, 0.50, 0.95])
+        out["v_pred_p05"] = float(p05)
+        out["v_pred_p50"] = float(p50)
+        out["v_pred_p95"] = float(p95)
+
+        # Calibration bins + ECE.
+        bins_out: list[dict[str, Any]] = []
+        total = float(sum(self.bin_count))
+        ece = 0.0
+        for i in range(self.bins):
+            c = int(self.bin_count[i])
+            if c <= 0:
+                bins_out.append({"count": 0, "mean_pred": None, "mean_z": None})
+                continue
+            mp = float(self.bin_sum_pred[i]) / float(c)
+            mz = float(self.bin_sum_z[i]) / float(c)
+            bins_out.append({"count": c, "mean_pred": mp, "mean_z": mz})
+            if total > 0:
+                ece += (float(c) / total) * abs(mp - mz)
+        out["calibration_bins"] = bins_out
+        out["ece"] = float(ece)
+        return out
+
+
+def _append_metrics_learn_summary(
+    *,
+    run_root: Path,
+    iter_idx: int | None,
+    snapshot_name: str | None,
+    total_samples: int | None,
+    batch_size: int,
+    steps_target: int,
+    steps_completed: int,
+    staleness: dict[str, Any],
+    agg: dict[str, Any],
+    train_wall_s: float | None,
+) -> None:
+    """Append one learn_summary metrics event to runs/<id>/logs/metrics.ndjson (best-effort)."""
+    run_root = Path(run_root)
+    if not (run_root / "run.json").exists():
+        return
+
+    logs_dir = run_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = logs_dir / "metrics.ndjson"
+
+    run_id = run_root.name
+    git_hash = None
+    config_snapshot = "config.yaml" if (run_root / "config.yaml").exists() else None
+    try:
+        from ..run_manifest import load_manifest
+
+        m = load_manifest(run_root)
+        run_id = str(m.get("run_id", run_id))
+        git_hash = m.get("git_hash")
+        config_snapshot = m.get("config_snapshot", config_snapshot)
+    except Exception:
+        pass
+
+    from ..replay_dataset import FEATURE_SCHEMA_ID, PROTOCOL_VERSION, RULESET_ID
+
+    samples_s = None
+    if train_wall_s is not None and train_wall_s > 0:
+        samples_s = float(batch_size) * float(steps_completed) / float(train_wall_s)
+
+    ev: dict[str, Any] = {
+        "event": "learn_summary",
+        "ts_ms": int(time.time() * 1000),
+        "run_id": run_id,
+        "v": {
+            "protocol_version": int(PROTOCOL_VERSION),
+            "feature_schema_id": int(FEATURE_SCHEMA_ID),
+            "action_space_id": "oracle_keepmask_v1",
+            "ruleset_id": str(RULESET_ID),
+        },
+        "git_hash": git_hash,
+        "config_snapshot": config_snapshot,
+        "iter_idx": None if iter_idx is None else int(iter_idx),
+        "snapshot": snapshot_name,
+        "total_samples": None if total_samples is None else int(total_samples),
+        "batch_size": int(batch_size),
+        "steps_target": int(steps_target),
+        "steps_completed": int(steps_completed),
+        "samples_s_mean": samples_s,
+    }
+    ev.update(staleness)
+    ev.update(agg)
+
+    with metrics_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
 def _update_run_manifest_train_scalars(
     *,
     run_root: Path,
@@ -606,7 +988,10 @@ def run_from_args(args: argparse.Namespace) -> int:
     it = iter(dl)
     last_log_t = time.perf_counter()
     last_log_step = start_step
+    learn = _LearnSummaryAgg(seed=int(args.seed))
+    t_train_start = time.perf_counter()
     for step in range(start_step + 1, start_step + int(steps_target) + 1):
+        t_step0 = time.perf_counter()
         try:
             x, legal, pi, z, _z_margin = next(it)
         except StopIteration:
@@ -636,6 +1021,10 @@ def run_from_args(args: argparse.Namespace) -> int:
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+
+        # Learning summary aggregates (low overhead: mostly tensor reductions + small reservoir).
+        learn.record_step_ms((time.perf_counter() - t_step0) * 1000.0)
+        learn.update_batch(pi=pi, v_pred=v, z=z, logp=logp)
 
         if step % int(args.log_every) == 0 or step == 1:
             with torch.no_grad():
@@ -676,6 +1065,28 @@ def run_from_args(args: argparse.Namespace) -> int:
                     steps_target=int(steps_target),
                     steps_completed=int(step),
                 )
+
+    # Emit one per-iteration learn_summary for the TUI learning dashboard (best-effort).
+    try:
+        iter_idx = _read_run_manifest_iter_idx(run_root)
+        staleness = _snapshot_staleness_summary(replay_dir=replay_dir, snapshot=snap)
+        train_wall_s = float(time.perf_counter() - t_train_start)
+        agg = learn.finalize()
+        _append_metrics_learn_summary(
+            run_root=run_root,
+            iter_idx=iter_idx,
+            snapshot_name=str(snapshot_path.name) if snapshot_path is not None else None,
+            total_samples=int(snap.get("total_samples")) if isinstance(snap, dict) else None,
+            batch_size=int(args.batch_size),
+            steps_target=int(steps_target),
+            steps_completed=int(steps_target),
+            staleness=staleness,
+            agg=agg,
+            train_wall_s=train_wall_s,
+        )
+    except Exception:
+        # Best-effort; training must not fail due to summary logging.
+        pass
 
     ckpt_path = out_dir / "candidate.pt"
     torch.save(

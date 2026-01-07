@@ -588,6 +588,8 @@ pub fn run_selfplay_then_gate(
         &ctrl,
         iter_idx,
     )?;
+    // Best-effort: merge worker-local selfplay summaries into unified metrics stream.
+    emit_selfplay_summary_metrics(run_dir, &cfg, &manifest, iter_idx);
 
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     // E13.2S4: Hot-reload best + candidate models before gating.
@@ -633,6 +635,8 @@ pub fn run_iteration(
         &ctrl,
         iter_idx,
     )?;
+    // Best-effort: merge worker-local selfplay summaries into unified metrics stream.
+    emit_selfplay_summary_metrics(run_dir, &cfg, &manifest, iter_idx);
 
     ctrl.set_phase(Phase::Train, "starting train")?;
     run_train_subprocess(run_dir, &cfg, python_exe, &ctrl, iter_idx)?;
@@ -754,6 +758,8 @@ pub fn spawn_iteration(
                     &ctrl,
                     iter_idx,
                 )?;
+                // Best-effort: merge worker-local selfplay summaries into unified metrics stream.
+                emit_selfplay_summary_metrics(&run_dir, &cfg, &manifest, iter_idx);
                 if ctrl.cancelled() {
                     let _ = ctrl.set_phase(Phase::Selfplay, "shutting down...");
                     return Err(ControllerError::Cancelled);
@@ -1114,6 +1120,224 @@ fn finalize_iteration(
     }
 
     Ok(())
+}
+
+fn hist_mean(h: &yz_logging::HistogramV1) -> Option<f64> {
+    let tot = h.total_count();
+    if tot == 0 || h.bins.is_empty() {
+        return None;
+    }
+    let n = h.bins.len() as f64;
+    let w = if h.hi > h.lo { (h.hi - h.lo) / n.max(1.0) } else { 0.0 };
+    if w <= 0.0 {
+        return h.quantile_estimate(0.5);
+    }
+    let mut acc = 0.0f64;
+    for (i, &c) in h.bins.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let x0 = h.lo + (i as f64) * w;
+        let x1 = (x0 + w).min(h.hi);
+        let mid = (x0 + x1) * 0.5;
+        acc += (c as f64) * mid;
+    }
+    Some(acc / (tot as f64))
+}
+
+/// Best-effort: merge worker-local selfplay summaries and emit one per-iteration metrics event.
+fn emit_selfplay_summary_metrics(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    manifest: &yz_logging::RunManifestV1,
+    iter_idx: u32,
+) {
+    let logs_workers = run_dir.join("logs_workers");
+    let rd = match std::fs::read_dir(&logs_workers) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    let mut summaries: Vec<yz_logging::SelfplayWorkerSummaryV1> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let f = p.join("selfplay_worker_summary.json");
+        let Ok(bytes) = std::fs::read(&f) else {
+            continue;
+        };
+        let Ok(s) = serde_json::from_slice::<yz_logging::SelfplayWorkerSummaryV1>(&bytes) else {
+            continue;
+        };
+        if s.event != "selfplay_worker_summary" {
+            continue;
+        }
+        summaries.push(s);
+    }
+    if summaries.is_empty() {
+        return;
+    }
+
+    let mut wall_ms_max = 0u64;
+    let mut games_completed = 0u32;
+    let mut moves_executed = 0u64;
+
+    // Merge histograms (clone from first to preserve binning).
+    let mut pi_entropy_hist = summaries[0].pi_entropy_hist.clone();
+    let mut pi_max_p_hist = summaries[0].pi_max_p_hist.clone();
+    let mut pi_eff_actions_hist = summaries[0].pi_eff_actions_hist.clone();
+    let mut pending_count_max_hist = summaries[0].pending_count_max_hist.clone();
+    let mut prior_kl_hist = summaries[0].prior_kl_hist.clone();
+    let mut noise_kl_hist = summaries[0].noise_kl_hist.clone();
+    let mut game_ply_hist = summaries[0].game_ply_hist.clone();
+    let mut score_diff_hist = summaries[0].score_diff_hist.clone();
+
+    let mut root_value_sum = 0.0f64;
+    let mut root_value_sumsq = 0.0f64;
+    let mut root_value_n = 0u64;
+    let mut fallbacks_nz = 0u64;
+    let mut pending_collisions_sum = 0u64;
+
+    let mut prior_kl_sum = 0.0f64;
+    let mut prior_kl_n = 0u64;
+    let mut prior_n = 0u64;
+    let mut prior_overturn_n = 0u64;
+
+    let mut noise_kl_sum = 0.0f64;
+    let mut noise_kl_n = 0u64;
+    let mut noise_n = 0u64;
+    let mut noise_flip_n = 0u64;
+
+    for s in &summaries {
+        wall_ms_max = wall_ms_max.max(s.wall_ms);
+        games_completed = games_completed.saturating_add(s.games_completed);
+        moves_executed = moves_executed.saturating_add(s.moves_executed);
+
+        pi_entropy_hist.merge_inplace(&s.pi_entropy_hist);
+        pi_max_p_hist.merge_inplace(&s.pi_max_p_hist);
+        pi_eff_actions_hist.merge_inplace(&s.pi_eff_actions_hist);
+        pending_count_max_hist.merge_inplace(&s.pending_count_max_hist);
+        prior_kl_hist.merge_inplace(&s.prior_kl_hist);
+        noise_kl_hist.merge_inplace(&s.noise_kl_hist);
+        game_ply_hist.merge_inplace(&s.game_ply_hist);
+        score_diff_hist.merge_inplace(&s.score_diff_hist);
+
+        root_value_sum += s.root_value_sum;
+        root_value_sumsq += s.root_value_sumsq;
+        root_value_n = root_value_n.saturating_add(s.root_value_n);
+        fallbacks_nz = fallbacks_nz.saturating_add(s.fallbacks_nz);
+        pending_collisions_sum = pending_collisions_sum.saturating_add(s.pending_collisions_sum);
+
+        prior_kl_sum += s.prior_kl_sum;
+        prior_kl_n = prior_kl_n.saturating_add(s.prior_kl_n);
+        prior_n = prior_n.saturating_add(s.prior_n);
+        prior_overturn_n = prior_overturn_n.saturating_add(s.prior_argmax_overturn_n);
+
+        noise_kl_sum += s.noise_kl_sum;
+        noise_kl_n = noise_kl_n.saturating_add(s.noise_kl_n);
+        noise_n = noise_n.saturating_add(s.noise_n);
+        noise_flip_n = noise_flip_n.saturating_add(s.noise_argmax_flip_n);
+    }
+
+    let moves_s_mean = if wall_ms_max > 0 && moves_executed > 0 {
+        Some((moves_executed as f64) / ((wall_ms_max as f64) / 1000.0))
+    } else {
+        None
+    };
+
+    let root_value_mean = if root_value_n > 0 {
+        Some(root_value_sum / (root_value_n as f64))
+    } else {
+        None
+    };
+    let root_value_std = if root_value_n > 0 {
+        let mu = root_value_sum / (root_value_n as f64);
+        let var = (root_value_sumsq / (root_value_n as f64) - mu * mu).max(0.0);
+        Some(var.sqrt())
+    } else {
+        None
+    };
+
+    let fallbacks_rate = if moves_executed > 0 {
+        Some((fallbacks_nz as f64) / (moves_executed as f64))
+    } else {
+        None
+    };
+    let pending_collisions_per_move = if moves_executed > 0 {
+        Some((pending_collisions_sum as f64) / (moves_executed as f64))
+    } else {
+        None
+    };
+
+    let prior_kl_mean = if prior_kl_n > 0 {
+        Some(prior_kl_sum / (prior_kl_n as f64))
+    } else {
+        None
+    };
+    let noise_kl_mean = if noise_kl_n > 0 {
+        Some(noise_kl_sum / (noise_kl_n as f64))
+    } else {
+        None
+    };
+    let prior_overturn_rate = if prior_n > 0 {
+        Some((prior_overturn_n as f64) / (prior_n as f64))
+    } else {
+        None
+    };
+    let noise_flip_rate = if noise_n > 0 {
+        Some((noise_flip_n as f64) / (noise_n as f64))
+    } else {
+        None
+    };
+
+    let metrics_path = run_dir.join("logs").join("metrics.ndjson");
+    if let Ok(mut metrics) = yz_logging::NdjsonWriter::open_append_with_flush(&metrics_path, 1) {
+        let workers_observed = summaries.len() as u32;
+        let ev = yz_logging::MetricsSelfplaySummaryV1 {
+            event: "selfplay_summary",
+            ts_ms: yz_logging::now_ms(),
+            v: yz_logging::VersionInfoV1 {
+                protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+                feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+                action_space_id: "oracle_keepmask_v1",
+                ruleset_id: "swedish_scandinavian_v1",
+            },
+            run_id: manifest.run_id.clone(),
+            git_hash: manifest.git_hash.clone(),
+            config_snapshot: manifest.config_snapshot.clone(),
+            iter_idx,
+            workers: workers_observed.max(cfg.selfplay.workers.max(1)),
+            games_completed,
+            moves_executed,
+            moves_s_mean,
+            pi_entropy_mean: hist_mean(&pi_entropy_hist),
+            pi_entropy_p50: pi_entropy_hist.quantile_estimate(0.50),
+            pi_entropy_p95: pi_entropy_hist.quantile_estimate(0.95),
+            pi_max_p_p50: pi_max_p_hist.quantile_estimate(0.50),
+            pi_max_p_p95: pi_max_p_hist.quantile_estimate(0.95),
+            pi_eff_actions_p50: pi_eff_actions_hist.quantile_estimate(0.50),
+            pi_eff_actions_p95: pi_eff_actions_hist.quantile_estimate(0.95),
+            root_value_mean,
+            root_value_std,
+            fallbacks_rate,
+            pending_collisions_per_move,
+            pending_count_max_p95: pending_count_max_hist.quantile_estimate(0.95),
+            prior_kl_mean,
+            prior_kl_p95: prior_kl_hist.quantile_estimate(0.95),
+            prior_argmax_overturn_rate: prior_overturn_rate,
+            noise_kl_mean,
+            noise_kl_p95: noise_kl_hist.quantile_estimate(0.95),
+            noise_argmax_flip_rate: noise_flip_rate,
+            game_ply_p50: game_ply_hist.quantile_estimate(0.50),
+            game_ply_p95: game_ply_hist.quantile_estimate(0.95),
+            score_diff_p50: score_diff_hist.quantile_estimate(0.50),
+            score_diff_p95: score_diff_hist.quantile_estimate(0.95),
+        };
+        let _ = metrics.write_event(&ev);
+        let _ = metrics.flush();
+    }
 }
 
 fn refresh_train_stats_from_run_json(

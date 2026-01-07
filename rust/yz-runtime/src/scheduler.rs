@@ -1,4 +1,4 @@
-use crate::game_task::{GameTask, StepStatus};
+use crate::game_task::{ExecutedMove, GameTask, StepStatus};
 use yz_logging::VersionInfoV1;
 use yz_logging::{
     InferStatsV1, IterationStatsEventV1, MctsRootEventV1, MetricsMctsRootSampleV1,
@@ -32,6 +32,14 @@ pub struct Scheduler {
     stats: SchedulerStats,
     global_ply: u64,
     completed_games_total: u64,
+}
+
+/// Optional observer invoked for each executed move during `tick_and_write`.
+///
+/// This is used for low-overhead aggregation in selfplay-worker without forcing
+/// multi-process writes to the shared `logs/metrics.ndjson`.
+pub trait ExecutedMoveObserver {
+    fn on_executed_move(&mut self, global_ply: u64, exec: &ExecutedMove);
 }
 
 impl Scheduler {
@@ -83,7 +91,18 @@ impl Scheduler {
         &mut self,
         backend: &InferBackend,
         writer: &mut ShardWriter,
+        loggers: Option<&mut RunLoggers>,
+    ) -> Result<(), ReplayError> {
+        self.tick_and_write_observe(backend, writer, loggers, None)
+    }
+
+    /// Like `tick_and_write`, but also invokes an optional observer for each executed move.
+    pub fn tick_and_write_observe(
+        &mut self,
+        backend: &InferBackend,
+        writer: &mut ShardWriter,
         mut loggers: Option<&mut RunLoggers>,
+        mut observer: Option<&mut dyn ExecutedMoveObserver>,
     ) -> Result<(), ReplayError> {
         self.stats.ticks += 1;
         for t in &mut self.tasks {
@@ -92,6 +111,9 @@ impl Scheduler {
                 Ok(sr) => {
                     if let Some(exec) = sr.executed {
                         self.global_ply += 1;
+                        if let Some(obs) = observer.as_deref_mut() {
+                            obs.on_executed_move(self.global_ply, &exec);
+                        }
                         if let Some(lg) = loggers.as_deref_mut() {
                             if lg.root_log_every_n > 0
                                 && self.global_ply.is_multiple_of(lg.root_log_every_n)

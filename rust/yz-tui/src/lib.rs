@@ -8,7 +8,10 @@ mod config_io;
 mod form;
 mod validate;
 
+use std::collections::HashMap;
 use std::io;
+use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,7 +24,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline};
 use ratatui::Terminal;
 
 use crate::form::{EditMode, FieldId, FormState, Section, StepSize, ALL_FIELDS};
@@ -34,6 +37,160 @@ enum Screen {
     NamingRun, // Input mode for naming a new run
     Config,
     Dashboard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardTab {
+    Performance,
+    Learning,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct LearnSummaryNdjsonV1 {
+    #[allow(dead_code)]
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    iter_idx: Option<u32>,
+
+    // Dataset + progress
+    #[serde(default)]
+    total_samples: Option<u64>,
+    #[serde(default)]
+    batch_size: Option<u64>,
+    #[serde(default)]
+    steps_target: Option<u64>,
+    #[serde(default)]
+    steps_completed: Option<u64>,
+    #[serde(default)]
+    samples_s_mean: Option<f64>,
+
+    // Replay staleness
+    #[serde(default)]
+    age_wall_s_p50: Option<f64>,
+    #[serde(default)]
+    age_wall_s_p95: Option<f64>,
+    #[serde(default)]
+    age_shard_idx_p50: Option<f64>,
+    #[serde(default)]
+    age_shard_idx_p95: Option<f64>,
+
+    // Policy target spikiness
+    #[serde(default)]
+    pi_entropy_mean: Option<f64>,
+    #[serde(default)]
+    pi_entropy_p50: Option<f64>,
+    #[serde(default)]
+    pi_entropy_p95: Option<f64>,
+    #[serde(default)]
+    pi_top1_p50: Option<f64>,
+    #[serde(default)]
+    pi_top1_p95: Option<f64>,
+    #[serde(default)]
+    pi_eff_actions_p50: Option<f64>,
+    #[serde(default)]
+    pi_eff_actions_p95: Option<f64>,
+
+    // Value predictions
+    #[serde(default)]
+    v_pred_mean: Option<f64>,
+    #[serde(default)]
+    v_pred_std: Option<f64>,
+    #[serde(default)]
+    v_pred_p05: Option<f64>,
+    #[serde(default)]
+    v_pred_p50: Option<f64>,
+    #[serde(default)]
+    v_pred_p95: Option<f64>,
+    #[serde(default)]
+    v_pred_sat_frac: Option<f64>,
+
+    // Calibration
+    #[serde(default)]
+    ece: Option<f64>,
+
+    // Policy alignment (optional; emitted by trainer when available)
+    #[serde(default)]
+    pi_model_entropy_mean: Option<f64>,
+    #[serde(default)]
+    pi_model_entropy_p50: Option<f64>,
+    #[serde(default)]
+    pi_model_entropy_p95: Option<f64>,
+    #[serde(default)]
+    pi_kl_mean: Option<f64>,
+    #[serde(default)]
+    pi_kl_p50: Option<f64>,
+    #[serde(default)]
+    pi_kl_p95: Option<f64>,
+    #[serde(default)]
+    pi_entropy_gap_mean: Option<f64>,
+
+    // Calibration bins (for a tiny reliability diagram).
+    #[serde(default)]
+    calibration_bins: Option<Vec<LearnCalibBinV1>>,
+
+    // Training throughput
+    #[serde(default)]
+    step_ms_p50: Option<f64>,
+    #[serde(default)]
+    step_ms_p95: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct LearnCalibBinV1 {
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    mean_pred: Option<f64>,
+    #[serde(default)]
+    mean_z: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SelfplaySummaryNdjsonV1 {
+    #[allow(dead_code)]
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    iter_idx: Option<u32>,
+
+    // Throughput / volume.
+    #[serde(default)]
+    moves_executed: Option<u64>,
+    #[serde(default)]
+    moves_s_mean: Option<f64>,
+
+    // Visit-policy (MCTS pi) shape.
+    #[serde(default)]
+    pi_entropy_mean: Option<f64>,
+    #[serde(default)]
+    pi_entropy_p95: Option<f64>,
+    #[serde(default)]
+    pi_max_p_p95: Option<f64>,
+    #[serde(default)]
+    pi_eff_actions_p95: Option<f64>,
+
+    // Search stability + improvement.
+    #[serde(default)]
+    fallbacks_rate: Option<f64>,
+    #[serde(default)]
+    pending_collisions_per_move: Option<f64>,
+    #[serde(default)]
+    prior_kl_mean: Option<f64>,
+    #[serde(default)]
+    prior_argmax_overturn_rate: Option<f64>,
+    #[serde(default)]
+    noise_kl_mean: Option<f64>,
+    #[serde(default)]
+    noise_argmax_flip_rate: Option<f64>,
+
+    // Game stats.
+    #[serde(default)]
+    game_ply_p95: Option<f64>,
+    #[serde(default)]
+    score_diff_p95: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -52,10 +209,18 @@ struct App {
     dashboard_err: Option<String>,
     dashboard_planned_total_iterations: Option<u32>,
     dashboard_planned_loaded_for_run: Option<String>,
+    dashboard_tab: DashboardTab,
     /// Scroll offset (in rows) for the dashboard Performance iteration list.
     dashboard_iter_scroll: usize,
     /// If true, keep the current iteration row visible (auto-follow). Any manual scroll disables it.
     dashboard_iter_follow: bool,
+
+    // Learning dashboard state (tail metrics.ndjson).
+    learn_loaded_for_run: Option<String>,
+    learn_metrics_offset: u64,
+    learn_metrics_partial: String,
+    learn_by_iter: HashMap<u32, LearnSummaryNdjsonV1>,
+    selfplay_by_iter: HashMap<u32, SelfplaySummaryNdjsonV1>,
 
     iter: Option<yz_controller::IterationHandle>,
 
@@ -83,8 +248,14 @@ impl App {
             dashboard_err: None,
             dashboard_planned_total_iterations: None,
             dashboard_planned_loaded_for_run: None,
+            dashboard_tab: DashboardTab::Performance,
             dashboard_iter_scroll: 0,
             dashboard_iter_follow: true,
+            learn_loaded_for_run: None,
+            learn_metrics_offset: 0,
+            learn_metrics_partial: String::new(),
+            learn_by_iter: HashMap::new(),
+            selfplay_by_iter: HashMap::new(),
             iter: None,
             shutdown_requested: false,
             shutdown_exit_after: false,
@@ -103,7 +274,9 @@ impl App {
                 self.runs_dir.display()
             );
         } else {
-            self.status = "q: quit | r: refresh | n: new run | ↑/↓: select".to_string();
+            self.status =
+                "q: quit | r: refresh | n: new run | Enter: open | ↑/↓ select | PgUp/PgDn | Home/End"
+                    .to_string();
         }
     }
 
@@ -197,6 +370,11 @@ impl App {
             self.dashboard_err = None;
             self.dashboard_planned_total_iterations = None;
             self.dashboard_planned_loaded_for_run = None;
+            self.learn_loaded_for_run = None;
+            self.learn_metrics_offset = 0;
+            self.learn_metrics_partial.clear();
+            self.learn_by_iter.clear();
+            self.selfplay_by_iter.clear();
             return;
         };
         let run_json = run_dir.join("run.json");
@@ -228,6 +406,83 @@ impl App {
                 }
             }
         }
+
+        self.refresh_learning_metrics(&run_dir);
+    }
+
+    fn refresh_learning_metrics(&mut self, run_dir: &Path) {
+        let rid = self.active_run_id.clone().unwrap_or_default();
+        if self.learn_loaded_for_run.as_deref() != Some(rid.as_str()) {
+            self.learn_loaded_for_run = Some(rid);
+            self.learn_metrics_offset = 0;
+            self.learn_metrics_partial.clear();
+            self.learn_by_iter.clear();
+            self.selfplay_by_iter.clear();
+        }
+
+        let metrics_path = run_dir.join("logs").join("metrics.ndjson");
+        if !metrics_path.exists() {
+            return;
+        }
+        let mut f = match File::open(&metrics_path) {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        if f.seek(SeekFrom::Start(self.learn_metrics_offset)).is_err() {
+            // If the file was truncated/rotated, restart from 0.
+            self.learn_metrics_offset = 0;
+            self.learn_metrics_partial.clear();
+            if f.seek(SeekFrom::Start(0)).is_err() {
+                return;
+            }
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            return;
+        }
+        self.learn_metrics_offset = self.learn_metrics_offset.saturating_add(buf.len() as u64);
+
+        // Prepend any partial line from the previous refresh.
+        let mut data = std::mem::take(&mut self.learn_metrics_partial);
+        data.push_str(&buf);
+
+        // Keep the last partial line (no trailing newline) for next time.
+        let mut lines = data.split('\n').peekable();
+        while let Some(line) = lines.next() {
+            if lines.peek().is_none() && !data.ends_with('\n') {
+                self.learn_metrics_partial = line.to_string();
+                break;
+            }
+            let s = line.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+                continue;
+            };
+            let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
+            match ev {
+                "learn_summary" => {
+                    let Ok(ls) = serde_json::from_value::<LearnSummaryNdjsonV1>(v) else {
+                        continue;
+                    };
+                    let Some(i) = ls.iter_idx else {
+                        continue;
+                    };
+                    self.learn_by_iter.insert(i, ls);
+                }
+                "selfplay_summary" => {
+                    let Ok(ss) = serde_json::from_value::<SelfplaySummaryNdjsonV1>(v) else {
+                        continue;
+                    };
+                    let Some(i) = ss.iter_idx else {
+                        continue;
+                    };
+                    self.selfplay_by_iter.insert(i, ss);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn enter_dashboard(&mut self) {
@@ -242,7 +497,7 @@ impl App {
             self.status = "cancelling… waiting for shutdown | r refresh".to_string();
         } else {
             self.status =
-                "r refresh | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                "r refresh | l toggle learning/perf | d perf | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
                     .to_string();
         }
     }
@@ -437,6 +692,24 @@ pub fn run() -> io::Result<()> {
                                 app.selected += 1;
                             }
                         }
+                        KeyCode::PageUp => {
+                            let step = 10usize;
+                            app.selected = app.selected.saturating_sub(step);
+                        }
+                        KeyCode::PageDown => {
+                            let step = 10usize;
+                            if !app.runs.is_empty() {
+                                app.selected = (app.selected + step).min(app.runs.len() - 1);
+                            }
+                        }
+                        KeyCode::Home => {
+                            app.selected = 0;
+                        }
+                        KeyCode::End => {
+                            if !app.runs.is_empty() {
+                                app.selected = app.runs.len() - 1;
+                            }
+                        }
                         _ => {}
                     },
                     Screen::NamingRun => match k.code {
@@ -493,6 +766,18 @@ pub fn run() -> io::Result<()> {
                         KeyCode::Esc => {
                             app.screen = Screen::Config;
                             app.status = config_help(&app.form);
+                        }
+                        KeyCode::Char('l') => {
+                            app.dashboard_tab = match app.dashboard_tab {
+                                DashboardTab::Performance => DashboardTab::Learning,
+                                DashboardTab::Learning => DashboardTab::Performance,
+                            };
+                            app.enter_dashboard();
+                        }
+                        // Convenience: always jump back to the Performance dashboard.
+                        KeyCode::Char('d') => {
+                            app.dashboard_tab = DashboardTab::Performance;
+                            app.enter_dashboard();
                         }
                         KeyCode::Char('r') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
@@ -1435,16 +1720,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             let title = Line::from(vec![
                 Span::styled("yA0tzy", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
-                Span::raw("TUI"),
+                Span::raw("Runs"),
             ]);
             let items: Vec<ListItem> = if app.runs.is_empty() {
                 vec![ListItem::new(Line::from("No runs yet"))]
             } else {
+                let sel = app.selected.min(app.runs.len().saturating_sub(1));
+                let view_h = chunks[0].height.saturating_sub(2).max(1) as usize;
+                let mut start = sel.saturating_sub(view_h.saturating_sub(1));
+                if start + view_h > app.runs.len() {
+                    start = app.runs.len().saturating_sub(view_h);
+                }
                 app.runs
                     .iter()
                     .enumerate()
+                    .skip(start)
+                    .take(view_h)
                     .map(|(i, r)| {
-                        let prefix = if i == app.selected { "> " } else { "  " };
+                        let prefix = if i == sel { "> " } else { "  " };
                         ListItem::new(Line::from(format!("{prefix}{r}")))
                     })
                     .collect()
@@ -1497,6 +1790,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
         Screen::Dashboard => {
             let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
+            if matches!(app.dashboard_tab, DashboardTab::Learning) {
+                draw_dashboard_learning(f, app, chunks[0]);
+            } else {
             let title = Line::from(vec![
                 Span::styled("Performance", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
@@ -1851,12 +2147,430 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let p = Paragraph::new(right_lines).block(right_block);
                 f.render_widget(p, cols[1]);
             }
+            }
         }
     }
 
     let help = Paragraph::new(app.status.clone())
         .block(Block::default().title("Commands").borders(Borders::ALL));
     f.render_widget(help, chunks[1]);
+}
+
+fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
+    let title = Line::from(vec![
+        Span::styled("Learning", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(rid.to_string()),
+    ]);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(1)].as_ref())
+        .split(area);
+
+    // Sparklines (2x2)
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(chunks[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(top[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(top[1]);
+
+    let max_iter = app
+        .dashboard_manifest
+        .as_ref()
+        .map(|m| m.iterations.len().max(1))
+        .unwrap_or(1);
+
+    fn carry_series(len: usize, mut get: impl FnMut(usize) -> Option<u64>, default: u64) -> Vec<u64> {
+        let mut out = Vec::with_capacity(len);
+        let mut last = default;
+        for i in 0..len {
+            if let Some(v) = get(i) {
+                last = v;
+            }
+            out.push(last);
+        }
+        out
+    }
+
+    let stale_p95 = carry_series(
+        max_iter,
+        |i| {
+            app.learn_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.age_wall_s_p95)
+                .map(|s| (s.max(0.0) as u64).min(1_000_000))
+        },
+        0,
+    );
+    let pi_kl = carry_series(
+        max_iter,
+        |i| {
+            app.learn_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.pi_kl_mean)
+                .map(|v| (v.max(0.0) * 1000.0) as u64)
+        },
+        0,
+    );
+    let ece = carry_series(
+        max_iter,
+        |i| {
+            app.learn_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.ece)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
+        },
+        0,
+    );
+    let overturn = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.prior_argmax_overturn_rate)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
+        },
+        0,
+    );
+
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("staleness p95 (s)").borders(Borders::ALL))
+            .data(&stale_p95),
+        left[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("pi KL mean").borders(Borders::ALL))
+            .data(&pi_kl),
+        left[1],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("ECE").borders(Borders::ALL))
+            .data(&ece),
+        right[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("overturn rate").borders(Borders::ALL))
+            .data(&overturn),
+        right[1],
+    );
+
+    // Bottom: table + details.
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)].as_ref())
+        .split(chunks[1]);
+    let table_area = bottom[0];
+    let detail_area = bottom[1];
+
+    // Table (left)
+    let mut lines: Vec<Line> = Vec::new();
+    const W_IDX: usize = 4;
+    const W_DEC: usize = 8;
+    const W_WR: usize = 7;
+    const W_STALE: usize = 7;
+    const W_PI: usize = 5;
+    const W_KL: usize = 5;
+    const W_OVR: usize = 5;
+    const W_VMEAN: usize = 5;
+    const W_ECE: usize = 5;
+    const W_SPS: usize = 6;
+    const W_MPS: usize = 6;
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {sps:>W_SPS$}  {mps:>W_MPS$}",
+            idx = "Iter",
+            dec = "Decision",
+            wr = "WinRate",
+            stale = "Stale95",
+            pi = "PiEnt",
+            kl = "KL",
+            ovr = "Ovr%",
+            vmean = "Vmean",
+            ece = "ECE",
+            sps = "Samp/s",
+            mps = "Move/s",
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    match (&app.dashboard_manifest, &app.dashboard_err) {
+        (Some(m), _) => {
+            let cur_idx = m.controller_iteration_idx;
+            let active_idx = if m.iterations.iter().any(|it| it.idx == cur_idx) {
+                cur_idx
+            } else {
+                cur_idx.saturating_sub(1)
+            };
+            let mut rows: Vec<Line> = Vec::new();
+            fn fmt_opt_f64(v: Option<f64>, width: usize, prec: usize) -> String {
+                match v {
+                    Some(x) if x.is_finite() => {
+                        let s = format!("{x:.prec$}", prec = prec);
+                        format!("{s:>width$}", width = width)
+                    }
+                    _ => format!("{:>width$}", "-", width = width),
+                }
+            }
+            fn fmt_opt_pct(v: Option<f64>, width: usize) -> String {
+                match v {
+                    Some(x) if x.is_finite() => {
+                        let p = (x.clamp(0.0, 1.0) * 100.0).round() as i64;
+                        let s = format!("{p}%");
+                        format!("{s:>width$}", width = width)
+                    }
+                    _ => format!("{:>width$}", "-", width = width),
+                }
+            }
+            fn fmt_opt_u0(v: Option<f64>, width: usize) -> String {
+                match v {
+                    Some(x) if x.is_finite() => {
+                        let s = format!("{:.0}", x);
+                        format!("{s:>width$}", width = width)
+                    }
+                    _ => format!("{:>width$}", "-", width = width),
+                }
+            }
+            for it in &m.iterations {
+                // ASCII marker to avoid wide-char rendering differences across terminals.
+                let marker = if it.idx == active_idx { ">" } else { " " };
+                let promo = it
+                    .promoted
+                    .map(|p| if p { "promote" } else { "reject" })
+                    .unwrap_or("-");
+                let wr = fmt_opt_f64(it.gate.win_rate, W_WR, 3);
+
+                let ls = app.learn_by_iter.get(&it.idx);
+                let ss = app.selfplay_by_iter.get(&it.idx);
+                let stale95 = fmt_opt_u0(ls.and_then(|x| x.age_wall_s_p95), W_STALE);
+                let pi_ent = fmt_opt_f64(ls.and_then(|x| x.pi_entropy_mean), W_PI, 2);
+                let kl = fmt_opt_f64(ls.and_then(|x| x.pi_kl_mean), W_KL, 2);
+                let ovr = fmt_opt_pct(ss.and_then(|x| x.prior_argmax_overturn_rate), W_OVR);
+                let vmean = fmt_opt_f64(ls.and_then(|x| x.v_pred_mean), W_VMEAN, 2);
+                let ece = fmt_opt_f64(ls.and_then(|x| x.ece), W_ECE, 3);
+                let sps = fmt_opt_u0(ls.and_then(|x| x.samples_s_mean), W_SPS);
+                let mps = fmt_opt_u0(ss.and_then(|x| x.moves_s_mean), W_MPS);
+
+                // Light alerting: highlight rows that match common failure signatures.
+                let mut warn_level: u8 = 0;
+                if let Some(v) = ls.and_then(|x| x.ece) {
+                    if v > 0.20 {
+                        warn_level = warn_level.max(2);
+                    } else if v > 0.10 {
+                        warn_level = warn_level.max(1);
+                    }
+                }
+                if let Some(v) = ls.and_then(|x| x.pi_kl_mean) {
+                    if v > 2.0 {
+                        warn_level = warn_level.max(2);
+                    } else if v > 1.0 {
+                        warn_level = warn_level.max(1);
+                    }
+                }
+                if let Some(v) = ls.and_then(|x| x.pi_entropy_mean) {
+                    if v < 0.30 {
+                        warn_level = warn_level.max(1);
+                    }
+                }
+                if let Some(v) = ss.and_then(|x| x.fallbacks_rate) {
+                    if v > 0.10 {
+                        warn_level = warn_level.max(2);
+                    } else if v > 0.05 {
+                        warn_level = warn_level.max(1);
+                    }
+                }
+                if let Some(v) = ss.and_then(|x| x.prior_argmax_overturn_rate) {
+                    if v < 0.02 {
+                        warn_level = warn_level.max(1);
+                    }
+                }
+
+                let mut row_style = if it.idx == active_idx {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                if warn_level >= 2 {
+                    row_style = row_style.fg(Color::Red).add_modifier(Modifier::BOLD);
+                } else if warn_level == 1 {
+                    row_style = row_style.fg(Color::Yellow);
+                }
+                rows.push(Line::from(Span::styled(
+                    format!(
+                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {kl}  {ovr}  {vmean}  {ece}  {sps}  {mps}",
+                        idx = it.idx,
+                        dec = promo,
+                        stale = stale95,
+                        pi = pi_ent,
+                        kl = kl,
+                        ovr = ovr,
+                    ),
+                    row_style,
+                )));
+            }
+
+            // Determine scroll window for rows.
+            let view_h = table_area.height.saturating_sub(2) as usize;
+            let max_start = rows.len().saturating_sub(view_h.saturating_sub(1));
+            let start = if app.dashboard_iter_follow {
+                max_start
+            } else {
+                app.dashboard_iter_scroll.min(max_start)
+            };
+            for line in rows.into_iter().skip(start).take(view_h.saturating_sub(1)) {
+                lines.push(line);
+            }
+
+            // Details panel (right): show metrics for active_idx (best-effort).
+            let mut detail: Vec<Line> = Vec::new();
+            detail.push(Line::from(Span::styled(
+                format!("iter {active_idx}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            if let Some(ss) = app.selfplay_by_iter.get(&active_idx) {
+                if let Some(v) = ss.moves_s_mean {
+                    detail.push(Line::from(format!("selfplay: {v:.0} moves/s")));
+                }
+                if let Some(v) = ss.prior_argmax_overturn_rate {
+                    detail.push(Line::from(format!("overturn: {:.0}%", v * 100.0)));
+                }
+                if let Some(v) = ss.prior_kl_mean {
+                    detail.push(Line::from(format!("prior_KL: {v:.3}")));
+                }
+                if let Some(v) = ss.fallbacks_rate {
+                    detail.push(Line::from(format!("fallbacks: {:.1}%", v * 100.0)));
+                }
+                if let Some(v) = ss.pending_collisions_per_move {
+                    detail.push(Line::from(format!("pending_coll: {v:.3}/move")));
+                }
+            }
+            if let Some(ls) = app.learn_by_iter.get(&active_idx) {
+                if let Some(v) = ls.samples_s_mean {
+                    detail.push(Line::from(format!("train: {v:.0} samples/s")));
+                }
+                if let Some(v) = ls.pi_entropy_mean {
+                    detail.push(Line::from(format!("pi_ent_tgt: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_model_entropy_mean {
+                    detail.push(Line::from(format!("pi_ent_model: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_kl_mean {
+                    detail.push(Line::from(format!("pi_KL: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_entropy_gap_mean {
+                    detail.push(Line::from(format!("ent_gap: {v:.3}")));
+                }
+                if let Some(v) = ls.v_pred_mean {
+                    detail.push(Line::from(format!("v_mean: {v:.3}")));
+                }
+                if let Some(v) = ls.ece {
+                    detail.push(Line::from(format!("ECE: {v:.3}")));
+                }
+
+                // Alerts summary for current iteration (best-effort).
+                let mut alerts: Vec<String> = Vec::new();
+                if let Some(v) = ls.pi_kl_mean {
+                    if v > 2.0 {
+                        alerts.push(format!("KL spike ({v:.2})"));
+                    }
+                }
+                if let Some(v) = ls.pi_entropy_mean {
+                    if v < 0.30 {
+                        alerts.push(format!("entropy low ({v:.2})"));
+                    }
+                }
+                if let Some(v) = ls.ece {
+                    if v > 0.20 {
+                        alerts.push(format!("ECE high ({v:.2})"));
+                    }
+                }
+                if let Some(ss) = app.selfplay_by_iter.get(&active_idx) {
+                    if let Some(v) = ss.fallbacks_rate {
+                        if v > 0.10 {
+                            alerts.push(format!("fallbacks high ({:.0}%)", v * 100.0));
+                        }
+                    }
+                    if let Some(v) = ss.prior_argmax_overturn_rate {
+                        if v < 0.02 {
+                            alerts.push("search not improving (overturn <2%)".to_string());
+                        }
+                    }
+                }
+                if !alerts.is_empty() {
+                    detail.push(Line::from(""));
+                    detail.push(Line::from(Span::styled(
+                        "alerts:",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    for a in alerts {
+                        detail.push(Line::from(Span::styled(a, Style::default().fg(Color::Yellow))));
+                    }
+                }
+
+                // Tiny reliability diagram.
+                if let Some(bins) = &ls.calibration_bins {
+                    detail.push(Line::from(""));
+                    detail.push(Line::from(Span::styled(
+                        "calibration (pred vs z):",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    for (i, b) in bins.iter().enumerate() {
+                        if b.count == 0 {
+                            continue;
+                        }
+                        let mp = b.mean_pred.unwrap_or(0.0);
+                        let mz = b.mean_z.unwrap_or(0.0);
+                        let err = (mp - mz).abs();
+                        let bar_w = 10usize;
+                        let filled = (err.clamp(0.0, 1.0) * (bar_w as f64)).round() as usize;
+                        let mut bar = String::new();
+                        for _ in 0..filled.min(bar_w) {
+                            bar.push('#');
+                        }
+                        for _ in filled.min(bar_w)..bar_w {
+                            bar.push(' ');
+                        }
+                        detail.push(Line::from(format!(
+                            "b{i}: n={:>4} pred={:+.2} z={:+.2} |{bar}|",
+                            b.count, mp, mz
+                        )));
+                    }
+                }
+            }
+
+            let p_details =
+                Paragraph::new(detail).block(Block::default().title("Details").borders(Borders::ALL));
+            f.render_widget(p_details, detail_area);
+        }
+        (_, Some(e)) => {
+            lines.push(Line::from(format!(" (unavailable: {e})")));
+            let p_details = Paragraph::new(vec![Line::from("(no data)")])
+                .block(Block::default().title("Details").borders(Borders::ALL));
+            f.render_widget(p_details, detail_area);
+        }
+        _ => {
+            lines.push(Line::from(" (no run selected)"));
+            let p_details = Paragraph::new(vec![Line::from("(no run selected)")])
+                .block(Block::default().title("Details").borders(Borders::ALL));
+            f.render_widget(p_details, detail_area);
+        }
+    }
+
+    let p = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
+    f.render_widget(p, table_area);
 }
 
 fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
@@ -1987,6 +2701,23 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod learn_summary_parse_tests {
+    use super::LearnSummaryNdjsonV1;
+
+    #[test]
+    fn parses_learn_summary_minimal() {
+        let s = r#"{"event":"learn_summary","iter_idx":3,"age_wall_s_p95":12.0,"pi_entropy_mean":1.23,"v_pred_mean":-0.1,"ece":0.02,"samples_s_mean":456.0}"#;
+        let v: LearnSummaryNdjsonV1 = serde_json::from_str(s).expect("parse");
+        assert_eq!(v.iter_idx, Some(3));
+        assert_eq!(v.age_wall_s_p95, Some(12.0));
+        assert_eq!(v.pi_entropy_mean, Some(1.23));
+        assert_eq!(v.v_pred_mean, Some(-0.1));
+        assert_eq!(v.ece, Some(0.02));
+        assert_eq!(v.samples_s_mean, Some(456.0));
+    }
 }
 
 // (no tests)

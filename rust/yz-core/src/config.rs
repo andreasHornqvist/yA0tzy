@@ -213,6 +213,15 @@ pub struct SelfplayConfig {
     pub workers: u32,
     /// Number of threads per worker.
     pub threads_per_worker: u32,
+    /// Emit a sampled root-search record every N executed moves (0 disables).
+    ///
+    /// Used for lightweight search diagnostics without large logs.
+    #[serde(default = "default_selfplay_root_sample_every_n")]
+    pub root_sample_every_n: u32,
+}
+
+fn default_selfplay_root_sample_every_n() -> u32 {
+    10
 }
 
 /// Training configuration.
@@ -359,6 +368,7 @@ impl Default for Config {
                 games_per_iteration: 50,
                 workers: 1,
                 threads_per_worker: 1,
+                root_sample_every_n: default_selfplay_root_sample_every_n(),
             },
             training: TrainingConfig {
                 batch_size: 256,

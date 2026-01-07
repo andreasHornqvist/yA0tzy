@@ -110,6 +110,19 @@ uv run pytest                        # Run tests (future)
 # Terminal UI
 cargo run -p yz-cli --bin yz -- tui
 
+# Learning dashboard (TUI)
+# - From the Dashboard, press `l` to toggle Performance ⇄ Learning.
+# - Learning reads `runs/<id>/logs/metrics.ndjson` and shows per-iteration:
+#   - `learn_summary` (trainer): buffer staleness, policy target spikiness + alignment (KL/entropy gap),
+#     value distribution + calibration bins (ECE + tiny reliability diagram), training throughput.
+#   - `selfplay_summary` (controller): merged worker-local search stats (visit entropy/max-share,
+#     fallbacks/pending collisions, prior-vs-visit “overturn” rate, self-play throughput).
+# - Optional sampled per-move roots are written worker-locally under:
+#   `runs/<id>/logs_workers/worker_*/mcts_root_sample.ndjson`
+# - Worker-local merge inputs are written as:
+#   `runs/<id>/logs_workers/worker_*/selfplay_worker_summary.json`
+#   Controlled by `selfplay.root_sample_every_n` (0 disables; default 10).
+
 # Inference server (Python)
 cd python
 uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best dummy --cand dummy

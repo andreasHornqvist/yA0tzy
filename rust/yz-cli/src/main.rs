@@ -772,6 +772,339 @@ OPTIONS:
     }
     let mut sched = yz_runtime::Scheduler::new(tasks, 64);
 
+    // -------------------------
+    // Self-play/search aggregation (worker-local)
+    // -------------------------
+    use yz_runtime::scheduler::ExecutedMoveObserver;
+    const HIST_BINS: usize = 32;
+
+    struct Agg {
+        run_id: String,
+        worker_id: u32,
+        num_workers: u32,
+        games_target: u32,
+        root_sample_every_n: u32,
+
+        // Counts.
+        moves_executed: u64,
+        games_completed: u32,
+
+        // Visit policy histograms.
+        pi_entropy_hist: yz_logging::HistogramV1,
+        pi_max_p_hist: yz_logging::HistogramV1,
+        pi_eff_actions_hist: yz_logging::HistogramV1,
+
+        // Search scalars.
+        root_value_sum: f64,
+        root_value_sumsq: f64,
+        root_value_n: u64,
+        fallbacks_sum: u64,
+        fallbacks_nz: u64,
+        pending_collisions_sum: u64,
+        pending_count_max_hist: yz_logging::HistogramV1,
+
+        // Prior vs visit.
+        prior_kl_hist: yz_logging::HistogramV1,
+        prior_kl_sum: f64,
+        prior_kl_n: u64,
+        prior_n: u64,
+        prior_argmax_overturn_n: u64,
+
+        // Noise effect (raw vs noisy priors).
+        noise_kl_hist: yz_logging::HistogramV1,
+        noise_kl_sum: f64,
+        noise_kl_n: u64,
+        noise_n: u64,
+        noise_argmax_flip_n: u64,
+
+        // Game stats.
+        game_ply_hist: yz_logging::HistogramV1,
+        game_turn_hist: yz_logging::HistogramV1,
+        score_p0_hist: yz_logging::HistogramV1,
+        score_p1_hist: yz_logging::HistogramV1,
+        score_diff_hist: yz_logging::HistogramV1,
+
+        // Optional sampled root logs (NDJSON, worker-local).
+        root_log: Option<yz_logging::NdjsonWriter>,
+        v: yz_logging::VersionInfoV1,
+        git_hash: Option<String>,
+        config_snapshot: Option<String>,
+    }
+
+    fn dist_entropy_max_eff_argmax(xs: &[f32; yz_core::A]) -> (f64, f64, f64, u8) {
+        let mut ent = 0.0f64;
+        let mut max_p = -1.0f64;
+        let mut argmax = 0usize;
+        let mut sumsq = 0.0f64;
+        for (i, &x) in xs.iter().enumerate() {
+            let p = x as f64;
+            if !(p.is_finite()) || p < 0.0 {
+                continue;
+            }
+            if p > max_p {
+                max_p = p;
+                argmax = i;
+            }
+            if p > 0.0 {
+                ent -= p * p.ln();
+            }
+            sumsq += p * p;
+        }
+        let eff = if sumsq > 0.0 { 1.0 / sumsq } else { 0.0 };
+        (ent, max_p.max(0.0), eff, argmax as u8)
+    }
+
+    fn kl_div(p: &[f32; yz_core::A], q: &[f32; yz_core::A]) -> Option<f64> {
+        let mut sp = 0.0f64;
+        let mut sq = 0.0f64;
+        for i in 0..yz_core::A {
+            let pi = p[i] as f64;
+            let qi = q[i] as f64;
+            if pi.is_finite() && pi > 0.0 {
+                sp += pi;
+            }
+            if qi.is_finite() && qi > 0.0 {
+                sq += qi;
+            }
+        }
+        if sp <= 0.0 || sq <= 0.0 {
+            return None;
+        }
+        let mut kl = 0.0f64;
+        for i in 0..yz_core::A {
+            let pi0 = p[i] as f64;
+            if !(pi0.is_finite()) || pi0 <= 0.0 {
+                continue;
+            }
+            let pi = (pi0 / sp).clamp(0.0, 1.0);
+            let qi0 = (q[i] as f64) / sq;
+            let qi = qi0.max(1e-12);
+            kl += pi * (pi / qi).ln();
+        }
+        Some(kl.max(0.0))
+    }
+
+    impl Agg {
+        fn new(
+            run_id: String,
+            worker_id: u32,
+            num_workers: u32,
+            games_target: u32,
+            root_sample_every_n: u32,
+            logs_dir: &PathBuf,
+            v: yz_logging::VersionInfoV1,
+            git_hash: Option<String>,
+            config_snapshot: Option<String>,
+        ) -> Self {
+            let root_log = if root_sample_every_n > 0 {
+                yz_logging::NdjsonWriter::open_append_with_flush(
+                    logs_dir.join("mcts_root_sample.ndjson"),
+                    50,
+                )
+                .ok()
+            } else {
+                None
+            };
+            Self {
+                run_id,
+                worker_id,
+                num_workers,
+                games_target,
+                root_sample_every_n,
+                moves_executed: 0,
+                games_completed: 0,
+                pi_entropy_hist: yz_logging::HistogramV1::new(0.0, 4.0, HIST_BINS),
+                pi_max_p_hist: yz_logging::HistogramV1::new(0.0, 1.0, HIST_BINS),
+                pi_eff_actions_hist: yz_logging::HistogramV1::new(0.0, yz_core::A as f64, HIST_BINS),
+                root_value_sum: 0.0,
+                root_value_sumsq: 0.0,
+                root_value_n: 0,
+                fallbacks_sum: 0,
+                fallbacks_nz: 0,
+                pending_collisions_sum: 0,
+                pending_count_max_hist: yz_logging::HistogramV1::new(0.0, 32.0, HIST_BINS),
+                prior_kl_hist: yz_logging::HistogramV1::new(0.0, 3.0, HIST_BINS),
+                prior_kl_sum: 0.0,
+                prior_kl_n: 0,
+                prior_n: 0,
+                prior_argmax_overturn_n: 0,
+                noise_kl_hist: yz_logging::HistogramV1::new(0.0, 3.0, HIST_BINS),
+                noise_kl_sum: 0.0,
+                noise_kl_n: 0,
+                noise_n: 0,
+                noise_argmax_flip_n: 0,
+                game_ply_hist: yz_logging::HistogramV1::new(0.0, 256.0, HIST_BINS),
+                game_turn_hist: yz_logging::HistogramV1::new(0.0, 64.0, HIST_BINS),
+                score_p0_hist: yz_logging::HistogramV1::new(0.0, 400.0, HIST_BINS),
+                score_p1_hist: yz_logging::HistogramV1::new(0.0, 400.0, HIST_BINS),
+                score_diff_hist: yz_logging::HistogramV1::new(-400.0, 400.0, HIST_BINS),
+                root_log,
+                v,
+                git_hash,
+                config_snapshot,
+            }
+        }
+
+        fn on_game_terminal(&mut self, ply: u32, turn_idx: u32, s0: i16, s1: i16) {
+            self.games_completed = self.games_completed.saturating_add(1);
+            self.game_ply_hist.add(ply as f64);
+            self.game_turn_hist.add(turn_idx as f64);
+            self.score_p0_hist.add((s0 as f64).max(0.0));
+            self.score_p1_hist.add((s1 as f64).max(0.0));
+            self.score_diff_hist.add((s0 as f64) - (s1 as f64));
+        }
+
+        fn finalize(self, wall_ms: u64) -> yz_logging::SelfplayWorkerSummaryV1 {
+            yz_logging::SelfplayWorkerSummaryV1 {
+                event: "selfplay_worker_summary".to_string(),
+                ts_ms: yz_logging::now_ms(),
+                run_id: self.run_id,
+                worker_id: self.worker_id,
+                num_workers: self.num_workers,
+                games_target: self.games_target,
+                games_completed: self.games_completed,
+                moves_executed: self.moves_executed,
+                wall_ms,
+                root_sample_every_n: self.root_sample_every_n,
+                pi_entropy_hist: self.pi_entropy_hist,
+                pi_max_p_hist: self.pi_max_p_hist,
+                pi_eff_actions_hist: self.pi_eff_actions_hist,
+                root_value_sum: self.root_value_sum,
+                root_value_sumsq: self.root_value_sumsq,
+                root_value_n: self.root_value_n,
+                fallbacks_sum: self.fallbacks_sum,
+                fallbacks_nz: self.fallbacks_nz,
+                pending_collisions_sum: self.pending_collisions_sum,
+                pending_count_max_hist: self.pending_count_max_hist,
+                prior_kl_hist: self.prior_kl_hist,
+                prior_kl_sum: self.prior_kl_sum,
+                prior_kl_n: self.prior_kl_n,
+                prior_n: self.prior_n,
+                prior_argmax_overturn_n: self.prior_argmax_overturn_n,
+                noise_kl_hist: self.noise_kl_hist,
+                noise_kl_sum: self.noise_kl_sum,
+                noise_kl_n: self.noise_kl_n,
+                noise_n: self.noise_n,
+                noise_argmax_flip_n: self.noise_argmax_flip_n,
+                game_ply_hist: self.game_ply_hist,
+                game_turn_hist: self.game_turn_hist,
+                score_p0_hist: self.score_p0_hist,
+                score_p1_hist: self.score_p1_hist,
+                score_diff_hist: self.score_diff_hist,
+            }
+        }
+    }
+
+    impl ExecutedMoveObserver for Agg {
+        fn on_executed_move(&mut self, global_ply: u64, exec: &yz_runtime::game_task::ExecutedMove) {
+            self.moves_executed = self.moves_executed.saturating_add(1);
+
+            // Visit-policy shape.
+            let (ent, max_p, eff, _argmax) = dist_entropy_max_eff_argmax(&exec.search.pi);
+            self.pi_entropy_hist.add(ent);
+            self.pi_max_p_hist.add(max_p);
+            self.pi_eff_actions_hist.add(eff);
+
+            // Root value and search stability.
+            let rv = exec.search.root_value as f64;
+            self.root_value_sum += rv;
+            self.root_value_sumsq += rv * rv;
+            self.root_value_n = self.root_value_n.saturating_add(1);
+
+            let fb = exec.search.fallbacks as u64;
+            self.fallbacks_sum = self.fallbacks_sum.saturating_add(fb);
+            if fb > 0 {
+                self.fallbacks_nz = self.fallbacks_nz.saturating_add(1);
+            }
+            self.pending_collisions_sum =
+                self.pending_collisions_sum.saturating_add(exec.search.pending_collisions as u64);
+            self.pending_count_max_hist.add(exec.search.pending_count_max as f64);
+
+            // Search improvement: compare noisy priors to visit pi (when priors present).
+            if let Some(prior_noisy) = &exec.search.root_priors_noisy {
+                self.prior_n = self.prior_n.saturating_add(1);
+                if let Some(kl) = kl_div(prior_noisy, &exec.search.pi) {
+                    self.prior_kl_hist.add(kl);
+                    self.prior_kl_sum += kl;
+                    self.prior_kl_n = self.prior_kl_n.saturating_add(1);
+                }
+                let (_, _, _, a_prior) = dist_entropy_max_eff_argmax(prior_noisy);
+                let (_, _, _, a_visit) = dist_entropy_max_eff_argmax(&exec.search.pi);
+                if a_prior != a_visit {
+                    self.prior_argmax_overturn_n = self.prior_argmax_overturn_n.saturating_add(1);
+                }
+            }
+
+            // Noise impact: raw vs noisy priors.
+            if let (Some(raw), Some(noisy)) = (&exec.search.root_priors_raw, &exec.search.root_priors_noisy) {
+                self.noise_n = self.noise_n.saturating_add(1);
+                if let Some(kl) = kl_div(raw, noisy) {
+                    self.noise_kl_hist.add(kl);
+                    self.noise_kl_sum += kl;
+                    self.noise_kl_n = self.noise_kl_n.saturating_add(1);
+                }
+                let (_, _, _, a_raw) = dist_entropy_max_eff_argmax(raw);
+                let (_, _, _, a_noisy) = dist_entropy_max_eff_argmax(noisy);
+                if a_raw != a_noisy {
+                    self.noise_argmax_flip_n = self.noise_argmax_flip_n.saturating_add(1);
+                }
+            }
+
+            // Optional sampled root logs (worker-local NDJSON).
+            if self.root_sample_every_n > 0
+                && global_ply % (self.root_sample_every_n as u64) == 0
+            {
+                if let Some(w) = self.root_log.as_mut() {
+                    let (ent_s, maxp_s, _eff_s, argmax_s) = dist_entropy_max_eff_argmax(&exec.search.pi);
+                    let ev = yz_logging::MetricsMctsRootSampleV1 {
+                        event: "mcts_root_sample",
+                        ts_ms: yz_logging::now_ms(),
+                        v: self.v.clone(),
+                        run_id: self.run_id.clone(),
+                        git_hash: self.git_hash.clone(),
+                        config_snapshot: self.config_snapshot.clone(),
+                        global_ply,
+                        game_id: exec.game_id,
+                        game_ply: exec.game_ply,
+                        player_to_move: exec.player_to_move,
+                        rerolls_left: exec.rerolls_left,
+                        dice: exec.dice,
+                        chosen_action: exec.chosen_action,
+                        root_value: exec.search.root_value,
+                        fallbacks: exec.search.fallbacks,
+                        pending_count_max: exec.search.pending_count_max as u64,
+                        pending_collisions: exec.search.pending_collisions,
+                        pi: yz_logging::PiSummaryV1 {
+                            entropy: ent_s as f32,
+                            max_p: maxp_s as f32,
+                            argmax_a: argmax_s,
+                        },
+                    };
+                    let _ = w.write_event(&ev);
+                }
+            }
+        }
+    }
+
+    let root_sample_every_n = cfg.selfplay.root_sample_every_n;
+    let v = yz_logging::VersionInfoV1 {
+        protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+        feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+        action_space_id: "oracle_keepmask_v1",
+        ruleset_id: "swedish_scandinavian_v1",
+    };
+    let mut agg = Agg::new(
+        manifest.run_id.clone(),
+        worker_id,
+        num_workers,
+        games,
+        root_sample_every_n,
+        &logs_dir,
+        v,
+        manifest.git_hash.clone(),
+        manifest.config_snapshot.clone(),
+    );
+
     let mut completed_games: u32 = 0;
     let mut next_seq: u64 = parallel_games as u64;
     let mut last_progress_write = std::time::Instant::now();
@@ -794,7 +1127,7 @@ OPTIONS:
         }
         let before_steps = sched.stats().steps;
         let before_terminal = sched.stats().terminal;
-        sched.tick_and_write(&backend, &mut writer, None)
+        sched.tick_and_write_observe(&backend, &mut writer, None, Some(&mut agg))
             .unwrap_or_else(|e| {
                 eprintln!("worker {worker_id}: scheduler failed: {e}");
                 process::exit(1);
@@ -840,6 +1173,13 @@ OPTIONS:
 
         for t in sched.tasks_mut() {
             if yz_core::is_terminal(&t.state) {
+                // Record game summary before resetting.
+                agg.on_game_terminal(
+                    t.ply,
+                    t.turn_idx,
+                    t.state.players[0].total_score,
+                    t.state.players[1].total_score,
+                );
                 completed_games += 1;
                 // Progress update: cheap atomic write. Rate-limit a bit.
                 if completed_games == games || (completed_games % 5 == 0) {
@@ -933,6 +1273,18 @@ OPTIONS:
             wall_ms: t_start.elapsed().as_millis() as u64,
         });
         let _ = w.flush();
+    }
+
+    // Finalize and write worker-local selfplay summary (best-effort).
+    {
+        let wall_ms = t_start.elapsed().as_millis() as u64;
+        let summary = agg.finalize(wall_ms);
+        let path = logs_dir.join("selfplay_worker_summary.json");
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(&summary) {
+            let _ = std::fs::write(&tmp, &bytes);
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 

@@ -107,6 +107,13 @@ class SelfplayConfig(BaseModel):
     )
     workers: int = Field(description="Number of worker processes")
     threads_per_worker: int = Field(description="Number of threads per worker process")
+    root_sample_every_n: int = Field(
+        default=10,
+        description=(
+            "Emit a sampled root-search record every N executed moves (0 disables). "
+            "Used for lightweight search diagnostics without large logs."
+        ),
+    )
 
 
 class TrainingConfig(BaseModel):

@@ -340,6 +340,203 @@ pub struct MetricsSelfplayIterV1 {
     pub infer: InferStatsV1,
 }
 
+/// Uniform-binned histogram for cheap mergeable quantile estimates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistogramV1 {
+    pub lo: f64,
+    pub hi: f64,
+    pub bins: Vec<u64>,
+}
+
+impl HistogramV1 {
+    pub fn new(lo: f64, hi: f64, bins: usize) -> Self {
+        Self {
+            lo,
+            hi,
+            bins: vec![0; bins.max(1)],
+        }
+    }
+
+    pub fn add(&mut self, x: f64) {
+        if self.bins.is_empty() {
+            return;
+        }
+        let lo = self.lo;
+        let hi = self.hi;
+        let n = self.bins.len();
+        let idx = if !(x.is_finite()) || !(hi > lo) {
+            0usize
+        } else if x <= lo {
+            0usize
+        } else if x >= hi {
+            n - 1
+        } else {
+            let t = (x - lo) / (hi - lo);
+            let k = (t * (n as f64)) as usize;
+            k.min(n - 1)
+        };
+        self.bins[idx] = self.bins[idx].saturating_add(1);
+    }
+
+    pub fn merge_inplace(&mut self, other: &HistogramV1) {
+        if self.bins.len() != other.bins.len() || self.lo != other.lo || self.hi != other.hi {
+            // Defensive: incompatible histograms -> ignore.
+            return;
+        }
+        for (a, b) in self.bins.iter_mut().zip(other.bins.iter()) {
+            *a = a.saturating_add(*b);
+        }
+    }
+
+    pub fn total_count(&self) -> u64 {
+        self.bins.iter().copied().sum()
+    }
+
+    /// Approximate quantile from histogram bin counts.
+    pub fn quantile_estimate(&self, q: f64) -> Option<f64> {
+        let tot = self.total_count();
+        if tot == 0 || self.bins.is_empty() {
+            return None;
+        }
+        let q = q.clamp(0.0, 1.0);
+        let target = (q * (tot as f64)).ceil() as u64;
+        let mut acc = 0u64;
+        let n = self.bins.len() as f64;
+        for (i, &c) in self.bins.iter().enumerate() {
+            acc = acc.saturating_add(c);
+            if acc >= target {
+                let w = (self.hi - self.lo) / n.max(1.0);
+                let x0 = self.lo + (i as f64) * w;
+                let x1 = (x0 + w).min(self.hi);
+                return Some((x0 + x1) * 0.5);
+            }
+        }
+        Some(self.hi)
+    }
+}
+
+/// Worker-local, mergeable self-play/search summary written by `yz selfplay-worker`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfplayWorkerSummaryV1 {
+    pub event: String, // "selfplay_worker_summary"
+    pub ts_ms: u64,
+    pub run_id: String,
+    pub worker_id: u32,
+    pub num_workers: u32,
+    pub games_target: u32,
+    pub games_completed: u32,
+    pub moves_executed: u64,
+    pub wall_ms: u64,
+    pub root_sample_every_n: u32,
+
+    // Visit-policy (MCTS pi) shape.
+    pub pi_entropy_hist: HistogramV1,     // range ~[0, 4]
+    pub pi_max_p_hist: HistogramV1,       // [0,1]
+    pub pi_eff_actions_hist: HistogramV1, // [1,A]
+
+    // Search outcomes.
+    pub root_value_sum: f64,
+    pub root_value_sumsq: f64,
+    pub root_value_n: u64,
+    pub fallbacks_sum: u64,
+    pub fallbacks_nz: u64,
+    pub pending_collisions_sum: u64,
+    pub pending_count_max_hist: HistogramV1,
+
+    // Prior vs visit (search improvement).
+    pub prior_kl_hist: HistogramV1, // [0,3] (clamped)
+    pub prior_kl_sum: f64,
+    pub prior_kl_n: u64,
+    pub prior_n: u64,
+    pub prior_argmax_overturn_n: u64,
+
+    // Root noise effect (raw prior vs noisy prior).
+    pub noise_kl_hist: HistogramV1, // [0,3] (clamped)
+    pub noise_kl_sum: f64,
+    pub noise_kl_n: u64,
+    pub noise_n: u64,
+    pub noise_argmax_flip_n: u64,
+
+    // Game stats.
+    pub game_ply_hist: HistogramV1,  // [0,256] (clamped)
+    pub game_turn_hist: HistogramV1, // [0,64] (clamped)
+    pub score_p0_hist: HistogramV1,  // [0,400] (clamped)
+    pub score_p1_hist: HistogramV1,  // [0,400] (clamped)
+    pub score_diff_hist: HistogramV1, // [-400,400] (clamped)
+}
+
+/// Unified per-iteration self-play/search summary emitted by the controller into metrics.ndjson.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSelfplaySummaryV1 {
+    pub event: &'static str, // "selfplay_summary"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+    pub iter_idx: u32,
+
+    pub workers: u32,
+    pub games_completed: u32,
+    pub moves_executed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moves_s_mean: Option<f64>,
+
+    // Visit policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_entropy_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_entropy_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_entropy_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_max_p_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_max_p_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_eff_actions_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_eff_actions_p95: Option<f64>,
+
+    // Search stability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_value_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_value_std: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_collisions_per_move: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_count_max_p95: Option<f64>,
+
+    // Search improvement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_kl_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_kl_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_argmax_overturn_rate: Option<f64>,
+
+    // Noise impact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_kl_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_kl_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_argmax_flip_rate: Option<f64>,
+
+    // Game length / score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_ply_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_ply_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_diff_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_diff_p95: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricsMctsRootSampleV1 {
     pub event: &'static str, // "mcts_root_sample"
