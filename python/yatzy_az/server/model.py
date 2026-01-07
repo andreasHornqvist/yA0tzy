@@ -64,6 +64,7 @@ class TorchModel(Model):
         cfg = ckpt.config
         hidden = int(cfg["hidden"])
         blocks = int(cfg["blocks"])
+        kind = str(cfg.get("kind", "residual"))
 
         from ..model import YatzyNet, YatzyNetConfig
 
@@ -82,7 +83,7 @@ class TorchModel(Model):
             if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
                 raise RuntimeError("device=mps requested but torch.backends.mps.is_available() is false")
 
-        m = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks))
+        m = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks, kind=kind))
         m.load_state_dict(ckpt.model, strict=True)
         m.eval()
         m.to(self._device)

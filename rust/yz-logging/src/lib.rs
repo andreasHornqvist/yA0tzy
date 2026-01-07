@@ -612,10 +612,11 @@ fn dbg_outlier_start() -> Option<mpsc::Sender<String>> {
     std::thread::Builder::new()
         .name("yz-logging-debuglog".to_string())
         .spawn(move || {
+            let _ = std::fs::create_dir_all(".cursor");
             let mut f = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+                .open(std::path::Path::new(".cursor").join("debug.log"))
                 .ok();
             let mut bw = f.as_mut().map(|ff| BufWriter::with_capacity(1 << 20, ff));
             let mut n: u32 = 0;

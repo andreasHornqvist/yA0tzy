@@ -1117,6 +1117,7 @@ gating:
                     dirichlet_alpha: 0.3,
                     dirichlet_epsilon: 0.0,
                     max_inflight: 4,
+                    virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
                     virtual_loss: 1.0,
                 },
             },

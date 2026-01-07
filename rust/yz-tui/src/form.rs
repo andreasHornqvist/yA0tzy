@@ -56,6 +56,8 @@ pub enum FieldId {
     MctsTempT0,
     MctsTempT1,
     MctsTempCutoffPly,
+    MctsVirtualLossMode,
+    MctsVirtualLoss,
 
     // selfplay
     SelfplayGamesPerIteration,
@@ -87,6 +89,7 @@ pub enum FieldId {
     // model
     ModelHiddenDim,
     ModelNumBlocks,
+    ModelKind,
 }
 
 impl FieldId {
@@ -114,7 +117,9 @@ impl FieldId {
             | FieldId::MctsTempKind
             | FieldId::MctsTempT0
             | FieldId::MctsTempT1
-            | FieldId::MctsTempCutoffPly => Section::Search,
+            | FieldId::MctsTempCutoffPly
+            | FieldId::MctsVirtualLossMode
+            | FieldId::MctsVirtualLoss => Section::Search,
 
             // Pipeline: Controller (iterations) + Self-play + Gating
             FieldId::ControllerTotalIterations
@@ -136,7 +141,8 @@ impl FieldId {
             | FieldId::TrainingWeightDecay
             | FieldId::TrainingStepsPerIteration
             | FieldId::ModelHiddenDim
-            | FieldId::ModelNumBlocks => Section::Learning,
+            | FieldId::ModelNumBlocks
+            | FieldId::ModelKind => Section::Learning,
 
             // Data: Replay
             FieldId::ReplayCapacityShards => Section::Data,
@@ -166,6 +172,8 @@ impl FieldId {
             FieldId::MctsTempT0 => "mcts.temperature_schedule.t0",
             FieldId::MctsTempT1 => "mcts.temperature_schedule.t1",
             FieldId::MctsTempCutoffPly => "mcts.temperature_schedule.cutoff_ply",
+            FieldId::MctsVirtualLossMode => "mcts.virtual_loss_mode",
+            FieldId::MctsVirtualLoss => "mcts.virtual_loss",
 
             FieldId::SelfplayGamesPerIteration => "selfplay.games_per_iteration",
             FieldId::SelfplayWorkers => "selfplay.workers",
@@ -191,6 +199,7 @@ impl FieldId {
 
             FieldId::ModelHiddenDim => "model.hidden_dim",
             FieldId::ModelNumBlocks => "model.num_blocks",
+            FieldId::ModelKind => "model.kind",
         }
     }
 }
@@ -268,6 +277,8 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::MctsTempT0,
     FieldId::MctsTempT1,
     FieldId::MctsTempCutoffPly,
+    FieldId::MctsVirtualLossMode,
+    FieldId::MctsVirtualLoss,
     // Pipeline: Controller (iterations) + Self-play + Gating
     FieldId::ControllerTotalIterations,
     FieldId::SelfplayGamesPerIteration,
@@ -288,6 +299,7 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::TrainingStepsPerIteration,
     FieldId::ModelHiddenDim,
     FieldId::ModelNumBlocks,
+    FieldId::ModelKind,
     // Data: Replay
     FieldId::ReplayCapacityShards,
 ];

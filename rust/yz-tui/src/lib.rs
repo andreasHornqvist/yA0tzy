@@ -283,7 +283,43 @@ impl App {
             self.shutdown_exit_after = false;
             self.status = "cancelling… waiting for shutdown".to_string();
         } else {
-            self.status = "no active run".to_string();
+            // If the run was started outside the TUI (e.g. `yz start-run`), request cancel via
+            // run-local cancel.request so the controller can observe it.
+            let Some(run_dir) = self.run_dir() else {
+                self.status = "no active run".to_string();
+                return;
+            };
+            let run_json = run_dir.join("run.json");
+            if !run_json.exists() {
+                self.status = "no active run".to_string();
+                return;
+            }
+            match yz_logging::read_manifest(&run_json) {
+                Ok(m) => {
+                    let phase = m.controller_phase.as_deref().unwrap_or("");
+                    let running = matches!(phase, "selfplay" | "train" | "gate");
+                    if running {
+                        let tmp = run_dir.join("cancel.request.tmp");
+                        let p = run_dir.join("cancel.request");
+                        if std::fs::write(&tmp, format!("ts_ms: {}\n", yz_logging::now_ms()))
+                            .and_then(|_| std::fs::rename(&tmp, &p))
+                            .is_ok()
+                        {
+                            self.shutdown_requested = true;
+                            self.shutdown_exit_after = false;
+                            self.enter_dashboard();
+                            self.status = "cancel requested… (waiting for controller)".to_string();
+                        } else {
+                            self.status = "cancel request failed".to_string();
+                        }
+                    } else {
+                        self.status = "no active run".to_string();
+                    }
+                }
+                Err(_) => {
+                    self.status = "no active run".to_string();
+                }
+            }
         }
     }
 
@@ -300,6 +336,24 @@ impl App {
             self.status = "cancelling… waiting for shutdown".to_string();
             false
         } else {
+            // If the run is active but was started outside the TUI, request cancel and exit.
+            let Some(run_dir) = self.run_dir() else {
+                return true;
+            };
+            let run_json = run_dir.join("run.json");
+            if !run_json.exists() {
+                return true;
+            }
+            if let Ok(m) = yz_logging::read_manifest(&run_json) {
+                let phase = m.controller_phase.as_deref().unwrap_or("");
+                let running = matches!(phase, "selfplay" | "train" | "gate");
+                if running {
+                    let tmp = run_dir.join("cancel.request.tmp");
+                    let p = run_dir.join("cancel.request");
+                    let _ = std::fs::write(&tmp, format!("ts_ms: {}\n", yz_logging::now_ms()))
+                        .and_then(|_| std::fs::rename(&tmp, &p));
+                }
+            }
             true
         }
     }
@@ -653,6 +707,14 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 TemperatureSchedule::Step { .. } => TemperatureSchedule::Constant { t0 },
             };
         }
+        FieldId::MctsVirtualLossMode => {
+            // Cycle: q_penalty → n_virtual_only → off → q_penalty
+            app.cfg.mcts.virtual_loss_mode = match app.cfg.mcts.virtual_loss_mode.as_str() {
+                "q_penalty" => "n_virtual_only".to_string(),
+                "n_virtual_only" => "off".to_string(),
+                _ => "q_penalty".to_string(),
+            };
+        }
         FieldId::TrainingMode => {
             // Toggle between epochs mode (steps_per_iteration=None) and steps mode
             if app.cfg.training.steps_per_iteration.is_some() {
@@ -663,6 +725,13 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 // Default to 500 steps if not set
                 app.cfg.training.steps_per_iteration = Some(500);
             }
+        }
+        FieldId::ModelKind => {
+            // Cycle: residual → mlp → residual
+            app.cfg.model.kind = match app.cfg.model.kind.as_str() {
+                "residual" => "mlp".to_string(),
+                _ => "residual".to_string(),
+            };
         }
         _ => {}
     }
@@ -838,6 +907,20 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 _ => Err("cutoff_ply only applies when kind=step".to_string()),
             }
         }
+        FieldId::MctsVirtualLossMode => {
+            let s = buf.trim().to_lowercase();
+            match s.as_str() {
+                "q_penalty" | "n_virtual_only" | "off" => {
+                    cfg.mcts.virtual_loss_mode = s;
+                    Ok(())
+                }
+                _ => Err("virtual_loss_mode must be q_penalty|n_virtual_only|off".to_string()),
+            }
+        }
+        FieldId::MctsVirtualLoss => {
+            cfg.mcts.virtual_loss = buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
+            Ok(())
+        }
 
         FieldId::SelfplayGamesPerIteration => {
             cfg.selfplay.games_per_iteration =
@@ -956,6 +1039,16 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
             cfg.model.num_blocks = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
             Ok(())
         }
+        FieldId::ModelKind => {
+            let s = buf.trim().to_lowercase();
+            match s.as_str() {
+                "residual" | "mlp" => {
+                    cfg.model.kind = s;
+                    Ok(())
+                }
+                _ => Err("model.kind must be residual|mlp".to_string()),
+            }
+        }
     }
 }
 
@@ -1002,6 +1095,8 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             TemperatureSchedule::Step { cutoff_ply, .. } => cutoff_ply.to_string(),
             _ => "(n/a)".to_string(),
         },
+        FieldId::MctsVirtualLossMode => cfg.mcts.virtual_loss_mode.clone(),
+        FieldId::MctsVirtualLoss => format!("{:.3}", cfg.mcts.virtual_loss),
 
         FieldId::SelfplayGamesPerIteration => cfg.selfplay.games_per_iteration.to_string(),
         FieldId::SelfplayWorkers => cfg.selfplay.workers.to_string(),
@@ -1045,6 +1140,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
 
         FieldId::ModelHiddenDim => cfg.model.hidden_dim.to_string(),
         FieldId::ModelNumBlocks => cfg.model.num_blocks.to_string(),
+        FieldId::ModelKind => cfg.model.kind.clone(),
     }
 }
 
@@ -1052,6 +1148,19 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
     let mut next = app.cfg.clone();
     let d = if dir >= 0 { 1.0 } else { -1.0 };
     let ok = match field {
+        FieldId::MctsVirtualLossMode => {
+            let opts = ["q_penalty", "n_virtual_only", "off"];
+            let cur = next.mcts.virtual_loss_mode.as_str();
+            let mut idx = opts.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+            idx = (idx + dir.signum()).rem_euclid(opts.len() as i32);
+            next.mcts.virtual_loss_mode = opts[idx as usize].to_string();
+            true
+        }
+        FieldId::MctsVirtualLoss => {
+            let inc = if step == StepSize::Large { 1.0 } else { 0.1 };
+            next.mcts.virtual_loss = (next.mcts.virtual_loss as f64 + d * inc).max(0.0) as f32;
+            true
+        }
         FieldId::InferMaxBatch => {
             let inc = if step == StepSize::Large { 8 } else { 1 };
             next.inference.max_batch = if dir >= 0 {
@@ -1291,6 +1400,14 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
             } else {
                 next.model.num_blocks.saturating_sub(inc).max(1)
             };
+            true
+        }
+        FieldId::ModelKind => {
+            let opts = ["residual", "mlp"];
+            let cur = next.model.kind.as_str();
+            let mut idx = opts.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+            idx = (idx + dir.signum()).rem_euclid(opts.len() as i32);
+            next.model.kind = opts[idx as usize].to_string();
             true
         }
         _ => false,

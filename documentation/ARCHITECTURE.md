@@ -84,6 +84,18 @@ cargo clippy --workspace -- -D warnings  # Lint
 make run                        # Optimized default (release)
 make run-dev                    # Debug build (slow, for debugging)
 
+# Experiment CLI (small A/B runs)
+#
+# Start a run from a config file (creates runs/<name> or runs/<name>_<ts>):
+cargo run -p yz-cli --bin yz -- start-run --run-name exp1 --config /tmp/cfg.yaml
+#
+# Run an existing run directory in the foreground and print per-iteration summaries:
+cargo run -p yz-cli --bin yz -- controller --run-dir runs/exp1 --print-iter-table
+#
+# Cancel from another terminal:
+# - open `yz tui`, select the run, and press `x` (or `q`) which writes runs/<id>/cancel.request
+# - the controller polls for cancel.request and shuts down cleanly
+
 # Opt-in Rust↔Python inference e2e test (E6.5S6)
 YZ_PY_E2E=1 cargo test -p yz-mcts --test python_infer_e2e
 

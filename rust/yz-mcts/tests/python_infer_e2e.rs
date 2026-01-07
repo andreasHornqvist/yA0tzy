@@ -141,6 +141,7 @@ fn python_infer_server_real_checkpoint_e2e_opt_in() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
+        virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     })
     .unwrap();

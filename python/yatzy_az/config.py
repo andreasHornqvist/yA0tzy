@@ -84,6 +84,19 @@ class MctsConfig(BaseModel):
             'Example: {"kind":"step","t0":1.0,"t1":0.0,"cutoff_ply":10}'
         ),
     )
+    virtual_loss_mode: str = Field(
+        default="q_penalty",
+        description=(
+            "Virtual-loss/inflight scheme.\n"
+            "- q_penalty: reserve visits and subtract virtual loss from Q while pending (default)\n"
+            "- n_virtual_only: reserve visits only (AlphaYatzy-style)\n"
+            "- off: no reservations"
+        ),
+    )
+    virtual_loss: float = Field(
+        default=1.0,
+        description="Virtual loss magnitude (used when virtual_loss_mode != off).",
+    )
 
 
 class SelfplayConfig(BaseModel):
@@ -154,6 +167,14 @@ class ModelConfig(BaseModel):
 
     hidden_dim: int = Field(default=256, description="Hidden layer size for the neural network")
     num_blocks: int = Field(default=2, description="Number of residual blocks in the network")
+    kind: str = Field(
+        default="residual",
+        description=(
+            "Model architecture kind.\n"
+            "- residual: residual MLP with LayerNorm (default)\n"
+            "- mlp: plain MLP (AlphaYatzy-style)"
+        ),
+    )
 
 
 class GatingConfig(BaseModel):

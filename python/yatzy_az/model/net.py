@@ -22,6 +22,7 @@ A: int = 47
 class YatzyNetConfig:
     hidden: int = 256
     blocks: int = 2
+    kind: str = "residual"  # residual|mlp
 
 
 class ResidualBlock(nn.Module):
@@ -45,10 +46,31 @@ class YatzyNet(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.inp = nn.Linear(F, cfg.hidden)
-        self.norm = nn.LayerNorm(cfg.hidden)
+        kind = str(cfg.kind).strip().lower()
+        if kind not in {"residual", "mlp"}:
+            raise ValueError(f"invalid model kind: {cfg.kind!r} (expected 'residual' or 'mlp')")
+
+        self.kind = kind
         self.act = nn.ReLU()
-        self.blocks = nn.ModuleList([ResidualBlock(cfg.hidden) for _ in range(cfg.blocks)])
+
+        if kind == "residual":
+            self.inp = nn.Linear(F, cfg.hidden)
+            self.norm = nn.LayerNorm(cfg.hidden)
+            self.blocks = nn.ModuleList([ResidualBlock(cfg.hidden) for _ in range(cfg.blocks)])
+            self.mlp_layers = None
+        else:
+            # Plain MLP trunk (AlphaYatzy-style). `blocks` is interpreted as number of hidden layers.
+            layers: list[nn.Module] = []
+            in_dim = F
+            n_layers = max(1, int(cfg.blocks))
+            for _ in range(n_layers):
+                layers.append(nn.Linear(in_dim, cfg.hidden))
+                layers.append(nn.ReLU())
+                in_dim = cfg.hidden
+            self.mlp_layers = nn.Sequential(*layers)
+            self.inp = None
+            self.norm = None
+            self.blocks = None
 
         self.policy = nn.Linear(cfg.hidden, A)
         self.value = nn.Linear(cfg.hidden, 1)
@@ -57,11 +79,16 @@ class YatzyNet(nn.Module):
         """Return (policy_logits[B,A], value[B])."""
         if x.ndim != 2 or x.shape[1] != F:
             raise ValueError(f"expected x shape [B,{F}], got {tuple(x.shape)}")
-        h = self.inp(x)
-        h = self.norm(h)
-        h = self.act(h)
-        for b in self.blocks:
-            h = b(h)
+        if self.kind == "residual":
+            assert self.inp is not None and self.norm is not None and self.blocks is not None
+            h = self.inp(x)
+            h = self.norm(h)
+            h = self.act(h)
+            for b in self.blocks:
+                h = b(h)
+        else:
+            assert self.mlp_layers is not None
+            h = self.mlp_layers(x)
         logits = self.policy(h)
         v = torch.tanh(self.value(h).squeeze(-1))
         return logits, v

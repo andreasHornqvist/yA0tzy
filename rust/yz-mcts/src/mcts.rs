@@ -41,8 +41,8 @@ fn dbg_log_line(line: String) {
         std::thread::Builder::new()
             .name("yz-mcts-debuglog".to_string())
             .spawn(move || {
-                let path =
-                    std::path::Path::new("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log");
+                let _ = std::fs::create_dir_all(".cursor");
+                let path = std::path::Path::new(".cursor").join("debug.log");
                 let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path);
                 let mut w = f.as_mut().ok().map(|ff| std::io::BufWriter::with_capacity(1 << 20, ff));
                 let mut lines_since_flush: u32 = 0;
@@ -217,8 +217,20 @@ pub struct MctsConfig {
     pub dirichlet_epsilon: f32,
     /// Maximum in-flight leaf evaluations per search.
     pub max_inflight: usize,
+    /// Virtual-loss/inflight scheme.
+    pub virtual_loss_mode: VirtualLossMode,
     /// Virtual loss to apply while a leaf is pending.
     pub virtual_loss: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtualLossMode {
+    /// Reserve visits and subtract virtual loss from Q while pending (current behavior).
+    QPenalty,
+    /// Reserve visits only (affects counts / selection), but do not subtract from Q/W.
+    NVirtualOnly,
+    /// No reservations at all.
+    Off,
 }
 
 impl Default for MctsConfig {
@@ -230,6 +242,7 @@ impl Default for MctsConfig {
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.25,
             max_inflight: 8,
+            virtual_loss_mode: VirtualLossMode::QPenalty,
             virtual_loss: 1.0,
         }
     }
@@ -598,28 +611,40 @@ impl Mcts {
     }
 
     fn apply_virtual_loss_path(&mut self, path: &[(NodeId, usize, u8, u8)]) {
+        if self.cfg.virtual_loss_mode == VirtualLossMode::Off {
+            return;
+        }
         if path.is_empty() {
             return;
         }
         for &(node_id, a_idx, _pt, _ct) in path {
             let n = self.arena.get_mut(node_id);
             n.vl_n[a_idx] = n.vl_n[a_idx].saturating_add(1);
-            n.vl_w[a_idx] += self.cfg.virtual_loss;
+            if self.cfg.virtual_loss_mode == VirtualLossMode::QPenalty {
+                n.vl_w[a_idx] += self.cfg.virtual_loss;
+            }
             n.vl_sum = n.vl_sum.saturating_add(1);
         }
     }
 
     fn remove_virtual_loss_path(&mut self, path: &[(NodeId, usize, u8, u8)]) {
+        if self.cfg.virtual_loss_mode == VirtualLossMode::Off {
+            return;
+        }
         for &(node_id, a_idx, _pt, _ct) in path.iter().rev() {
             let n = self.arena.get_mut(node_id);
             n.vl_n[a_idx] = n.vl_n[a_idx].saturating_sub(1);
-            n.vl_w[a_idx] -= self.cfg.virtual_loss;
+            if self.cfg.virtual_loss_mode == VirtualLossMode::QPenalty {
+                n.vl_w[a_idx] -= self.cfg.virtual_loss;
+            }
             n.vl_sum = n.vl_sum.saturating_sub(1);
         }
     }
 
     fn backup_with_virtual_loss(&mut self, path: &[(NodeId, usize, u8, u8)], v_leaf: f32) {
-        self.remove_virtual_loss_path(path);
+        if self.cfg.virtual_loss_mode != VirtualLossMode::Off {
+            self.remove_virtual_loss_path(path);
+        }
         self.backup(path, v_leaf);
     }
 
@@ -670,8 +695,9 @@ impl Mcts {
 
     fn select_action(&mut self, node_id: NodeId, legal: LegalMask, mode: ChanceMode) -> u8 {
         let n = self.arena.get(node_id);
-        let use_vl = self.cfg.virtual_loss > 0.0;
-        let n_sum_eff = if use_vl {
+        let use_virtual_counts = self.cfg.virtual_loss_mode != VirtualLossMode::Off;
+        let use_q_penalty = self.cfg.virtual_loss_mode == VirtualLossMode::QPenalty;
+        let n_sum_eff = if use_virtual_counts {
             n.n_sum.saturating_add(n.vl_sum)
         } else {
             n.n_sum
@@ -685,8 +711,8 @@ impl Mcts {
             if !legal_ok(legal, a) {
                 continue;
             }
-            let q = n.q_eff(a, use_vl);
-            let n_eff = if use_vl {
+            let q = if use_q_penalty { n.q_eff(a, true) } else { n.q(a) };
+            let n_eff = if use_virtual_counts {
                 n.n[a].saturating_add(n.vl_n[a]) as f32
             } else {
                 n.n[a] as f32
@@ -706,7 +732,7 @@ impl Mcts {
         }
 
         // Collision: chose an edge that already has a pending reservation.
-        if self.arena.get(node_id).vl_n[best_a as usize] > 0 {
+        if use_virtual_counts && self.arena.get(node_id).vl_n[best_a as usize] > 0 {
             self.stats.pending_collisions += 1;
         }
 
@@ -800,8 +826,9 @@ pub fn bench_select_action_v1(
     legal: LegalMask,
     mode: ChanceMode,
 ) -> u8 {
-    let use_vl = cfg.virtual_loss > 0.0;
-    let n_sum_eff = if use_vl {
+    let use_virtual_counts = cfg.virtual_loss_mode != VirtualLossMode::Off;
+    let use_q_penalty = cfg.virtual_loss_mode == VirtualLossMode::QPenalty;
+    let n_sum_eff = if use_virtual_counts {
         node.n_sum.saturating_add(node.vl_sum)
     } else {
         node.n_sum
@@ -815,8 +842,8 @@ pub fn bench_select_action_v1(
         if !legal_ok(legal, a) {
             continue;
         }
-        let q = node.q_eff(a, use_vl);
-        let n_eff = if use_vl {
+        let q = if use_q_penalty { node.q_eff(a, true) } else { node.q(a) };
+        let n_eff = if use_virtual_counts {
             node.n[a].saturating_add(node.vl_n[a]) as f32
         } else {
             node.n[a] as f32

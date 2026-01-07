@@ -40,10 +40,11 @@ fn dbg_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json:
         "data": data,
     });
     if let Ok(line) = serde_json::to_string(&payload) {
+        let _ = std::fs::create_dir_all(".cursor");
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+            .open(std::path::Path::new(".cursor").join("debug.log"))
         {
             let _ = std::io::Write::write_all(&mut f, line.as_bytes());
             let _ = std::io::Write::write_all(&mut f, b"\n");

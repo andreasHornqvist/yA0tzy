@@ -66,6 +66,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--value-lambda", type=float, default=1.0, help="Weight for value loss")
     p.add_argument("--hidden", type=int, default=256, help="Hidden size")
     p.add_argument("--blocks", type=int, default=2, help="Number of residual blocks")
+    p.add_argument(
+        "--kind",
+        default="residual",
+        choices=["residual", "mlp"],
+        help="Model kind (architecture).",
+    )
     p.add_argument("--log-every", type=int, default=25, help="Log scalars every N steps")
     p.add_argument(
         "--snapshot",
@@ -88,26 +94,40 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
     return d
 
 
-def _init_model_and_opt(*, hidden: int, blocks: int, lr: float, weight_decay: float, device):
+def _init_model_and_opt(
+    *, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, device
+):
     import torch
 
     from ..model import YatzyNet, YatzyNetConfig
 
-    model = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks)).to(device)
+    # Note: `blocks` means residual blocks for kind=residual, or MLP hidden layers for kind=mlp.
+    model = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks, kind=str(kind))).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(weight_decay))
     return model, opt
 
 
 def init_from_best(
-    *, best_path: Path, hidden: int, blocks: int, lr: float, weight_decay: float, device
+    *, best_path: Path, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, device
 ):
     """Initialize candidate from best weights with a fresh optimizer (no state)."""
     d = _load_checkpoint(best_path)
     if "model" not in d:
         raise RuntimeError(f"best checkpoint missing 'model' key: {best_path}")
+    best_cfg = d.get("config", {}) if isinstance(d.get("config", {}), dict) else {}
+    best_kind = str(best_cfg.get("kind", "residual"))
+    if str(kind).strip().lower() != str(best_kind).strip().lower():
+        raise RuntimeError(
+            f"model kind mismatch: best.pt kind={best_kind!r} but requested kind={kind!r}"
+        )
 
     model, opt = _init_model_and_opt(
-        hidden=hidden, blocks=blocks, lr=lr, weight_decay=weight_decay, device=device
+        hidden=hidden,
+        blocks=blocks,
+        kind=str(kind),
+        lr=lr,
+        weight_decay=weight_decay,
+        device=device,
     )
     model.load_state_dict(d["model"])
 
@@ -119,15 +139,26 @@ def init_from_best(
 
 
 def resume_candidate(
-    *, candidate_path: Path, hidden: int, blocks: int, lr: float, weight_decay: float, device
+    *, candidate_path: Path, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, device
 ):
     """Resume candidate training by loading model + optimizer state."""
     d = _load_checkpoint(candidate_path)
     if "model" not in d:
         raise RuntimeError(f"candidate checkpoint missing 'model' key: {candidate_path}")
+    cand_cfg = d.get("config", {}) if isinstance(d.get("config", {}), dict) else {}
+    cand_kind = str(cand_cfg.get("kind", "residual"))
+    if str(kind).strip().lower() != str(cand_kind).strip().lower():
+        raise RuntimeError(
+            f"model kind mismatch: candidate.pt kind={cand_kind!r} but requested kind={kind!r}"
+        )
 
     model, opt = _init_model_and_opt(
-        hidden=hidden, blocks=blocks, lr=lr, weight_decay=weight_decay, device=device
+        hidden=hidden,
+        blocks=blocks,
+        kind=str(kind),
+        lr=lr,
+        weight_decay=weight_decay,
+        device=device,
     )
     model.load_state_dict(d["model"])
     if "optimizer" in d and d["optimizer"] is not None:
@@ -535,6 +566,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             candidate_path=Path(args.resume),
             hidden=int(args.hidden),
             blocks=int(args.blocks),
+            kind=str(args.kind),
             lr=float(args.lr),
             weight_decay=float(args.weight_decay),
             device=device,
@@ -546,6 +578,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             best_path=Path(args.best),
             hidden=int(args.hidden),
             blocks=int(args.blocks),
+            kind=str(args.kind),
             lr=float(args.lr),
             weight_decay=float(args.weight_decay),
             device=device,
@@ -653,6 +686,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             "config": {
                 "hidden": int(args.hidden),
                 "blocks": int(args.blocks),
+                "kind": str(args.kind),
                 "feature_len": FEATURE_LEN,
                 "action_space_a": ACTION_SPACE_A,
             },

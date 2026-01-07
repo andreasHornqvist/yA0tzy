@@ -1,5 +1,5 @@
 use thiserror::Error;
-use yz_core::{apply_action, index_to_action, is_terminal, GameState};
+use yz_core::{apply_action, index_to_action, is_terminal, Action, GameState};
 use yz_features::schema::F;
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchDriver};
 use yz_replay::ReplaySample;
@@ -63,6 +63,8 @@ struct PendingSample {
 pub struct GameTask {
     pub game_id: u64,
     pub ply: u32,
+    /// Scoring turn index (number of Mark actions taken so far).
+    pub turn_idx: u32,
     pub state: GameState,
     pub mode: ChanceMode,
     pub temperature_schedule: TemperatureSchedule,
@@ -84,6 +86,7 @@ impl GameTask {
         Self {
             game_id,
             ply: 0,
+            turn_idx: 0,
             state,
             mode,
             temperature_schedule,
@@ -93,11 +96,11 @@ impl GameTask {
         }
     }
 
-    fn temperature_for_ply(&self) -> f32 {
+    fn temperature_for_turn(&self) -> f32 {
         match self.temperature_schedule {
             TemperatureSchedule::Constant { t0 } => t0,
             TemperatureSchedule::Step { t0, t1, cutoff_ply } => {
-                if self.ply < cutoff_ply {
+                if self.turn_idx < cutoff_ply {
                     t0
                 } else {
                     t1
@@ -174,7 +177,7 @@ impl GameTask {
                 // Choose executed action using temperature schedule (PRD §7.3).
                 // NOTE: this does NOT change the stored replay `pi` target (visit distribution).
                 let legal_b = yz_mcts::legal_action_mask_for_mode(&self.state, self.mode);
-                let t = self.temperature_for_ply();
+                let t = self.temperature_for_turn();
                 let exec_pi = yz_mcts::apply_temperature(&sr.pi, legal_b, t);
                 let chosen_action = if t == 0.0 {
                     // apply_temperature already returns a one-hot distribution in this case.
@@ -233,6 +236,9 @@ impl GameTask {
                 let next = apply_action(self.state, action, &mut ctx)
                     .map_err(|_| GameTaskError::IllegalTransition)?;
                 self.state = next;
+                if matches!(action, Action::Mark(_)) {
+                    self.turn_idx += 1;
+                }
                 self.ply += 1;
                 self.search = None;
                 let mut out_episode = None;
@@ -273,5 +279,37 @@ impl GameTask {
             executed: None,
             completed_episode: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yz_core::config::TemperatureSchedule;
+
+    #[test]
+    fn temperature_step_uses_turn_idx_not_ply() {
+        let mut ctx = yz_core::TurnContext::new_deterministic(1);
+        let s = yz_core::initial_state(&mut ctx);
+        let mut t = GameTask::new(
+            0,
+            s,
+            ChanceMode::Deterministic { episode_seed: 1 },
+            TemperatureSchedule::Step {
+                t0: 1.0,
+                t1: 0.0,
+                cutoff_ply: 1,
+            },
+            MctsConfig::default(),
+        );
+
+        // Before any marks: turn_idx=0 -> t0, regardless of ply.
+        t.ply = 999;
+        t.turn_idx = 0;
+        assert_eq!(t.temperature_for_turn(), 1.0);
+
+        // After one mark: turn_idx=1 -> t1.
+        t.turn_idx = 1;
+        assert_eq!(t.temperature_for_turn(), 0.0);
     }
 }

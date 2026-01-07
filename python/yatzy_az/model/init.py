@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-def init_model_checkpoint(out: Path, *, hidden: int, blocks: int) -> None:
+def init_model_checkpoint(out: Path, *, hidden: int, blocks: int, kind: str = "residual") -> None:
     """Create a fresh, contract-compliant checkpoint for inference/training bootstrap."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -16,7 +16,7 @@ def init_model_checkpoint(out: Path, *, hidden: int, blocks: int) -> None:
     from ..model import A, F, YatzyNet, YatzyNetConfig
     from ..replay_dataset import FEATURE_SCHEMA_ID, PROTOCOL_VERSION, RULESET_ID
 
-    model = YatzyNet(YatzyNetConfig(hidden=int(hidden), blocks=int(blocks)))
+    model = YatzyNet(YatzyNetConfig(hidden=int(hidden), blocks=int(blocks), kind=str(kind)))
     model.eval()
 
     payload: dict[str, Any] = {
@@ -25,6 +25,7 @@ def init_model_checkpoint(out: Path, *, hidden: int, blocks: int) -> None:
         "config": {
             "hidden": int(hidden),
             "blocks": int(blocks),
+            "kind": str(kind),
             "feature_len": int(F),
             "action_space_a": int(A),
         },

@@ -9,6 +9,9 @@ help:
 	@echo "  make run                      Start the TUI (release; fast default)"
 	@echo "  make run-dev                  Start the TUI (dev; faster compile, slower runtime)"
 	@echo "  make tui                      Run the Ratatui UI (yz tui)"
+	@echo "  make start-run RUN_NAME=<id> CONFIG=<path>   Start a run from a config file (release; prints table)"
+	@echo "  make controller RUN=<id>      Run runs/<id> in foreground and print the iteration table"
+	@echo "  make cancel RUN=<id>          Request cancel for runs/<id> (writes cancel.request)"
 	@echo "  make infer-server             Run Python inference server (with hot-reload)"
 	@echo ""
 	@echo "Rust:"
@@ -33,6 +36,8 @@ help:
 	@echo "  METRICS_BIND=<host:port>       Default: 127.0.0.1:18080"
 	@echo "  CONFIG=<path>                  Default: configs/local_cpu.yaml"
 	@echo "  RUN=<id>                       Run id under runs/"
+	@echo "  RUN_NAME=<id>                  Run name for start-run (directory under runs/)"
+	@echo "  DETACH=1                       Detach start-run (controller runs as child process)"
 
 .PHONY: _print_env
 _print_env:
@@ -105,6 +110,21 @@ run-dev:
 .PHONY: infer-server
 infer-server:
 	$(PY_RUN) -m yatzy_az infer-server --best dummy --cand dummy --bind $(INFER_BIND) --metrics-bind $(METRICS_BIND) --print-stats-every-s 0
+
+# Experiment CLI (release by default)
+.PHONY: start-run controller cancel
+start-run:
+	@if [ -z "$(RUN_NAME)" ]; then echo "Missing RUN_NAME=<id> (e.g. make start-run RUN_NAME=exp1 CONFIG=/tmp/cfg.yaml)"; exit 2; fi
+	@if [ -z "$(CONFIG)" ]; then echo "Missing CONFIG=<path> (e.g. make start-run RUN_NAME=exp1 CONFIG=/tmp/cfg.yaml)"; exit 2; fi
+	cargo run --release -p yz-cli --bin yz -- start-run --run-name "$(RUN_NAME)" --config "$(CONFIG)" --python-exe "$(PYTHON)" $(if $(DETACH),--detach,)
+
+controller:
+	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make controller RUN=exp1)"; exit 2; fi
+	cargo run --release -p yz-cli --bin yz -- controller --run-dir "runs/$(RUN)" --python-exe "$(PYTHON)" --print-iter-table
+
+cancel:
+	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make cancel RUN=exp1)"; exit 2; fi
+	@mkdir -p "runs/$(RUN)" && echo "ts_ms: $$(date +%s000)" > "runs/$(RUN)/cancel.request" && echo "cancel requested: runs/$(RUN)"
 
 # Convenience wrappers. These assume a run id under ./runs/<id>/.
 .PHONY: selfplay train gate

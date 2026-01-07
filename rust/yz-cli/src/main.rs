@@ -13,6 +13,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 use std::process::Command;
+use std::time::Duration;
 
 /// Print the oracle's optimal expected score for a fresh game.
 fn cmd_oracle_expected() {
@@ -111,6 +112,8 @@ USAGE:
 COMMANDS:
     oracle expected     Print oracle expected score (~248.44)
     oracle sim          Run oracle solitaire simulation
+    start-run           Create a run from a config file and start it (foreground by default)
+    controller          Run a run-dir (runs/<id>) in the foreground and print iteration summaries
     selfplay            Run self-play with MCTS + inference
     selfplay-worker     Internal: run one self-play worker process (spawned by controller)
     gate                Gate candidate vs best model (paired seed + side swap)
@@ -127,6 +130,366 @@ OPTIONS:
 For more information, see the PRD or run `yz <COMMAND> --help`.
 "#
     );
+}
+
+fn sanitize_run_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn ensure_unique_run_dir(runs_dir: &std::path::Path, base_name: &str) -> (String, PathBuf) {
+    let ts = yz_logging::now_ms();
+    let base = sanitize_run_name(base_name);
+    let id = if base.is_empty() {
+        format!("run_{ts}")
+    } else {
+        base
+    };
+    let mut final_id = id.clone();
+    if runs_dir.join(&final_id).exists() {
+        final_id = format!("{id}_{ts}");
+    }
+    let dir = runs_dir.join(&final_id);
+    (final_id, dir)
+}
+
+fn write_cancel_request(run_dir: &std::path::Path) -> std::io::Result<()> {
+    let p = run_dir.join("cancel.request");
+    let tmp = run_dir.join("cancel.request.tmp");
+    std::fs::write(&tmp, format!("ts_ms: {}\n", yz_logging::now_ms()))?;
+    std::fs::rename(&tmp, &p)?;
+    Ok(())
+}
+
+fn print_iteration_table_row(it: &yz_logging::IterationSummaryV1) {
+    let decision = match it.promoted {
+        Some(true) => "promote",
+        Some(false) => "reject",
+        None => "-",
+    };
+    let wr = it.gate.win_rate.map(|x| format!("{:.3}", x)).unwrap_or("-".to_string());
+    let oracle = it
+        .oracle
+        .match_rate_overall
+        .map(|x| format!("{:.3}", x))
+        .unwrap_or("-".to_string());
+    let lt = it
+        .train
+        .last_loss_total
+        .map(|x| format!("{:.3}", x))
+        .unwrap_or("-".to_string());
+    let lp = it
+        .train
+        .last_loss_policy
+        .map(|x| format!("{:.3}", x))
+        .unwrap_or("-".to_string());
+    let lv = it
+        .train
+        .last_loss_value
+        .map(|x| format!("{:.3}", x))
+        .unwrap_or("-".to_string());
+    let avg_score = it
+        .gate
+        .mean_cand_score
+        .map(|x| format!("{:.1}", x))
+        .unwrap_or("-".to_string());
+    let avg_best = it
+        .gate
+        .mean_best_score
+        .map(|x| format!("{:.1}", x))
+        .unwrap_or("-".to_string());
+
+    println!(
+        "{:>4}  {:<7}  {:>7}  {:>7}  {:>5}/{:>5}/{:>5}  {:>7}/{:>7}",
+        it.idx, decision, wr, oracle, lt, lp, lv, avg_score, avg_best
+    );
+}
+
+fn run_controller_foreground(
+    run_dir: PathBuf,
+    cfg: yz_core::Config,
+    python_exe: String,
+    print_iter_table: bool,
+    verbose_status: bool,
+) -> i32 {
+    let infer_endpoint = cfg.inference.bind.clone();
+    let handle = yz_controller::spawn_iteration(&run_dir, cfg, infer_endpoint, python_exe);
+    let run_json = run_dir.join("run.json");
+
+    let mut last_phase: Option<String> = None;
+    let mut last_status: Option<String> = None;
+    let mut printed_iters: u32 = 0;
+
+    if print_iter_table {
+        println!("Iter  Decision  WinRate  Oracle    Loss(t/p/v)     AvgScore(cand/best)");
+    }
+
+    while !handle.is_finished() {
+        if let Ok(m) = yz_logging::read_manifest(&run_json) {
+            if verbose_status && (m.controller_phase != last_phase || m.controller_status != last_status) {
+                last_phase = m.controller_phase.clone();
+                last_status = m.controller_status.clone();
+                if let (Some(p), Some(s)) = (last_phase.as_deref(), last_status.as_deref()) {
+                    println!("[phase={p}] {s}");
+                }
+            }
+            if print_iter_table {
+                for it in &m.iterations {
+                    // Print each completed iteration at most once.
+                    if it.idx >= printed_iters && it.ended_ts_ms.is_some() {
+                        print_iteration_table_row(it);
+                        printed_iters = it.idx.saturating_add(1);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    match handle.join() {
+        Ok(()) => 0,
+        Err(yz_controller::ControllerError::Cancelled) => 2,
+        Err(e) => {
+            eprintln!("controller failed: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_controller(args: &[String]) {
+    let mut run_dir: Option<String> = None;
+    let mut python_exe: String = "python".to_string();
+    let mut print_iter_table = false;
+    let mut verbose = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz controller
+
+USAGE:
+    yz controller --run-dir runs/<id> [--python-exe python] [--print-iter-table]
+
+OPTIONS:
+    --run-dir DIR           Run directory (contains config.yaml) (required)
+    --python-exe PATH       Python executable or \"python\" (uv-managed) (default: python)
+    --print-iter-table      Print one summary row per completed iteration to stdout
+"#
+                );
+                return;
+            }
+            "--run-dir" => {
+                run_dir = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--python-exe" => {
+                python_exe = args.get(i + 1).cloned().unwrap_or_else(|| "python".to_string());
+                i += 2;
+            }
+            "--print-iter-table" => {
+                print_iter_table = true;
+                i += 1;
+            }
+            "--verbose" => {
+                verbose = true;
+                i += 1;
+            }
+            "--cancel" => {
+                let rd = args.get(i + 1).cloned().unwrap_or_default();
+                if rd.is_empty() {
+                    eprintln!("Missing value for --cancel");
+                    process::exit(1);
+                }
+                if let Err(e) = write_cancel_request(std::path::Path::new(&rd)) {
+                    eprintln!("Failed to write cancel.request: {e}");
+                    process::exit(1);
+                }
+                println!("cancel requested: {}", std::path::Path::new(&rd).display());
+                return;
+            }
+            other => {
+                eprintln!("Unknown option for `yz controller`: {other}");
+                eprintln!("Run `yz controller --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let run_dir = run_dir.unwrap_or_else(|| {
+        eprintln!("Missing --run-dir");
+        process::exit(1);
+    });
+    let run_dir = PathBuf::from(run_dir);
+    let cfg_path = run_dir.join("config.yaml");
+    let cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config at {}: {e}", cfg_path.display());
+        process::exit(1);
+    });
+
+    let code = run_controller_foreground(run_dir, cfg, python_exe, print_iter_table, verbose);
+    process::exit(code);
+}
+
+fn cmd_start_run(args: &[String]) {
+    let mut run_name: Option<String> = None;
+    let mut cfg_path: Option<String> = None;
+    let mut runs_dir: String = "runs".to_string();
+    let mut python_exe: String = "python".to_string();
+    let mut detach = false;
+    let mut print_iter_table = true;
+    let mut verbose = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz start-run
+
+USAGE:
+    yz start-run --run-name NAME --config PATH [--runs-dir DIR] [--python-exe PATH] [--detach]
+
+OPTIONS:
+    --run-name NAME         Desired run name (directory under runs/) (required)
+    --config PATH           Path to YAML config file (required)
+    --runs-dir DIR          Runs directory (default: runs)
+    --python-exe PATH       Python executable or \"python\" (uv-managed) (default: python)
+    --detach                Spawn controller as a child process and return immediately
+    --no-print-iter-table   Disable iteration summary printing when running in foreground
+"#
+                );
+                return;
+            }
+            "--run-name" => {
+                run_name = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--config" => {
+                cfg_path = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--runs-dir" => {
+                runs_dir = args.get(i + 1).cloned().unwrap_or_else(|| "runs".to_string());
+                i += 2;
+            }
+            "--python-exe" => {
+                python_exe = args.get(i + 1).cloned().unwrap_or_else(|| "python".to_string());
+                i += 2;
+            }
+            "--detach" => {
+                detach = true;
+                i += 1;
+            }
+            "--no-print-iter-table" => {
+                print_iter_table = false;
+                i += 1;
+            }
+            "--verbose" => {
+                verbose = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("Unknown option for `yz start-run`: {other}");
+                eprintln!("Run `yz start-run --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let run_name = run_name.unwrap_or_else(|| {
+        eprintln!("Missing --run-name");
+        process::exit(1);
+    });
+    let cfg_path = cfg_path.unwrap_or_else(|| {
+        eprintln!("Missing --config");
+        process::exit(1);
+    });
+    if run_name.trim().is_empty() {
+        eprintln!("--run-name must be non-empty");
+        process::exit(1);
+    }
+    if cfg_path.trim().is_empty() {
+        eprintln!("--config must be non-empty");
+        process::exit(1);
+    }
+
+    let cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config at {cfg_path}: {e}");
+        process::exit(1);
+    });
+
+    let runs_dir = PathBuf::from(runs_dir);
+    std::fs::create_dir_all(&runs_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create runs dir {}: {e}", runs_dir.display());
+        process::exit(1);
+    });
+
+    let (run_id, run_dir) = ensure_unique_run_dir(&runs_dir, &run_name);
+
+    // Create the run dir + standard subdirs (nice UX + matches TUI behavior).
+    std::fs::create_dir_all(run_dir.join("logs")).unwrap_or_else(|e| {
+        eprintln!("Failed to create logs dir: {e}");
+        process::exit(1);
+    });
+    std::fs::create_dir_all(run_dir.join("models")).unwrap_or_else(|e| {
+        eprintln!("Failed to create models dir: {e}");
+        process::exit(1);
+    });
+    std::fs::create_dir_all(run_dir.join("replay")).unwrap_or_else(|e| {
+        eprintln!("Failed to create replay dir: {e}");
+        process::exit(1);
+    });
+
+    // Write normalized run config snapshot (same contract as controller/TUI).
+    if let Err(e) = yz_logging::write_config_snapshot_atomic(&run_dir, &cfg) {
+        eprintln!("Failed to write config.yaml: {e}");
+        process::exit(1);
+    }
+
+    // Clear any stale cancel request.
+    let _ = std::fs::remove_file(run_dir.join("cancel.request"));
+
+    println!("run_id: {run_id}");
+    println!("run_dir: {}", run_dir.display());
+
+    if detach {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("yz"));
+        let mut cmd = Command::new(exe);
+        cmd.arg("controller");
+        cmd.arg("--run-dir").arg(&run_dir);
+        cmd.arg("--python-exe").arg(&python_exe);
+        if print_iter_table {
+            cmd.arg("--print-iter-table");
+        }
+        if verbose {
+            cmd.arg("--verbose");
+        }
+        cmd.stdout(process::Stdio::inherit());
+        cmd.stderr(process::Stdio::inherit());
+        let _child = cmd.spawn().unwrap_or_else(|e| {
+            eprintln!("Failed to spawn controller: {e}");
+            process::exit(1);
+        });
+        return;
+    }
+
+    let total_iters = cfg.controller.total_iterations.unwrap_or(1).max(1);
+    if print_iter_table {
+        println!();
+        println!("Training for {total_iters} iterations:");
+        println!();
+    }
+    let code = run_controller_foreground(run_dir, cfg, python_exe, print_iter_table, verbose);
+    process::exit(code);
 }
 
 fn cmd_selfplay_worker(args: &[String]) {
@@ -267,7 +630,13 @@ OPTIONS:
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
-        virtual_loss: 1.0,
+        virtual_loss_mode: match cfg.mcts.virtual_loss_mode.as_str() {
+            "q_penalty" => yz_mcts::VirtualLossMode::QPenalty,
+            "n_virtual_only" => yz_mcts::VirtualLossMode::NVirtualOnly,
+            "off" => yz_mcts::VirtualLossMode::Off,
+            _ => yz_mcts::VirtualLossMode::QPenalty,
+        },
+        virtual_loss: cfg.mcts.virtual_loss.max(0.0),
     };
 
     // Replay output is worker-local to avoid collisions.
@@ -813,7 +1182,13 @@ OPTIONS:
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: cfg.mcts.dirichlet_epsilon,
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
-        virtual_loss: 1.0,
+        virtual_loss_mode: match cfg.mcts.virtual_loss_mode.as_str() {
+            "q_penalty" => yz_mcts::VirtualLossMode::QPenalty,
+            "n_virtual_only" => yz_mcts::VirtualLossMode::NVirtualOnly,
+            "off" => yz_mcts::VirtualLossMode::Off,
+            _ => yz_mcts::VirtualLossMode::QPenalty,
+        },
+        virtual_loss: cfg.mcts.virtual_loss.max(0.0),
     };
 
     let mut tasks = Vec::new();
@@ -1105,7 +1480,13 @@ OPTIONS:
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: 0.0, // gating: no root noise
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
-        virtual_loss: 1.0,
+        virtual_loss_mode: match cfg.mcts.virtual_loss_mode.as_str() {
+            "q_penalty" => yz_mcts::VirtualLossMode::QPenalty,
+            "n_virtual_only" => yz_mcts::VirtualLossMode::NVirtualOnly,
+            "off" => yz_mcts::VirtualLossMode::Off,
+            _ => yz_mcts::VirtualLossMode::QPenalty,
+        },
+        virtual_loss: cfg.mcts.virtual_loss.max(0.0),
     };
 
     // Progress + output directories (mirrors selfplay-worker layout, but under logs_gate_workers).
@@ -1500,7 +1881,13 @@ OPTIONS:
         dirichlet_alpha: cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon: 0.0, // gating: no root noise
         max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
-        virtual_loss: 1.0,
+        virtual_loss_mode: match cfg.mcts.virtual_loss_mode.as_str() {
+            "q_penalty" => yz_mcts::VirtualLossMode::QPenalty,
+            "n_virtual_only" => yz_mcts::VirtualLossMode::NVirtualOnly,
+            "off" => yz_mcts::VirtualLossMode::Off,
+            _ => yz_mcts::VirtualLossMode::QPenalty,
+        },
+        virtual_loss: cfg.mcts.virtual_loss.max(0.0),
     };
 
     let report = yz_eval::gate(
@@ -2064,6 +2451,12 @@ fn main() {
                 }
             }
         }
+        "start-run" => {
+            cmd_start_run(&args[2..]);
+        }
+        "controller" => {
+            cmd_controller(&args[2..]);
+        }
         "selfplay" => {
             cmd_selfplay(&args[2..]);
         }
@@ -2118,9 +2511,28 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn cli_compiles() {
         // Basic sanity: the binary compiles and this test runs.
         assert!(true);
+    }
+
+    #[test]
+    fn sanitize_run_name_replaces_invalid_chars() {
+        assert_eq!(sanitize_run_name("abc-DEF_123"), "abc-DEF_123");
+        assert_eq!(sanitize_run_name("a b/c"), "a_b_c");
+        assert_eq!(sanitize_run_name(""), "");
+    }
+
+    #[test]
+    fn ensure_unique_run_dir_appends_timestamp_if_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path();
+        std::fs::create_dir_all(runs.join("foo")).unwrap();
+        let (id, dir) = ensure_unique_run_dir(runs, "foo");
+        assert!(id.starts_with("foo_"));
+        assert_eq!(dir, runs.join(&id));
     }
 }

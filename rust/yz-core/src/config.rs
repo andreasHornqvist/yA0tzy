@@ -52,6 +52,12 @@ pub struct ModelConfig {
     /// Number of residual blocks in the network.
     #[serde(default = "default_model_num_blocks")]
     pub num_blocks: u32,
+    /// Model architecture kind.
+    ///
+    /// - "residual": current residual MLP with LayerNorm
+    /// - "mlp": plain MLP (AlphaYatzy-style)
+    #[serde(default = "default_model_kind")]
+    pub kind: String,
 }
 
 fn default_model_hidden_dim() -> u32 {
@@ -62,11 +68,16 @@ fn default_model_num_blocks() -> u32 {
     2
 }
 
+fn default_model_kind() -> String {
+    "residual".to_string()
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             hidden_dim: default_model_hidden_dim(),
             num_blocks: default_model_num_blocks(),
+            kind: default_model_kind(),
         }
     }
 }
@@ -145,6 +156,18 @@ pub struct MctsConfig {
     /// Note: temperature never changes replay `pi` targets (visit-count distribution).
     #[serde(default)]
     pub temperature_schedule: TemperatureSchedule,
+
+    /// Virtual-loss/inflight scheme for batched search.
+    ///
+    /// - "q_penalty": reserve visits and subtract virtual loss from Q while pending (current)
+    /// - "n_virtual_only": reserve visits only (AlphaYatzy-style)
+    /// - "off": no reservations (simplest; more collisions)
+    #[serde(default = "default_virtual_loss_mode")]
+    pub virtual_loss_mode: String,
+
+    /// Virtual loss magnitude (used when virtual_loss_mode != "off").
+    #[serde(default = "default_virtual_loss")]
+    pub virtual_loss: f32,
 }
 
 fn default_dirichlet_alpha() -> f32 {
@@ -155,13 +178,23 @@ fn default_dirichlet_epsilon() -> f32 {
     0.25
 }
 
+fn default_virtual_loss_mode() -> String {
+    "q_penalty".to_string()
+}
+
+fn default_virtual_loss() -> f32 {
+    1.0
+}
+
 /// Executed-move temperature schedule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemperatureSchedule {
     /// Constant temperature `t0`.
     Constant { t0: f32 },
-    /// Step schedule: use `t0` while `ply < cutoff_ply`, else use `t1`.
+    /// Step schedule: use `t0` while `turn_idx < cutoff_ply`, else use `t1`.
+    ///
+    /// Note: cutoff_ply is interpreted as **scoring turns** (Mark count), not raw ply.
     Step { t0: f32, t1: f32, cutoff_ply: u32 },
 }
 
@@ -319,6 +352,8 @@ impl Default for Config {
                 dirichlet_alpha: default_dirichlet_alpha(),
                 dirichlet_epsilon: default_dirichlet_epsilon(),
                 temperature_schedule: TemperatureSchedule::default(),
+                virtual_loss_mode: default_virtual_loss_mode(),
+                virtual_loss: default_virtual_loss(),
             },
             selfplay: SelfplayConfig {
                 games_per_iteration: 50,

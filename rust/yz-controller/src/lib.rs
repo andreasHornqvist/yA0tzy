@@ -123,7 +123,17 @@ impl IterationController {
     }
 
     pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
+        if self.cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        // Support out-of-process cancellation (e.g. run started by `yz start-run` and cancelled
+        // from a separate TUI instance) via a run-local cancel request file.
+        let cancel_file = self.run_dir.join("cancel.request");
+        if cancel_file.exists() {
+            self.cancel.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     pub fn set_phase(
@@ -155,6 +165,20 @@ impl IterationController {
         m.controller_last_ts_ms = Some(yz_logging::now_ms());
         yz_logging::write_manifest_atomic(&run_json, &m)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cancel_file_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_request_file_triggers_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        std::fs::write(run_dir.join("cancel.request"), "ts_ms: 0\n").unwrap();
+        let ctrl = IterationController::new(run_dir);
+        assert!(ctrl.cancelled());
     }
 }
 
@@ -657,6 +681,9 @@ pub fn spawn_iteration(
             cancel: cancel2,
         };
         let res: Result<(), ControllerError> = (|| {
+            // Clear any stale cancel request from a previous run attempt.
+            let _ = std::fs::remove_file(run_dir.join("cancel.request"));
+
             // Enforce uv-managed Python when using PATH python (TUI default).
             if python_exe == "python" && !uv_available() {
                 return Err(ControllerError::InferServer(
@@ -903,10 +930,11 @@ fn reload_model(
             "data": data,
         });
         if let Ok(line) = serde_json::to_string(&payload) {
+            let _ = std::fs::create_dir_all(".cursor");
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log")
+                .open(std::path::Path::new(".cursor").join("debug.log"))
             {
                 let _ = std::io::Write::write_all(&mut f, line.as_bytes());
                 let _ = std::io::Write::write_all(&mut f, b"\n");
@@ -1172,6 +1200,7 @@ fn build_train_command(
     // Without this, the trainer defaults (--hidden=256 --blocks=2) can mismatch a run-local best.pt.
     let hidden = cfg.model.hidden_dim.to_string();
     let blocks = cfg.model.num_blocks.to_string();
+    let kind = cfg.model.kind.as_str();
     let num_workers = cfg.training.dataloader_workers.to_string();
     let sample_mode = cfg.training.sample_mode.as_str();
 
@@ -1197,6 +1226,8 @@ fn build_train_command(
             &hidden,
             "--blocks",
             &blocks,
+            "--kind",
+            kind,
             "--num-workers",
             &num_workers,
             "--sample-mode",
@@ -1225,6 +1256,8 @@ fn build_train_command(
             &hidden,
             "--blocks",
             &blocks,
+            "--kind",
+            kind,
             "--num-workers",
             &num_workers,
             "--sample-mode",
@@ -1252,6 +1285,7 @@ fn build_model_init_command(
         .join("best.pt");
     let hidden = cfg.model.hidden_dim.to_string();
     let blocks = cfg.model.num_blocks.to_string();
+    let kind = cfg.model.kind.as_str();
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -1267,6 +1301,8 @@ fn build_model_init_command(
             &hidden,
             "--blocks",
             &blocks,
+            "--kind",
+            kind,
         ]);
         cmd
     } else {
@@ -1283,6 +1319,8 @@ fn build_model_init_command(
             &hidden,
             "--blocks",
             &blocks,
+            "--kind",
+            kind,
         ]);
         cmd
     }
@@ -2392,6 +2430,15 @@ mod cancel_tests {
             args
         );
         assert_eq!(args[blocks_idx.unwrap() + 1], "3");
+
+        // Verify --kind
+        let kind_idx = args.iter().position(|a| a == "--kind");
+        assert!(
+            kind_idx.is_some(),
+            "command must include --kind; got: {:?}",
+            args
+        );
+        assert_eq!(args[kind_idx.unwrap() + 1], "residual");
     }
 
     #[test]

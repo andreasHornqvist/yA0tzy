@@ -42,7 +42,9 @@ def cmd_model_init(args: argparse.Namespace) -> int:
     from .model.init import init_model_checkpoint
 
     out = Path(args.out)
-    init_model_checkpoint(out, hidden=int(args.hidden), blocks=int(args.blocks))
+    init_model_checkpoint(
+        out, hidden=int(args.hidden), blocks=int(args.blocks), kind=str(args.kind)
+    )
     print(f"wrote: {out}")
     return 0
 
@@ -103,6 +105,11 @@ def main() -> int:
     p_init.add_argument("--out", required=True, help="Output checkpoint path (e.g. runs/<id>/models/best.pt)")
     p_init.add_argument("--hidden", type=int, default=256, help="Hidden size")
     p_init.add_argument("--blocks", type=int, default=2, help="Number of residual blocks")
+    p_init.add_argument(
+        "--kind",
+        default="residual",
+        help="Model kind: residual|mlp",
+    )
     p_init.add_argument(
         "--device",
         default="cpu",

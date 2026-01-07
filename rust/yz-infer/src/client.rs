@@ -35,7 +35,8 @@ fn dbg_start_writer_thread() -> Option<mpsc::Sender<String>> {
     thread::Builder::new()
         .name("yz-infer-debuglog".to_string())
         .spawn(move || {
-            let path = std::path::Path::new("/Users/andreashornqvist/code/yA0tzy/.cursor/debug.log");
+            let _ = std::fs::create_dir_all(".cursor");
+            let path = std::path::Path::new(".cursor").join("debug.log");
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path);
             // Buffer + periodic flush: reduces per-log syscalls dramatically.
             let mut buf = f.as_mut().ok().map(|ff| std::io::BufWriter::new(ff));

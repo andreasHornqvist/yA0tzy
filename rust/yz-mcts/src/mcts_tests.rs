@@ -1,4 +1,6 @@
-use crate::{apply_temperature, ChanceMode, InferBackend, Mcts, MctsConfig, UniformInference};
+use crate::{
+    apply_temperature, ChanceMode, InferBackend, Mcts, MctsConfig, UniformInference, VirtualLossMode,
+};
 use yz_core::{GameState, LegalMask, PlayerState, A, FULL_MASK};
 use yz_infer::ClientOptions;
 
@@ -63,6 +65,7 @@ fn pi_is_valid_distribution_and_respects_legality() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     })
     .unwrap();
@@ -118,6 +121,7 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     })
     .unwrap();
@@ -162,6 +166,7 @@ fn eval_mode_is_deterministic() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     };
     let infer = UniformInference;
@@ -195,6 +200,7 @@ fn root_noise_is_only_applied_in_rng_mode() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     };
     let infer = UniformInference;
@@ -230,6 +236,7 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     };
     let infer = UniformInference;
@@ -272,6 +279,7 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
     };
 
@@ -310,37 +318,107 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
 }
 
 #[test]
-fn virtual_loss_reduces_pending_collisions() {
-    let infer = UniformInference;
-    let mut ctx = yz_core::TurnContext::new_deterministic(1);
-    let root = yz_core::initial_state(&mut ctx);
+fn virtual_loss_modes_affect_pending_collision_tracking() {
+    // This test must go through the async backend path; UniformInference is synchronous
+    // and never produces pending leaf evaluations (so collisions would always be 0).
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
-    let cfg_no_vl = MctsConfig {
+    use yz_infer::codec::{decode_request_v1, encode_response_v1};
+    use yz_infer::frame::{read_frame, write_frame};
+    use yz_infer::protocol::{InferResponseV1, ACTION_SPACE_A};
+
+    // Start a *slow* dummy infer server so the client can build up multiple pending requests.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut sock, _peer) = listener.accept().unwrap();
+        loop {
+            let payload = match read_frame(&mut sock) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let req = match decode_request_v1(&payload) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            // Force a window where multiple requests are pending.
+            thread::sleep(Duration::from_millis(2));
+            let logits = vec![0.0f32; ACTION_SPACE_A as usize];
+            let resp = InferResponseV1 {
+                request_id: req.request_id,
+                policy_logits: logits,
+                value: 0.0,
+                margin: None,
+            };
+            let out = encode_response_v1(&resp);
+            if write_frame(&mut sock, &out).is_err() {
+                break;
+            }
+        }
+    });
+
+    let backend = InferBackend::connect_tcp(
+        addr,
+        0,
+        ClientOptions {
+            max_inflight_total: 4096,
+            max_outbound_queue: 4096,
+            request_id_start: 1,
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION_V1,
+            legal_mask_bitset: false,
+        },
+    )
+    .unwrap();
+
+    // Construct a state with exactly ONE legal action (one remaining Mark, no rerolls).
+    let mut ctx = yz_core::TurnContext::new_deterministic(7);
+    let mut root = yz_core::initial_state(&mut ctx);
+    root.rerolls_left = 0;
+    root.players[root.player_to_move as usize].avail_mask = 1; // one category available
+
+    let cfg_off = MctsConfig {
         c_puct: 1.5,
         simulations_mark: 64,
         simulations_reroll: 64,
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.0,
         max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::Off,
         virtual_loss: 0.0,
     };
-    let cfg_vl = MctsConfig {
+    let cfg_nv = MctsConfig {
+        virtual_loss_mode: VirtualLossMode::NVirtualOnly,
         virtual_loss: 1.0,
-        ..cfg_no_vl
+        ..cfg_off
     };
 
-    let mut m0 = Mcts::new(cfg_no_vl).unwrap();
-    let r0 = m0.run_search(root, ChanceMode::Deterministic { episode_seed: 1 }, &infer);
+    let mut m0 = Mcts::new(cfg_off).unwrap();
+    let r0 = m0.run_search_with_backend(
+        root,
+        ChanceMode::Deterministic { episode_seed: 7 },
+        &backend,
+    );
 
-    let mut m1 = Mcts::new(cfg_vl).unwrap();
-    let r1 = m1.run_search(root, ChanceMode::Deterministic { episode_seed: 1 }, &infer);
+    let mut m1 = Mcts::new(cfg_nv).unwrap();
+    let r1 = m1.run_search_with_backend(
+        root,
+        ChanceMode::Deterministic { episode_seed: 7 },
+        &backend,
+    );
 
+    // With mode=off, we never reserve, so the collision counter is disabled by design.
+    assert_eq!(r0.stats.pending_collisions, 0);
+    // With reservations enabled, repeated selection of the single legal edge will collide.
     assert!(
-        r1.stats.pending_collisions < r0.stats.pending_collisions,
-        "expected collisions to decrease with virtual loss: no_vl={} vl={}",
-        r0.stats.pending_collisions,
+        r1.stats.pending_collisions > 0,
+        "expected collisions to be tracked with reservations enabled; got {}",
         r1.stats.pending_collisions
     );
+
+    drop(backend);
+    server.join().unwrap();
 }
 
 #[test]

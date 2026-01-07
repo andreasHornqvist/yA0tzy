@@ -61,6 +61,23 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
             }
         }
     }
+    match cfg.mcts.virtual_loss_mode.as_str() {
+        "q_penalty" | "n_virtual_only" | "off" => {}
+        _ => {
+            return Err(
+                "mcts.virtual_loss_mode must be 'q_penalty', 'n_virtual_only', or 'off'".to_string(),
+            )
+        }
+    }
+    if !(cfg.mcts.virtual_loss.is_finite() && cfg.mcts.virtual_loss >= 0.0) {
+        return Err("mcts.virtual_loss must be finite and >= 0".to_string());
+    }
+
+    // model
+    match cfg.model.kind.as_str() {
+        "residual" | "mlp" => {}
+        _ => return Err("model.kind must be 'residual' or 'mlp'".to_string()),
+    }
 
     // selfplay
     if cfg.selfplay.games_per_iteration < 1 {
