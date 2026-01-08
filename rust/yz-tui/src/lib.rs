@@ -37,6 +37,7 @@ enum Screen {
     NamingRun, // Input mode for naming a new run
     Config,
     Dashboard,
+    System,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +206,99 @@ struct SelfplaySummaryNdjsonV1 {
     score_diff_p95: Option<f64>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InferSnapshotNdjsonV1 {
+    #[allow(dead_code)]
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    ts_ms: Option<u64>,
+    #[serde(default)]
+    iter_idx: Option<u32>,
+    #[serde(default)]
+    metrics_bind: Option<String>,
+
+    // Server snapshot.
+    #[serde(default)]
+    queue_depth: Option<u64>,
+    #[serde(default)]
+    requests_s: Option<f64>,
+    #[serde(default)]
+    batches_s: Option<f64>,
+    #[serde(default)]
+    batch_size_mean: Option<f64>,
+    #[serde(default)]
+    batch_size_p50: Option<f64>,
+    #[serde(default)]
+    batch_size_p95: Option<f64>,
+    #[serde(default)]
+    underfill_frac_mean: Option<f64>,
+    #[serde(default)]
+    full_frac_mean: Option<f64>,
+    #[serde(default)]
+    flush_full_s: Option<f64>,
+    #[serde(default)]
+    flush_deadline_s: Option<f64>,
+
+    #[serde(default)]
+    queue_wait_us_p50: Option<f64>,
+    #[serde(default)]
+    queue_wait_us_p95: Option<f64>,
+    #[serde(default)]
+    build_ms_p50: Option<f64>,
+    #[serde(default)]
+    build_ms_p95: Option<f64>,
+    #[serde(default)]
+    forward_ms_p50: Option<f64>,
+    #[serde(default)]
+    forward_ms_p95: Option<f64>,
+    #[serde(default)]
+    post_ms_p50: Option<f64>,
+    #[serde(default)]
+    post_ms_p95: Option<f64>,
+
+    // Worker snapshot (optional).
+    #[serde(default)]
+    workers_seen: Option<u32>,
+    #[serde(default)]
+    inflight_sum: Option<u64>,
+    #[serde(default)]
+    inflight_max: Option<u64>,
+    #[serde(default)]
+    rtt_p95_us_min: Option<u64>,
+    #[serde(default)]
+    rtt_p95_us_med: Option<u64>,
+    #[serde(default)]
+    rtt_p95_us_max: Option<u64>,
+    #[serde(default)]
+    would_block_frac: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct SystemLiveSample {
+    ts: Instant,
+    // Server
+    queue_depth: Option<u64>,
+    requests_s: Option<f64>,
+    batches_s: Option<f64>,
+    batch_size_mean: Option<f64>,
+    batch_size_p95: Option<f64>,
+    underfill_frac_mean: Option<f64>,
+    full_frac_mean: Option<f64>,
+    flush_full_s: Option<f64>,
+    flush_deadline_s: Option<f64>,
+    queue_wait_us_p95: Option<f64>,
+    forward_ms_p95: Option<f64>,
+    // Workers (selfplay only)
+    inflight_sum: Option<u64>,
+    inflight_max: Option<u64>,
+    rtt_p95_us_med: Option<u64>,
+    would_block_frac: Option<f64>,
+    // Parse/transport
+    source: &'static str, // "live" | "playback"
+}
+
 #[derive(Debug)]
 struct App {
     screen: Screen,
@@ -233,6 +327,26 @@ struct App {
     learn_metrics_partial: String,
     learn_by_iter: HashMap<u32, LearnSummaryNdjsonV1>,
     selfplay_by_iter: HashMap<u32, SelfplaySummaryNdjsonV1>,
+    infer_snapshots: Vec<InferSnapshotNdjsonV1>,
+    infer_last_ts_ms: u64,
+
+    // System/Inference screen live state (1 Hz polling).
+    system_agent: ureq::Agent,
+    system_last_poll: Instant,
+    system_live: Option<SystemLiveSample>,
+    system_live_err: Option<String>,
+    system_series_queue_depth: Vec<u64>,
+    system_series_rtt_p95_us: Vec<u64>,
+    system_series_rps_x10: Vec<u64>,
+    system_series_batch_mean_x100: Vec<u64>,
+    system_series_would_block_x1000: Vec<u64>,
+    system_prev_ts: Option<Instant>,
+    system_prev_req_total: Option<f64>,
+    system_prev_batches_total: Option<f64>,
+    system_prev_flush_full_total: Option<f64>,
+    system_prev_flush_deadline_total: Option<f64>,
+    system_prev_steps_sum: Option<u64>,
+    system_prev_wb_sum: Option<u64>,
 
     iter: Option<yz_controller::IterationHandle>,
 
@@ -247,6 +361,11 @@ struct App {
 
 impl App {
     fn new(runs_dir: PathBuf) -> Self {
+        let system_agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(200))
+            .timeout_read(Duration::from_millis(250))
+            .timeout_write(Duration::from_millis(250))
+            .build();
         Self {
             screen: Screen::Home,
             status: "q: quit | r: refresh | n: new run".to_string(),
@@ -268,6 +387,25 @@ impl App {
             learn_metrics_partial: String::new(),
             learn_by_iter: HashMap::new(),
             selfplay_by_iter: HashMap::new(),
+            infer_snapshots: Vec::new(),
+            infer_last_ts_ms: 0,
+
+            system_agent,
+            system_last_poll: Instant::now(),
+            system_live: None,
+            system_live_err: None,
+            system_series_queue_depth: Vec::new(),
+            system_series_rtt_p95_us: Vec::new(),
+            system_series_rps_x10: Vec::new(),
+            system_series_batch_mean_x100: Vec::new(),
+            system_series_would_block_x1000: Vec::new(),
+            system_prev_ts: None,
+            system_prev_req_total: None,
+            system_prev_batches_total: None,
+            system_prev_flush_full_total: None,
+            system_prev_flush_deadline_total: None,
+            system_prev_steps_sum: None,
+            system_prev_wb_sum: None,
             iter: None,
             shutdown_requested: false,
             shutdown_exit_after: false,
@@ -430,6 +568,24 @@ impl App {
             self.learn_metrics_partial.clear();
             self.learn_by_iter.clear();
             self.selfplay_by_iter.clear();
+            self.infer_snapshots.clear();
+            self.infer_last_ts_ms = 0;
+
+            // Reset system live deltas/series when switching runs.
+            self.system_live = None;
+            self.system_live_err = None;
+            self.system_series_queue_depth.clear();
+            self.system_series_rtt_p95_us.clear();
+            self.system_series_rps_x10.clear();
+            self.system_series_batch_mean_x100.clear();
+            self.system_series_would_block_x1000.clear();
+            self.system_prev_ts = None;
+            self.system_prev_req_total = None;
+            self.system_prev_batches_total = None;
+            self.system_prev_flush_full_total = None;
+            self.system_prev_flush_deadline_total = None;
+            self.system_prev_steps_sum = None;
+            self.system_prev_wb_sum = None;
         }
 
         let metrics_path = run_dir.join("logs").join("metrics.ndjson");
@@ -492,6 +648,25 @@ impl App {
                     };
                     self.selfplay_by_iter.insert(i, ss);
                 }
+                "infer_snapshot" => {
+                    let Ok(ss) = serde_json::from_value::<InferSnapshotNdjsonV1>(v) else {
+                        continue;
+                    };
+                    let Some(ts) = ss.ts_ms else {
+                        continue;
+                    };
+                    // Avoid duplicates if we ever re-read from earlier offsets.
+                    if ts <= self.infer_last_ts_ms {
+                        continue;
+                    }
+                    self.infer_last_ts_ms = ts;
+                    self.infer_snapshots.push(ss);
+                    const MAX: usize = 6000; // ~8.3h at 5s cadence
+                    if self.infer_snapshots.len() > MAX {
+                        let drain = self.infer_snapshots.len() - MAX;
+                        self.infer_snapshots.drain(0..drain);
+                    }
+                }
                 _ => {}
             }
         }
@@ -509,9 +684,145 @@ impl App {
             self.status = "cancelling… waiting for shutdown | r refresh".to_string();
         } else {
             self.status =
-                "r refresh | l toggle learning/perf | d perf | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                "r refresh | l toggle learning/perf | d perf | i system | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
                     .to_string();
         }
+    }
+
+    fn enter_system(&mut self) {
+        if self.active_run_id.is_none() {
+            return;
+        }
+        // Refresh once so we have run.json + any infer_snapshot playback immediately.
+        self.refresh_dashboard();
+        self.screen = Screen::System;
+        self.status =
+            "r refresh | d perf | l learning | i system | Esc back | q quit".to_string();
+        // Force immediate live poll on next tick.
+        self.system_last_poll = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+    }
+
+    fn refresh_system_live(&mut self) {
+        // Only poll when the system screen is active.
+        if !matches!(self.screen, Screen::System) {
+            return;
+        }
+        if self.system_last_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.system_last_poll = Instant::now();
+
+        let Some(run_dir) = self.run_dir() else {
+            return;
+        };
+        // Keep run.json + metrics playback reasonably fresh while on this screen.
+        self.refresh_dashboard();
+
+        let metrics_bind = self.cfg.inference.metrics_bind.clone();
+        match fetch_infer_metrics_text(&self.system_agent, &metrics_bind) {
+            Ok(text) => {
+                let server = parse_infer_server_metrics_text(&text);
+                let workers = read_selfplay_worker_progress_live(
+                    &run_dir.join("logs_workers"),
+                    &mut self.system_prev_steps_sum,
+                    &mut self.system_prev_wb_sum,
+                );
+                let now = Instant::now();
+
+                let (requests_s, batches_s, batch_size_mean, flush_full_s, flush_deadline_s) =
+                    derive_rates(
+                        now,
+                        &mut self.system_prev_ts,
+                        &mut self.system_prev_req_total,
+                        &mut self.system_prev_batches_total,
+                        &mut self.system_prev_flush_full_total,
+                        &mut self.system_prev_flush_deadline_total,
+                        server.requests_total,
+                        server.batches_total,
+                        server.flush_full_total,
+                        server.flush_deadline_total,
+                    );
+
+                let live = SystemLiveSample {
+                    ts: now,
+                    queue_depth: server.queue_depth,
+                    requests_s,
+                    batches_s,
+                    batch_size_mean,
+                    batch_size_p95: server.batch_size_p95,
+                    underfill_frac_mean: server.underfill_frac_mean,
+                    full_frac_mean: server.full_frac_mean,
+                    flush_full_s,
+                    flush_deadline_s,
+                    queue_wait_us_p95: server.queue_wait_us_p95,
+                    forward_ms_p95: server.forward_ms_p95,
+                    inflight_sum: workers.inflight_sum,
+                    inflight_max: workers.inflight_max,
+                    rtt_p95_us_med: workers.rtt_p95_us_med,
+                    would_block_frac: workers.would_block_frac,
+                    source: "live",
+                };
+                self.system_live = Some(live);
+                self.system_live_err = None;
+                self.push_system_series_from_current();
+            }
+            Err(e) => {
+                self.system_live_err = Some(e);
+                // Playback fallback: use last infer_snapshot (every ~5s) if available.
+                if let Some(last) = self.infer_snapshots.last() {
+                    let now = Instant::now();
+                    self.system_live = Some(SystemLiveSample {
+                        ts: now,
+                        queue_depth: last.queue_depth,
+                        requests_s: last.requests_s,
+                        batches_s: last.batches_s,
+                        batch_size_mean: last.batch_size_mean,
+                        batch_size_p95: last.batch_size_p95,
+                        underfill_frac_mean: last.underfill_frac_mean,
+                        full_frac_mean: last.full_frac_mean,
+                        flush_full_s: last.flush_full_s,
+                        flush_deadline_s: last.flush_deadline_s,
+                        queue_wait_us_p95: last.queue_wait_us_p95,
+                        forward_ms_p95: last.forward_ms_p95,
+                        inflight_sum: last.inflight_sum,
+                        inflight_max: last.inflight_max,
+                        rtt_p95_us_med: last.rtt_p95_us_med,
+                        would_block_frac: last.would_block_frac,
+                        source: "playback",
+                    });
+                }
+            }
+        }
+    }
+
+    fn push_system_series_from_current(&mut self) {
+        const MAX: usize = 120; // ~2 minutes at 1Hz
+        let Some(cur) = self.system_live.as_ref() else {
+            return;
+        };
+        push_series(&mut self.system_series_queue_depth, cur.queue_depth.unwrap_or(0), MAX);
+        push_series(
+            &mut self.system_series_rtt_p95_us,
+            cur.rtt_p95_us_med.unwrap_or(0),
+            MAX,
+        );
+        push_series(
+            &mut self.system_series_rps_x10,
+            (cur.requests_s.unwrap_or(0.0).max(0.0) * 10.0) as u64,
+            MAX,
+        );
+        push_series(
+            &mut self.system_series_batch_mean_x100,
+            (cur.batch_size_mean.unwrap_or(0.0).max(0.0) * 100.0) as u64,
+            MAX,
+        );
+        push_series(
+            &mut self.system_series_would_block_x1000,
+            (cur.would_block_frac.unwrap_or(0.0).clamp(0.0, 1.0) * 1000.0) as u64,
+            MAX,
+        );
     }
 
     fn start_iteration(&mut self) {
@@ -766,6 +1077,7 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::Char('s') => app.save_config_draft(),
                         KeyCode::Char('d') => app.enter_dashboard(),
+                        KeyCode::Char('i') => app.enter_system(),
                         KeyCode::Char('g') => app.start_iteration(),
                         _ => handle_config_key(&mut app, k),
                     },
@@ -791,6 +1103,7 @@ pub fn run() -> io::Result<()> {
                             app.dashboard_tab = DashboardTab::Performance;
                             app.enter_dashboard();
                         }
+                        KeyCode::Char('i') => app.enter_system(),
                         KeyCode::Char('r') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
                         KeyCode::Up => {
@@ -815,6 +1128,33 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::End => {
                             app.dashboard_iter_follow = true;
+                        }
+                        _ => {}
+                    },
+                    Screen::System => match k.code {
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            // Back to dashboard (keep the current tab).
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('d') => {
+                            app.dashboard_tab = DashboardTab::Performance;
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('l') => {
+                            app.dashboard_tab = DashboardTab::Learning;
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('r') => {
+                            app.refresh_dashboard();
+                            app.system_last_poll = Instant::now()
+                                .checked_sub(Duration::from_secs(10))
+                                .unwrap_or_else(Instant::now);
+                            app.refresh_system_live();
                         }
                         _ => {}
                     },
@@ -863,6 +1203,9 @@ pub fn run() -> io::Result<()> {
                 if app.shutdown_requested {
                     app.status = "cancelling… waiting for shutdown | r refresh".to_string();
                 }
+            }
+            if matches!(app.screen, Screen::System) {
+                app.refresh_system_live();
             }
             last_tick = Instant::now();
         }
@@ -2161,6 +2504,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
             }
         }
+        Screen::System => {
+            draw_system(f, app, chunks[0]);
+        }
     }
 
     let help = Paragraph::new(app.status.clone())
@@ -2300,12 +2646,10 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
     const W_VMEAN: usize = 5;
     const W_ECE: usize = 5;
     const W_ILL: usize = 5;
-    const W_SPS: usize = 6;
-    const W_MPS: usize = 6;
 
     lines.push(Line::from(Span::styled(
         format!(
-            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {top1:>W_TOP1$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {ill:>W_ILL$}  {sps:>W_SPS$}  {mps:>W_MPS$}",
+            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {top1:>W_TOP1$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {ill:>W_ILL$}",
             idx = "Iter",
             dec = "Decision",
             wr = "WinRate",
@@ -2317,8 +2661,6 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
             vmean = "Vmean",
             ece = "ECE",
             ill = "Ill%",
-            sps = "Samp/s",
-            mps = "Move/s",
         ),
         Style::default().fg(Color::DarkGray),
     )));
@@ -2379,8 +2721,6 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 let vmean = fmt_opt_f64(ls.and_then(|x| x.v_pred_mean), W_VMEAN, 2);
                 let ece = fmt_opt_f64(ls.and_then(|x| x.ece), W_ECE, 3);
                 let ill = fmt_opt_pct(ls.and_then(|x| x.p_illegal_mass_mean), W_ILL);
-                let sps = fmt_opt_u0(ls.and_then(|x| x.samples_s_mean), W_SPS);
-                let mps = fmt_opt_u0(ss.and_then(|x| x.moves_s_mean), W_MPS);
 
                 // Light alerting: highlight rows that match common failure signatures.
                 let mut warn_level: u8 = 0;
@@ -2428,7 +2768,7 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 }
                 rows.push(Line::from(Span::styled(
                     format!(
-                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {top1}  {kl}  {ovr}  {vmean}  {ece}  {ill}  {sps}  {mps}",
+                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {top1}  {kl}  {ovr}  {vmean}  {ece}  {ill}",
                         idx = it.idx,
                         dec = promo,
                         stale = stale95,
@@ -2436,6 +2776,8 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                         top1 = top1,
                         kl = kl,
                         ovr = ovr,
+                        vmean = vmean,
+                        ece = ece,
                         ill = ill,
                     ),
                     row_style,
@@ -2745,6 +3087,640 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+// -------------------------
+// System / Inference screen helpers
+// -------------------------
+
+fn push_series(v: &mut Vec<u64>, x: u64, max: usize) {
+    v.push(x);
+    if v.len() > max {
+        let drain = v.len() - max;
+        v.drain(0..drain);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ServerLiveAgg {
+    queue_depth: Option<u64>,
+    requests_total: Option<f64>,
+    batches_total: Option<f64>,
+    batch_size_p50: Option<f64>,
+    batch_size_p95: Option<f64>,
+    queue_wait_us_p95: Option<f64>,
+    forward_ms_p95: Option<f64>,
+    underfill_frac_mean: Option<f64>,
+    full_frac_mean: Option<f64>,
+    flush_full_total: Option<f64>,
+    flush_deadline_total: Option<f64>,
+}
+
+fn quantile_from_cumulative(mut buckets: Vec<(u64, u64)>, total: u64, q: f64) -> Option<u64> {
+    if total == 0 || buckets.is_empty() {
+        return None;
+    }
+    buckets.sort_by_key(|(le, _)| *le);
+    let qq = q.clamp(0.0, 1.0);
+    let target = (qq * (total as f64)).ceil() as u64;
+    for (le, cum) in buckets {
+        if cum >= target {
+            return Some(le);
+        }
+    }
+    None
+}
+
+fn parse_prom_sample(line: &str) -> Option<(&str, Option<&str>, f64)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (lhs, rhs) = line.split_once(' ')?;
+    let value = rhs.trim().parse::<f64>().ok()?;
+    if let Some((name, rest)) = lhs.split_once('{') {
+        let labels = rest.strip_suffix('}')?;
+        Some((name, Some(labels), value))
+    } else {
+        Some((lhs, None, value))
+    }
+}
+
+fn parse_label<'a>(labels: &'a str, key: &str) -> Option<&'a str> {
+    for part in labels.split(',') {
+        let (k, v) = part.split_once('=')?;
+        if k.trim() != key {
+            continue;
+        }
+        let vs = v.trim();
+        return vs.strip_prefix('"')?.strip_suffix('"');
+    }
+    None
+}
+
+fn parse_infer_server_metrics_text(text: &str) -> ServerLiveAgg {
+    let mut out = ServerLiveAgg::default();
+
+    let mut batch_size_cum: Vec<(u64, u64)> = Vec::new();
+    let mut batch_size_total: u64 = 0;
+    let mut qwait_cum: Vec<(u64, u64)> = Vec::new();
+    let mut qwait_total: u64 = 0;
+    let mut forward_cum_us: Vec<(u64, u64)> = Vec::new();
+    let mut forward_total: u64 = 0;
+
+    let mut underfill_sum = 0.0f64;
+    let mut underfill_n = 0u64;
+    let mut full_sum = 0.0f64;
+    let mut full_n = 0u64;
+
+    let mut flush_full_total = 0.0f64;
+    let mut flush_deadline_total = 0.0f64;
+
+    for line in text.lines() {
+        let Some((name, labels_opt, value)) = parse_prom_sample(line) else {
+            continue;
+        };
+        match name {
+            "yatzy_infer_queue_depth" => out.queue_depth = Some(value.max(0.0) as u64),
+            "yatzy_infer_requests_total" => out.requests_total = Some(value),
+            "yatzy_infer_batches_total" => out.batches_total = Some(value),
+            "yatzy_infer_batch_underfill_frac" => {
+                underfill_sum += value;
+                underfill_n += 1;
+            }
+            "yatzy_infer_batch_full_frac" => {
+                full_sum += value;
+                full_n += 1;
+            }
+            "yatzy_infer_flush_reason_total" => {
+                let Some(labels) = labels_opt else { continue };
+                let Some(reason) = parse_label(labels, "reason") else { continue };
+                match reason {
+                    "full" => flush_full_total += value,
+                    "deadline" => flush_deadline_total += value,
+                    _ => {}
+                }
+            }
+            "yatzy_infer_batch_size_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let Some(le) = parse_label(labels, "le") else { continue };
+                if le == "+Inf" {
+                    batch_size_total = batch_size_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    batch_size_cum.push((x.max(0.0) as u64, value.max(0.0) as u64));
+                }
+            }
+            "yatzy_infer_batch_queue_wait_us_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let Some(le) = parse_label(labels, "le") else { continue };
+                if le == "+Inf" {
+                    qwait_total = qwait_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    qwait_cum.push((x.max(0.0) as u64, value.max(0.0) as u64));
+                }
+            }
+            "yatzy_infer_batch_forward_ms_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let Some(le) = parse_label(labels, "le") else { continue };
+                if le == "+Inf" {
+                    forward_total = forward_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    // Store boundary in us for easy ordering, convert back later.
+                    let us = (x.max(0.0) * 1000.0).round() as u64;
+                    forward_cum_us.push((us, value.max(0.0) as u64));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.batch_size_p50 = quantile_from_cumulative(batch_size_cum.clone(), batch_size_total, 0.50).map(|x| x as f64);
+    out.batch_size_p95 = quantile_from_cumulative(batch_size_cum, batch_size_total, 0.95).map(|x| x as f64);
+    out.queue_wait_us_p95 = quantile_from_cumulative(qwait_cum, qwait_total, 0.95).map(|x| x as f64);
+    out.forward_ms_p95 = quantile_from_cumulative(forward_cum_us, forward_total, 0.95).map(|x| (x as f64) / 1000.0);
+
+    out.underfill_frac_mean = if underfill_n > 0 {
+        Some(underfill_sum / (underfill_n as f64))
+    } else {
+        None
+    };
+    out.full_frac_mean = if full_n > 0 {
+        Some(full_sum / (full_n as f64))
+    } else {
+        None
+    };
+    out.flush_full_total = Some(flush_full_total);
+    out.flush_deadline_total = Some(flush_deadline_total);
+    out
+}
+
+fn fetch_infer_metrics_text(agent: &ureq::Agent, metrics_bind: &str) -> Result<String, String> {
+    let url = format!("http://{}/metrics", metrics_bind);
+    let resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| format!("live /metrics failed: {e}"))?;
+    if resp.status() != 200 {
+        return Err(format!("live /metrics status {}", resp.status()));
+    }
+    resp.into_string()
+        .map_err(|e| format!("live /metrics read failed: {e}"))
+}
+
+#[derive(Debug, Default, Clone)]
+struct WorkerLiveAgg {
+    inflight_sum: Option<u64>,
+    inflight_max: Option<u64>,
+    rtt_p95_us_med: Option<u64>,
+    would_block_frac: Option<f64>,
+}
+
+fn read_selfplay_worker_progress_live(
+    logs_workers_dir: &Path,
+    prev_steps_sum: &mut Option<u64>,
+    prev_wb_sum: &mut Option<u64>,
+) -> WorkerLiveAgg {
+    #[derive(serde::Deserialize)]
+    struct P {
+        #[serde(default)]
+        infer_inflight: u64,
+        #[serde(default)]
+        infer_latency_p95_us: u64,
+        #[serde(default)]
+        sched_steps: u64,
+        #[serde(default)]
+        sched_would_block: u64,
+    }
+    let mut out = WorkerLiveAgg::default();
+    let mut rtts: Vec<u64> = Vec::new();
+    let mut steps_sum = 0u64;
+    let mut wb_sum = 0u64;
+
+    if let Ok(rd) = std::fs::read_dir(logs_workers_dir) {
+        let mut inflight_sum = 0u64;
+        let mut inflight_max = 0u64;
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let f = p.join("progress.json");
+            let Ok(bytes) = std::fs::read(&f) else { continue };
+            let Ok(pp) = serde_json::from_slice::<P>(&bytes) else { continue };
+            inflight_sum = inflight_sum.saturating_add(pp.infer_inflight);
+            inflight_max = inflight_max.max(pp.infer_inflight);
+            rtts.push(pp.infer_latency_p95_us);
+            steps_sum = steps_sum.saturating_add(pp.sched_steps);
+            wb_sum = wb_sum.saturating_add(pp.sched_would_block);
+        }
+        if !rtts.is_empty() {
+            out.inflight_sum = Some(inflight_sum);
+            out.inflight_max = Some(inflight_max);
+        }
+    }
+
+    if !rtts.is_empty() {
+        rtts.sort();
+        out.rtt_p95_us_med = Some(rtts[rtts.len() / 2]);
+    }
+
+    if let (Some(prev_s), Some(prev_w)) = (*prev_steps_sum, *prev_wb_sum) {
+        let ds = steps_sum.saturating_sub(prev_s);
+        let dw = wb_sum.saturating_sub(prev_w);
+        let denom = (ds + dw) as f64;
+        if denom > 0.0 {
+            out.would_block_frac = Some((dw as f64) / denom);
+        }
+    }
+    *prev_steps_sum = Some(steps_sum);
+    *prev_wb_sum = Some(wb_sum);
+
+    out
+}
+
+fn derive_rates(
+    now: Instant,
+    prev_ts: &mut Option<Instant>,
+    prev_req_total: &mut Option<f64>,
+    prev_batches_total: &mut Option<f64>,
+    prev_flush_full_total: &mut Option<f64>,
+    prev_flush_deadline_total: &mut Option<f64>,
+    req_total: Option<f64>,
+    batches_total: Option<f64>,
+    flush_full_total: Option<f64>,
+    flush_deadline_total: Option<f64>,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    let mut rps = None;
+    let mut bps = None;
+    let mut mean = None;
+    let mut full_s = None;
+    let mut dead_s = None;
+
+    if let Some(prev) = *prev_ts {
+        let dt = (now - prev).as_secs_f64().max(1e-6);
+        if let (Some(prev_r), Some(cur_r)) = (*prev_req_total, req_total) {
+            let dr = (cur_r - prev_r).max(0.0);
+            rps = Some(dr / dt);
+        }
+        if let (Some(prev_b), Some(cur_b)) = (*prev_batches_total, batches_total) {
+            let db = (cur_b - prev_b).max(0.0);
+            bps = Some(db / dt);
+            if db > 0.0 {
+                if let (Some(prev_r), Some(cur_r)) = (*prev_req_total, req_total) {
+                    let dr = (cur_r - prev_r).max(0.0);
+                    mean = Some(dr / db);
+                }
+            }
+        }
+        if let (Some(prev_f), Some(cur_f)) = (*prev_flush_full_total, flush_full_total) {
+            full_s = Some((cur_f - prev_f).max(0.0) / dt);
+        }
+        if let (Some(prev_f), Some(cur_f)) = (*prev_flush_deadline_total, flush_deadline_total) {
+            dead_s = Some((cur_f - prev_f).max(0.0) / dt);
+        }
+    }
+    *prev_ts = Some(now);
+    *prev_req_total = req_total;
+    *prev_batches_total = batches_total;
+    *prev_flush_full_total = flush_full_total;
+    *prev_flush_deadline_total = flush_deadline_total;
+    (rps, bps, mean, full_s, dead_s)
+}
+
+fn draw_system(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
+    let title = Line::from(vec![
+        Span::styled("System", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(rid.to_string()),
+    ]);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)].as_ref())
+        .split(area);
+
+    let cur = app.system_live.as_ref();
+
+    let mut left: Vec<Line> = Vec::new();
+    left.push(Line::from(title));
+    left.push(Line::from(""));
+
+    // Phase/status from run.json (best-effort, cheap: already loaded by refresh_dashboard()).
+    if let Some(m) = app.dashboard_manifest.as_ref() {
+        let phase = m.controller_phase.as_deref().unwrap_or("-");
+        let status = m.controller_status.as_deref().unwrap_or("-");
+        let planned = app
+            .dashboard_planned_total_iterations
+            .map(|x| format!("{x}"))
+            .unwrap_or_else(|| "?".to_string());
+        left.push(Line::from(Span::styled(
+            "Controller",
+            Style::default().fg(Color::DarkGray),
+        )));
+        left.push(Line::from(format!(
+            " phase={phase}  iter={}/{}",
+            m.controller_iteration_idx, planned
+        )));
+        left.push(Line::from(format!(" status: {status}")));
+        left.push(Line::from(""));
+    }
+
+    // Config knobs (high-signal).
+    left.push(Line::from(Span::styled(
+        "Config",
+        Style::default().fg(Color::DarkGray),
+    )));
+    left.push(Line::from(format!(
+        " infer: max_batch={} max_wait_us={} torch_threads={:?} interop={:?}",
+        app.cfg.inference.max_batch,
+        app.cfg.inference.max_wait_us,
+        app.cfg.inference.torch_threads,
+        app.cfg.inference.torch_interop_threads
+    )));
+    left.push(Line::from(format!(
+        " selfplay: workers={} threads/worker={}  mcts: max_inflight/game={}",
+        app.cfg.selfplay.workers,
+        app.cfg.selfplay.threads_per_worker,
+        app.cfg.mcts.max_inflight_per_game
+    )));
+    left.push(Line::from(""));
+
+    // Live vs playback status.
+    if let Some(err) = &app.system_live_err {
+        left.push(Line::from(vec![
+            Span::styled("live:", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::raw(err.clone()),
+        ]));
+    } else if let Some(c) = cur {
+        left.push(Line::from(format!("source: {}", c.source)));
+    }
+    left.push(Line::from(""));
+
+    // Per-iteration averages (not required to be live).
+    // We use existing per-iteration summaries (learn_summary + selfplay_summary + run.json timestamps).
+    if let Some(m) = app.dashboard_manifest.as_ref() {
+        let cur_idx = m.controller_iteration_idx;
+        let active_idx = if m.iterations.iter().any(|it| it.idx == cur_idx) {
+            cur_idx
+        } else {
+            cur_idx.saturating_sub(1)
+        };
+        let it = m.iterations.iter().find(|it| it.idx == active_idx);
+        let moves_s = app
+            .selfplay_by_iter
+            .get(&active_idx)
+            .and_then(|x| x.moves_s_mean);
+        let samples_s = app
+            .learn_by_iter
+            .get(&active_idx)
+            .and_then(|x| x.samples_s_mean);
+
+        let games_s = it.and_then(|it| {
+            let games = it.selfplay.games_completed as f64;
+            let start = it
+                .selfplay
+                .first_game_started_ts_ms
+                .or(it.selfplay.started_ts_ms)?;
+            let end = it.selfplay.ended_ts_ms.unwrap_or_else(yz_logging::now_ms);
+            let dt_s = ((end.saturating_sub(start)) as f64) / 1000.0;
+            if dt_s > 0.0 && games >= 0.0 {
+                Some(games / dt_s)
+            } else {
+                None
+            }
+        });
+
+        left.push(Line::from(Span::styled(
+            "Per-iteration averages",
+            Style::default().fg(Color::DarkGray),
+        )));
+        left.push(Line::from(format!(
+            " iter={}  games/s={}  moves/s={}  samples/s={}",
+            active_idx,
+            fmt_opt_f(games_s, 2),
+            fmt_opt_f(moves_s, 0),
+            fmt_opt_f(samples_s, 0),
+        )));
+        left.push(Line::from(""));
+
+        // Seconds per game / step by phase (derived from run.json timestamps; no extra logging).
+        left.push(Line::from(Span::styled(
+            "Phase timings",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let now_ms = yz_logging::now_ms();
+        let fmt_s = |ms: u64| -> String { format!("{:.2}s", (ms as f64) / 1000.0) };
+        let fmt_s_per = |ms: u64, n: u64| -> String {
+            if n == 0 {
+                "-".to_string()
+            } else {
+                format!("{:.3}s", (ms as f64) / 1000.0 / (n as f64))
+            }
+        };
+
+        if let Some(it2) = it {
+            // Selfplay: split setup vs running using first_game_started when available.
+            let sp_games = it2.selfplay.games_completed;
+            if let Some(sp_start) = it2.selfplay.started_ts_ms {
+                let sp_first = it2
+                    .selfplay
+                    .first_game_started_ts_ms
+                    .unwrap_or(sp_start);
+                let sp_end = it2.selfplay.ended_ts_ms.unwrap_or(now_ms);
+                let setup_ms = sp_first.saturating_sub(sp_start);
+                let run_ms = sp_end.saturating_sub(sp_first);
+                let total_ms = sp_end.saturating_sub(sp_start);
+                left.push(Line::from(format!(
+                    " selfplay: setup={} run={} total={}  s/game(run)={}  s/game(total)={}",
+                    fmt_s(setup_ms),
+                    fmt_s(run_ms),
+                    fmt_s(total_ms),
+                    fmt_s_per(run_ms, sp_games),
+                    fmt_s_per(total_ms, sp_games),
+                )));
+            }
+
+            // Gate: per-game timing (gate may not record first_game_started in some paths).
+            let g_games = it2.gate.games_completed;
+            if let Some(g_start) = it2.gate.started_ts_ms {
+                let g_first = it2.gate.first_game_started_ts_ms.unwrap_or(g_start);
+                let g_end = it2.gate.ended_ts_ms.unwrap_or(now_ms);
+                let setup_ms = g_first.saturating_sub(g_start);
+                let run_ms = g_end.saturating_sub(g_first);
+                let total_ms = g_end.saturating_sub(g_start);
+                left.push(Line::from(format!(
+                    " gate:    setup={} run={} total={}  s/game(run)={}  s/game(total)={}",
+                    fmt_s(setup_ms),
+                    fmt_s(run_ms),
+                    fmt_s(total_ms),
+                    fmt_s_per(run_ms, g_games),
+                    fmt_s_per(total_ms, g_games),
+                )));
+            }
+
+            // Train: seconds per step (not games, but useful phase speed signal).
+            if let (Some(t_start), Some(steps_done)) =
+                (it2.train.started_ts_ms, it2.train.steps_completed)
+            {
+                let t_end = it2.train.ended_ts_ms.unwrap_or(now_ms);
+                let t_ms = t_end.saturating_sub(t_start);
+                left.push(Line::from(format!(
+                    " train:   total={}  s/step={}",
+                    fmt_s(t_ms),
+                    fmt_s_per(t_ms, steps_done),
+                )));
+            }
+        } else {
+            left.push(Line::from(" (no iteration timing yet)"));
+        }
+        left.push(Line::from(""));
+    }
+
+    fn fmt_opt_u64(v: Option<u64>) -> String {
+        v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
+    }
+    fn fmt_opt_f(v: Option<f64>, prec: usize) -> String {
+        match v {
+            Some(x) if x.is_finite() => format!("{x:.prec$}", prec = prec),
+            _ => "-".to_string(),
+        }
+    }
+    fn fmt_pct(v: Option<f64>) -> String {
+        match v {
+            Some(x) if x.is_finite() => format!("{:.0}%", (x.clamp(0.0, 1.0) * 100.0)),
+            _ => "-".to_string(),
+        }
+    }
+
+    left.push(Line::from(Span::styled(
+        "Live snapshot",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if let Some(c) = cur {
+        let age_ms = c.ts.elapsed().as_millis() as u64;
+        left.push(Line::from(format!(" age_ms={age_ms}")));
+        left.push(Line::from(format!(
+            " queue_depth={}  rps={}  bps={}  avg_batch={}",
+            fmt_opt_u64(c.queue_depth),
+            fmt_opt_f(c.requests_s, 1),
+            fmt_opt_f(c.batches_s, 1),
+            fmt_opt_f(c.batch_size_mean, 2),
+        )));
+        left.push(Line::from(format!(
+            " batch_p95={}  underfill={}  full={}  would_block={}",
+            fmt_opt_f(c.batch_size_p95, 1),
+            fmt_pct(c.underfill_frac_mean),
+            fmt_pct(c.full_frac_mean),
+            fmt_pct(c.would_block_frac),
+        )));
+        left.push(Line::from(format!(
+            " qwait_p95_us={}  fwd_p95_ms={}  flush(full/dead)/s={}/{}",
+            fmt_opt_f(c.queue_wait_us_p95, 0),
+            fmt_opt_f(c.forward_ms_p95, 2),
+            fmt_opt_f(c.flush_full_s, 2),
+            fmt_opt_f(c.flush_deadline_s, 2),
+        )));
+        left.push(Line::from(format!(
+            " inflight(sum/max)={}/{}  rtt_p95_med_us={}",
+            fmt_opt_u64(c.inflight_sum),
+            fmt_opt_u64(c.inflight_max),
+            fmt_opt_u64(c.rtt_p95_us_med),
+        )));
+    } else {
+        left.push(Line::from(" (no data yet)"));
+    }
+
+    let left_block = Block::default().title("System / Inference").borders(Borders::ALL);
+    f.render_widget(Paragraph::new(left).block(left_block), cols[0]);
+
+    // Right: sparklines (prefer live series, fall back to playback samples).
+    let spark_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(4),
+            ]
+            .as_ref(),
+        )
+        .split(cols[1]);
+
+    let series_q = if app.system_series_queue_depth.is_empty() {
+        app.infer_snapshots
+            .iter()
+            .filter_map(|x| x.queue_depth)
+            .collect::<Vec<u64>>()
+    } else {
+        app.system_series_queue_depth.clone()
+    };
+    let series_rtt = if app.system_series_rtt_p95_us.is_empty() {
+        app.infer_snapshots
+            .iter()
+            .filter_map(|x| x.rtt_p95_us_med)
+            .collect::<Vec<u64>>()
+    } else {
+        app.system_series_rtt_p95_us.clone()
+    };
+    let series_rps = if app.system_series_rps_x10.is_empty() {
+        app.infer_snapshots
+            .iter()
+            .filter_map(|x| x.requests_s.map(|v| (v.max(0.0) * 10.0) as u64))
+            .collect::<Vec<u64>>()
+    } else {
+        app.system_series_rps_x10.clone()
+    };
+    let series_batch = if app.system_series_batch_mean_x100.is_empty() {
+        app.infer_snapshots
+            .iter()
+            .filter_map(|x| x.batch_size_mean.map(|v| (v.max(0.0) * 100.0) as u64))
+            .collect::<Vec<u64>>()
+    } else {
+        app.system_series_batch_mean_x100.clone()
+    };
+    let series_wb = if app.system_series_would_block_x1000.is_empty() {
+        app.infer_snapshots
+            .iter()
+            .filter_map(|x| x.would_block_frac.map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64))
+            .collect::<Vec<u64>>()
+    } else {
+        app.system_series_would_block_x1000.clone()
+    };
+
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("queue_depth").borders(Borders::ALL))
+            .data(&series_q),
+        spark_rows[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("rtt_p95_med (us)").borders(Borders::ALL))
+            .data(&series_rtt),
+        spark_rows[1],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("rps x10").borders(Borders::ALL))
+            .data(&series_rps),
+        spark_rows[2],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("avg_batch x100").borders(Borders::ALL))
+            .data(&series_batch),
+        spark_rows[3],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("would_block x1000").borders(Borders::ALL))
+            .data(&series_wb),
+        spark_rows[4],
+    );
 }
 
 #[cfg(test)]

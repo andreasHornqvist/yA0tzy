@@ -34,10 +34,22 @@ class ModelStats:
     batches_total: int = 0
     batch_hist: dict[int, int] | None = None
     max_batch_seen: int = 0
+    # Flush reasons: {"full": n, "deadline": n, "forced": n}
+    flush_reason_total: dict[str, int] | None = None
+    # Per-batch timing/queue-wait histograms (cheap, per-process).
+    batch_queue_wait_us: "PromHistogram" | None = None
+    batch_build_ms: "PromHistogram" | None = None
+    batch_forward_ms: "PromHistogram" | None = None
+    batch_post_ms: "PromHistogram" | None = None
+    # Utilization proxies (EMA in [0,1]).
+    batch_underfill_frac: float = 0.0
+    batch_full_frac: float = 0.0
 
     def __post_init__(self) -> None:
         if self.batch_hist is None:
             self.batch_hist = {}
+        if self.flush_reason_total is None:
+            self.flush_reason_total = {}
 
 
 @dataclass(slots=True)
@@ -53,6 +65,77 @@ class BatcherStats:
             self.batch_hist = {}
         if self.by_model is None:
             self.by_model = {}
+
+
+# Fixed buckets for cheap Prometheus histograms. Keep bucket counts small (<= ~16).
+_HIST_QUEUE_WAIT_US = (
+    100.0,
+    200.0,
+    500.0,
+    1_000.0,
+    2_000.0,
+    5_000.0,
+    10_000.0,
+    20_000.0,
+    50_000.0,
+    100_000.0,
+    200_000.0,
+    500_000.0,
+    1_000_000.0,
+)
+_HIST_BUILD_MS = (0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0)
+_HIST_FORWARD_MS = (
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    50.0,
+    100.0,
+    200.0,
+    500.0,
+)
+_HIST_POST_MS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
+
+
+@dataclass(slots=True)
+class PromHistogram:
+    """Tiny fixed-bucket histogram for Prometheus exposition."""
+
+    buckets: tuple[float, ...]  # finite bucket upper bounds (le)
+    counts: list[int]
+    overflow: int = 0
+    count: int = 0
+    sum: float = 0.0
+
+    @classmethod
+    def with_buckets(cls, buckets: tuple[float, ...]) -> "PromHistogram":
+        return cls(buckets=tuple(float(x) for x in buckets), counts=[0 for _ in buckets])
+
+    def observe(self, x: float) -> None:
+        xf = float(x)
+        if not np.isfinite(xf):
+            return
+        self.count += 1
+        self.sum += xf
+        for i, le in enumerate(self.buckets):
+            if xf <= le:
+                self.counts[i] += 1
+                return
+        self.overflow += 1
+
+
+def _ema_update(prev: float, x: float, alpha: float) -> float:
+    a = float(alpha)
+    if a <= 0.0:
+        return float(prev)
+    if a >= 1.0:
+        return float(x)
+    return float(prev) * (1.0 - a) + float(x) * a
 
 
 class Batcher:
@@ -125,7 +208,7 @@ class Batcher:
                             oldest_deadline = dl
                             oldest_mid = mid
                     if oldest_deadline is not None and oldest_mid is not None and (oldest_deadline - now) <= 0:
-                        self._flush_one(sample=False, force_model_id=oldest_mid)
+                        self._flush_one(sample=False, force_model_id=oldest_mid, reason="deadline")
                 continue
 
             self._stage(first)
@@ -144,7 +227,7 @@ class Batcher:
                         full_model_id = mid
                         break
                 if full_model_id is not None:
-                    self._flush_one(sample=True, force_model_id=full_model_id)
+                    self._flush_one(sample=True, force_model_id=full_model_id, reason="full")
                     continue
 
                 # Compute remaining time until the oldest pending item reaches max_wait.
@@ -163,7 +246,7 @@ class Batcher:
 
                 remaining = oldest_deadline - now
                 if remaining <= 0:
-                    self._flush_one(sample=True, force_model_id=oldest_mid)
+                    self._flush_one(sample=True, force_model_id=oldest_mid, reason="deadline")
                     continue
 
                 try:
@@ -173,7 +256,7 @@ class Batcher:
                     self._drain_nowait()
                 except TimeoutError:
                     # Oldest item reached deadline; flush that model.
-                    self._flush_one(sample=True, force_model_id=oldest_mid)
+                    self._flush_one(sample=True, force_model_id=oldest_mid, reason="deadline")
                     continue
 
     def stop(self) -> None:
@@ -197,7 +280,9 @@ class Batcher:
                 return
             self._stage(item)
 
-    def _flush_one(self, *, sample: bool, force_model_id: int | None = None) -> None:
+    def _flush_one(
+        self, *, sample: bool, force_model_id: int | None = None, reason: str = "forced"
+    ) -> None:
         """Flush one per-model batch.\n\n        If force_model_id is provided, we flush that model (if any pending).\n        Otherwise, we flush the model whose oldest item has waited the longest.\n        """
         if self._pending_total <= 0:
             return
@@ -265,9 +350,22 @@ class Batcher:
                 pass
         # endregion agent log
 
-        self._apply_model_batch(int(model_id), batch)
+        oldest_wait_us = int((time.monotonic() - batch[0].t0) * 1_000_000) if batch else 0
+        self._apply_model_batch(
+            int(model_id),
+            batch,
+            flush_reason=str(reason),
+            oldest_wait_us=oldest_wait_us,
+        )
 
-    def _apply_model_batch(self, model_id: int, items: list[_Queued]) -> None:
+    def _apply_model_batch(
+        self,
+        model_id: int,
+        items: list[_Queued],
+        *,
+        flush_reason: str,
+        oldest_wait_us: int,
+    ) -> None:
         if not items:
             return
 
@@ -284,6 +382,29 @@ class Batcher:
         ms.requests_total += len(items)
         ms.max_batch_seen = max(ms.max_batch_seen, len(items))
         ms.batch_hist[len(items)] = ms.batch_hist.get(len(items), 0) + 1
+        ms.flush_reason_total[flush_reason] = ms.flush_reason_total.get(flush_reason, 0) + 1
+
+        # Lazily create histograms on first real batch.
+        if ms.batch_queue_wait_us is None:
+            ms.batch_queue_wait_us = PromHistogram.with_buckets(_HIST_QUEUE_WAIT_US)
+        if ms.batch_build_ms is None:
+            ms.batch_build_ms = PromHistogram.with_buckets(_HIST_BUILD_MS)
+        if ms.batch_forward_ms is None:
+            ms.batch_forward_ms = PromHistogram.with_buckets(_HIST_FORWARD_MS)
+        if ms.batch_post_ms is None:
+            ms.batch_post_ms = PromHistogram.with_buckets(_HIST_POST_MS)
+        ms.batch_queue_wait_us.observe(float(max(0, int(oldest_wait_us))))
+
+        # Utilization proxies: EMA of underfill/full batch events.
+        alpha = 0.02
+        bsz = len(items)
+        underfill_thr = max(1, int(self._max_batch * 0.25))
+        ms.batch_underfill_frac = _ema_update(
+            ms.batch_underfill_frac, 1.0 if bsz < underfill_thr else 0.0, alpha
+        )
+        ms.batch_full_frac = _ema_update(
+            ms.batch_full_frac, 1.0 if bsz >= self._max_batch else 0.0, alpha
+        )
 
         model = self._models.get(model_id)
         if model is None:
@@ -293,14 +414,18 @@ class Batcher:
             return
 
         bsz = len(items)
+        t_build0 = time.monotonic()
         x_np = np.empty((bsz, FEATURE_LEN_V1), dtype=np.float32)
         for i, it in enumerate(items):
             row = np.frombuffer(it.req.features_f32, dtype=np.float32, count=FEATURE_LEN_V1)
             x_np[i, :] = row
         masks = [it.req.legal_mask for it in items]
+        build_ms = (time.monotonic() - t_build0) * 1000.0
+        ms.batch_build_ms.observe(float(build_ms))
         t0 = time.monotonic()
         logits_bytes, values_bytes, margin_bytes = model.infer_batch_packed(x_np, masks)
         dt_ms = (time.monotonic() - t0) * 1000.0
+        ms.batch_forward_ms.observe(float(dt_ms))
 
         # region agent log
         if self._first_batch_logged is not None and model_id not in self._first_batch_logged:
@@ -347,6 +472,7 @@ class Batcher:
             pass
         # endregion agent log
 
+        t_post0 = time.monotonic()
         if len(logits_bytes) != bsz * ACTION_SPACE_A * 4:
             for item in items:
                 if not item.fut.cancelled():
@@ -381,3 +507,5 @@ class Batcher:
                     margin_f32=None if margin_mv is None else margin_mv[i * 4 : (i + 1) * 4],
                 )
             )
+        post_ms = (time.monotonic() - t_post0) * 1000.0
+        ms.batch_post_ms.observe(float(post_ms))

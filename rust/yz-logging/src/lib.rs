@@ -340,6 +340,77 @@ pub struct MetricsSelfplayIterV1 {
     pub infer: InferStatsV1,
 }
 
+/// Low-rate inference/system snapshot for playback in the TUI (System/Inference screen).
+///
+/// Emitted by the controller at a coarse cadence (default every 5s) to avoid performance impact.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsInferSnapshotV1 {
+    pub event: &'static str, // "infer_snapshot"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iter_idx: Option<u32>,
+    pub metrics_bind: String,
+
+    // Infer-server snapshot (from GET /metrics).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batches_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underfill_frac_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_frac_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flush_full_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flush_deadline_s: Option<f64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_us_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_us_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_ms_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_ms_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_ms_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_ms_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_ms_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_ms_p95: Option<f64>,
+
+    // Worker-side snapshot (best-effort; only available where progress.json includes infer stats).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers_seen: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inflight_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inflight_max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_p95_us_min: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_p95_us_med: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_p95_us_max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub would_block_frac: Option<f64>,
+}
+
 /// Uniform-binned histogram for cheap mergeable quantile estimates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramV1 {

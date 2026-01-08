@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use yz_logging::RunManifestV1;
@@ -1657,6 +1657,447 @@ fn run_train_subprocess(
     }
 }
 
+// -------------------------
+// Infer snapshot (playback for TUI System screen)
+// -------------------------
+
+#[derive(Debug, Default, Clone)]
+struct WorkerInferAgg {
+    workers_seen: u32,
+    inflight_sum: u64,
+    inflight_max: u64,
+    rtt_p95_us_min: Option<u64>,
+    rtt_p95_us_med: Option<u64>,
+    rtt_p95_us_max: Option<u64>,
+    would_block_frac: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ServerInferAgg {
+    queue_depth: Option<u64>,
+    requests_total: Option<f64>,
+    batches_total: Option<f64>,
+    batch_size_p50: Option<f64>,
+    batch_size_p95: Option<f64>,
+    queue_wait_us_p50: Option<f64>,
+    queue_wait_us_p95: Option<f64>,
+    build_ms_p50: Option<f64>,
+    build_ms_p95: Option<f64>,
+    forward_ms_p50: Option<f64>,
+    forward_ms_p95: Option<f64>,
+    post_ms_p50: Option<f64>,
+    post_ms_p95: Option<f64>,
+    underfill_frac_mean: Option<f64>,
+    full_frac_mean: Option<f64>,
+    flush_full_total: Option<f64>,
+    flush_deadline_total: Option<f64>,
+}
+
+fn quantile_from_cumulative(mut buckets: Vec<(u64, u64)>, total: u64, q: f64) -> Option<u64> {
+    if total == 0 || buckets.is_empty() {
+        return None;
+    }
+    buckets.sort_by_key(|(le, _)| *le);
+    let qq = q.clamp(0.0, 1.0);
+    let target = (qq * (total as f64)).ceil() as u64;
+    for (le, cum) in buckets {
+        if cum >= target {
+            return Some(le);
+        }
+    }
+    None
+}
+
+fn parse_prom_sample(line: &str) -> Option<(&str, Option<&str>, f64)> {
+    // Returns (name, label_blob_without_braces, value)
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (lhs, rhs) = line.split_once(' ')?;
+    let value = rhs.trim().parse::<f64>().ok()?;
+    if let Some((name, rest)) = lhs.split_once('{') {
+        let labels = rest.strip_suffix('}')?;
+        Some((name, Some(labels), value))
+    } else {
+        Some((lhs, None, value))
+    }
+}
+
+fn parse_label(labels: &str, key: &str) -> Option<String> {
+    // Extremely small/simple parser for key="value" pairs (no escaping beyond \").
+    for part in labels.split(',') {
+        let (k, v) = part.split_once('=')?;
+        if k.trim() != key {
+            continue;
+        }
+        let vs = v.trim();
+        let unq = vs.strip_prefix('"')?.strip_suffix('"')?;
+        return Some(unq.to_string());
+    }
+    None
+}
+
+fn parse_infer_server_metrics(text: &str) -> ServerInferAgg {
+    let mut out = ServerInferAgg::default();
+
+    let mut batch_size_cum: Vec<(u64, u64)> = Vec::new();
+    let mut batch_size_total: u64 = 0;
+
+    let mut qwait_cum: Vec<(u64, u64)> = Vec::new();
+    let mut qwait_total: u64 = 0;
+
+    let mut build_cum_us: Vec<(u64, u64)> = Vec::new();
+    let mut build_total: u64 = 0;
+    let mut forward_cum_us: Vec<(u64, u64)> = Vec::new();
+    let mut forward_total: u64 = 0;
+    let mut post_cum_us: Vec<(u64, u64)> = Vec::new();
+    let mut post_total: u64 = 0;
+
+    let mut underfill_sum = 0.0f64;
+    let mut underfill_n = 0u64;
+    let mut full_sum = 0.0f64;
+    let mut full_n = 0u64;
+
+    let mut flush_full_total = 0.0f64;
+    let mut flush_deadline_total = 0.0f64;
+
+    for line in text.lines() {
+        let Some((name, labels_opt, value)) = parse_prom_sample(line) else {
+            continue;
+        };
+        match name {
+            "yatzy_infer_queue_depth" => {
+                out.queue_depth = Some(value.max(0.0) as u64);
+            }
+            "yatzy_infer_requests_total" => out.requests_total = Some(value),
+            "yatzy_infer_batches_total" => out.batches_total = Some(value),
+            "yatzy_infer_batch_underfill_frac" => {
+                underfill_sum += value;
+                underfill_n += 1;
+            }
+            "yatzy_infer_batch_full_frac" => {
+                full_sum += value;
+                full_n += 1;
+            }
+            "yatzy_infer_flush_reason_total" => {
+                let Some(labels) = labels_opt else { continue };
+                let reason = parse_label(labels, "reason").unwrap_or_default();
+                match reason.as_str() {
+                    "full" => flush_full_total += value,
+                    "deadline" => flush_deadline_total += value,
+                    _ => {}
+                }
+            }
+            "yatzy_infer_batch_size_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let le = parse_label(labels, "le").unwrap_or_default();
+                if le == "+Inf" {
+                    batch_size_total = batch_size_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    batch_size_cum.push((x.max(0.0) as u64, value.max(0.0) as u64));
+                }
+            }
+            "yatzy_infer_batch_queue_wait_us_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let le = parse_label(labels, "le").unwrap_or_default();
+                if le == "+Inf" {
+                    qwait_total = qwait_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    qwait_cum.push((x.max(0.0) as u64, value.max(0.0) as u64));
+                }
+            }
+            "yatzy_infer_batch_build_ms_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let le = parse_label(labels, "le").unwrap_or_default();
+                if le == "+Inf" {
+                    build_total = build_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    let us = (x.max(0.0) * 1000.0).round() as u64;
+                    build_cum_us.push((us, value.max(0.0) as u64));
+                }
+            }
+            "yatzy_infer_batch_forward_ms_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let le = parse_label(labels, "le").unwrap_or_default();
+                if le == "+Inf" {
+                    forward_total = forward_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    let us = (x.max(0.0) * 1000.0).round() as u64;
+                    forward_cum_us.push((us, value.max(0.0) as u64));
+                }
+            }
+            "yatzy_infer_batch_post_ms_bucket" => {
+                let Some(labels) = labels_opt else { continue };
+                let le = parse_label(labels, "le").unwrap_or_default();
+                if le == "+Inf" {
+                    post_total = post_total.max(value.max(0.0) as u64);
+                } else if let Ok(x) = le.parse::<f64>() {
+                    let us = (x.max(0.0) * 1000.0).round() as u64;
+                    post_cum_us.push((us, value.max(0.0) as u64));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.batch_size_p50 = quantile_from_cumulative(batch_size_cum.clone(), batch_size_total, 0.50).map(|x| x as f64);
+    out.batch_size_p95 = quantile_from_cumulative(batch_size_cum, batch_size_total, 0.95).map(|x| x as f64);
+
+    out.queue_wait_us_p50 = quantile_from_cumulative(qwait_cum.clone(), qwait_total, 0.50).map(|x| x as f64);
+    out.queue_wait_us_p95 = quantile_from_cumulative(qwait_cum, qwait_total, 0.95).map(|x| x as f64);
+
+    out.build_ms_p50 = quantile_from_cumulative(build_cum_us.clone(), build_total, 0.50).map(|x| (x as f64) / 1000.0);
+    out.build_ms_p95 = quantile_from_cumulative(build_cum_us, build_total, 0.95).map(|x| (x as f64) / 1000.0);
+
+    out.forward_ms_p50 = quantile_from_cumulative(forward_cum_us.clone(), forward_total, 0.50).map(|x| (x as f64) / 1000.0);
+    out.forward_ms_p95 = quantile_from_cumulative(forward_cum_us, forward_total, 0.95).map(|x| (x as f64) / 1000.0);
+
+    out.post_ms_p50 = quantile_from_cumulative(post_cum_us.clone(), post_total, 0.50).map(|x| (x as f64) / 1000.0);
+    out.post_ms_p95 = quantile_from_cumulative(post_cum_us, post_total, 0.95).map(|x| (x as f64) / 1000.0);
+
+    out.underfill_frac_mean = if underfill_n > 0 {
+        Some(underfill_sum / (underfill_n as f64))
+    } else {
+        None
+    };
+    out.full_frac_mean = if full_n > 0 {
+        Some(full_sum / (full_n as f64))
+    } else {
+        None
+    };
+    out.flush_full_total = Some(flush_full_total);
+    out.flush_deadline_total = Some(flush_deadline_total);
+    out
+}
+
+fn read_selfplay_worker_infer_agg(
+    logs_workers_dir: &Path,
+    prev_steps_sum: &mut Option<u64>,
+    prev_wb_sum: &mut Option<u64>,
+) -> WorkerInferAgg {
+    #[derive(serde::Deserialize)]
+    struct P {
+        #[serde(default)]
+        infer_inflight: u64,
+        #[serde(default)]
+        infer_latency_p95_us: u64,
+        #[serde(default)]
+        sched_steps: u64,
+        #[serde(default)]
+        sched_would_block: u64,
+    }
+
+    let mut out = WorkerInferAgg::default();
+    let mut rtts: Vec<u64> = Vec::new();
+    let mut steps_sum = 0u64;
+    let mut wb_sum = 0u64;
+
+    if let Ok(rd) = std::fs::read_dir(logs_workers_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let f = p.join("progress.json");
+            let Ok(bytes) = std::fs::read(&f) else { continue };
+            let Ok(pp) = serde_json::from_slice::<P>(&bytes) else { continue };
+
+            out.workers_seen += 1;
+            out.inflight_sum = out.inflight_sum.saturating_add(pp.infer_inflight);
+            out.inflight_max = out.inflight_max.max(pp.infer_inflight);
+            rtts.push(pp.infer_latency_p95_us);
+            steps_sum = steps_sum.saturating_add(pp.sched_steps);
+            wb_sum = wb_sum.saturating_add(pp.sched_would_block);
+        }
+    }
+
+    if !rtts.is_empty() {
+        rtts.sort();
+        out.rtt_p95_us_min = rtts.first().copied();
+        out.rtt_p95_us_max = rtts.last().copied();
+        out.rtt_p95_us_med = Some(rtts[rtts.len() / 2]);
+    }
+
+    // Delta-based would-block fraction (more meaningful than absolute totals).
+    if let (Some(prev_s), Some(prev_w)) = (prev_steps_sum.take(), prev_wb_sum.take()) {
+        let ds = steps_sum.saturating_sub(prev_s);
+        let dw = wb_sum.saturating_sub(prev_w);
+        let denom = (ds + dw) as f64;
+        if denom > 0.0 {
+            out.would_block_frac = Some((dw as f64) / denom);
+        }
+        *prev_steps_sum = Some(steps_sum);
+        *prev_wb_sum = Some(wb_sum);
+    } else {
+        *prev_steps_sum = Some(steps_sum);
+        *prev_wb_sum = Some(wb_sum);
+    }
+
+    out
+}
+
+struct InferSnapshotPoller {
+    agent: ureq::Agent,
+    metrics_bind: String,
+    run_id: String,
+    git_hash: Option<String>,
+    config_snapshot: Option<String>,
+    writer: Option<yz_logging::NdjsonWriter>,
+    last_emit: Instant,
+    last_ts: Option<Instant>,
+    last_req_total: Option<f64>,
+    last_batches_total: Option<f64>,
+    last_flush_full_total: Option<f64>,
+    last_flush_deadline_total: Option<f64>,
+    prev_steps_sum: Option<u64>,
+    prev_wb_sum: Option<u64>,
+}
+
+impl InferSnapshotPoller {
+    fn new(run_dir: &Path, cfg: &yz_core::Config, manifest: &RunManifestV1) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(200))
+            .timeout_read(Duration::from_millis(250))
+            .timeout_write(Duration::from_millis(250))
+            .build();
+        let metrics_path = run_dir.join("logs").join("metrics.ndjson");
+        let writer = yz_logging::NdjsonWriter::open_append_with_flush(&metrics_path, 1).ok();
+        Self {
+            agent,
+            metrics_bind: cfg.inference.metrics_bind.clone(),
+            run_id: manifest.run_id.clone(),
+            git_hash: manifest.git_hash.clone(),
+            config_snapshot: manifest.config_snapshot.clone(),
+            writer,
+            last_emit: Instant::now(),
+            last_ts: None,
+            last_req_total: None,
+            last_batches_total: None,
+            last_flush_full_total: None,
+            last_flush_deadline_total: None,
+            prev_steps_sum: None,
+            prev_wb_sum: None,
+        }
+    }
+
+    fn try_fetch_metrics(&self) -> Option<String> {
+        let url = format!("http://{}/metrics", self.metrics_bind);
+        let resp = self.agent.get(&url).call().ok()?;
+        if resp.status() != 200 {
+            return None;
+        }
+        resp.into_string().ok()
+    }
+
+    fn maybe_emit(&mut self, iter_idx: u32, worker_progress_dir: Option<&Path>) {
+        // Hard rate-limit to avoid any performance impact.
+        if self.last_emit.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_emit = Instant::now();
+
+        let Some(text) = self.try_fetch_metrics() else {
+            return;
+        };
+        let server = parse_infer_server_metrics(&text);
+
+        let mut worker = WorkerInferAgg::default();
+        if let Some(d) = worker_progress_dir {
+            worker = read_selfplay_worker_infer_agg(d, &mut self.prev_steps_sum, &mut self.prev_wb_sum);
+        }
+
+        let now = Instant::now();
+        let (requests_s, batches_s, batch_size_mean, flush_full_s, flush_deadline_s) = {
+            let mut rps = None;
+            let mut bps = None;
+            let mut mean = None;
+            let mut fr_full = None;
+            let mut fr_dead = None;
+            if let Some(prev_ts) = self.last_ts {
+                let dt = (now - prev_ts).as_secs_f64().max(1e-6);
+                if let (Some(prev_r), Some(cur_r)) = (self.last_req_total, server.requests_total) {
+                    let dr = (cur_r - prev_r).max(0.0);
+                    rps = Some(dr / dt);
+                }
+                if let (Some(prev_b), Some(cur_b)) = (self.last_batches_total, server.batches_total) {
+                    let db = (cur_b - prev_b).max(0.0);
+                    bps = Some(db / dt);
+                    if db > 0.0 {
+                        if let (Some(prev_r), Some(cur_r)) = (self.last_req_total, server.requests_total) {
+                            let dr = (cur_r - prev_r).max(0.0);
+                            mean = Some(dr / db);
+                        }
+                    }
+                }
+                if let (Some(prev_f), Some(cur_f)) =
+                    (self.last_flush_full_total, server.flush_full_total)
+                {
+                    fr_full = Some((cur_f - prev_f).max(0.0) / dt);
+                }
+                if let (Some(prev_f), Some(cur_f)) =
+                    (self.last_flush_deadline_total, server.flush_deadline_total)
+                {
+                    fr_dead = Some((cur_f - prev_f).max(0.0) / dt);
+                }
+            }
+            (rps, bps, mean, fr_full, fr_dead)
+        };
+        self.last_ts = Some(now);
+        self.last_req_total = server.requests_total;
+        self.last_batches_total = server.batches_total;
+        self.last_flush_full_total = server.flush_full_total;
+        self.last_flush_deadline_total = server.flush_deadline_total;
+
+        let Some(w) = self.writer.as_mut() else { return };
+        let ev = yz_logging::MetricsInferSnapshotV1 {
+            event: "infer_snapshot",
+            ts_ms: yz_logging::now_ms(),
+            v: yz_logging::VersionInfoV1 {
+                protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+                feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+                action_space_id: "oracle_keepmask_v1",
+                ruleset_id: "swedish_scandinavian_v1",
+            },
+            run_id: self.run_id.clone(),
+            git_hash: self.git_hash.clone(),
+            config_snapshot: self.config_snapshot.clone(),
+            iter_idx: Some(iter_idx),
+            metrics_bind: self.metrics_bind.clone(),
+
+            queue_depth: server.queue_depth,
+            requests_s,
+            batches_s,
+            batch_size_mean,
+            batch_size_p50: server.batch_size_p50,
+            batch_size_p95: server.batch_size_p95,
+            underfill_frac_mean: server.underfill_frac_mean,
+            full_frac_mean: server.full_frac_mean,
+            flush_full_s,
+            flush_deadline_s,
+
+            queue_wait_us_p50: server.queue_wait_us_p50,
+            queue_wait_us_p95: server.queue_wait_us_p95,
+            build_ms_p50: server.build_ms_p50,
+            build_ms_p95: server.build_ms_p95,
+            forward_ms_p50: server.forward_ms_p50,
+            forward_ms_p95: server.forward_ms_p95,
+            post_ms_p50: server.post_ms_p50,
+            post_ms_p95: server.post_ms_p95,
+
+            workers_seen: if worker.workers_seen > 0 { Some(worker.workers_seen) } else { None },
+            inflight_sum: if worker.workers_seen > 0 { Some(worker.inflight_sum) } else { None },
+            inflight_max: if worker.workers_seen > 0 { Some(worker.inflight_max) } else { None },
+            rtt_p95_us_min: worker.rtt_p95_us_min,
+            rtt_p95_us_med: worker.rtt_p95_us_med,
+            rtt_p95_us_max: worker.rtt_p95_us_max,
+            would_block_frac: worker.would_block_frac,
+        };
+        let _ = w.write_event(&ev);
+        let _ = w.flush();
+    }
+}
+
 fn run_selfplay(
     run_dir: &Path,
     cfg: &yz_core::Config,
@@ -1687,6 +2128,9 @@ fn run_selfplay(
     std::fs::create_dir_all(&replay_workers_dir)?;
     std::fs::create_dir_all(&logs_dir)?;
     std::fs::create_dir_all(&logs_workers_dir)?;
+
+    // Low-rate infer snapshot emitter for TUI playback (best-effort).
+    let mut infer_poller = InferSnapshotPoller::new(run_dir, cfg, manifest);
 
     // Spawn OS processes for true CPU parallelism.
     let num_workers = cfg.selfplay.workers.max(1);
@@ -1803,6 +2247,9 @@ fn run_selfplay(
             }
             let _ = yz_logging::write_manifest_atomic(&run_json, manifest);
             last_manifest_ts = std::time::Instant::now();
+
+            // Emit a coarse snapshot at most every 5s (HTTP GET /metrics + progress aggregation).
+            infer_poller.maybe_emit(iter_idx, Some(&logs_workers_dir));
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -1937,6 +2384,9 @@ fn run_gate(
     }
     let run_json = run_dir.join("run.json");
     let mut m = yz_logging::read_manifest(&run_json)?;
+    // Ensure logs dir exists so we can append to logs/metrics.ndjson even in gate-only usage.
+    let _ = std::fs::create_dir_all(run_dir.join("logs"));
+    let mut infer_poller = InferSnapshotPoller::new(run_dir, cfg, &m);
 
     // Record per-iteration phase start (best-effort).
     if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
@@ -2130,6 +2580,9 @@ fn run_gate(
                 let _ = yz_logging::write_manifest_atomic(&run_json, &mm);
             }
             last_manifest_ts = std::time::Instant::now();
+
+            // Gate-worker progress does not include infer client stats (server metrics still apply).
+            infer_poller.maybe_emit(iter_idx, None);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
