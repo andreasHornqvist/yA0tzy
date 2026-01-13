@@ -30,6 +30,57 @@ pub trait OracleDiagSink {
     fn on_step(&mut self, ev: &OracleDiagEvent);
 }
 
+// --- Gating replay traces (for TUI replay viewer) ---
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateReplayPlayerV1 {
+    pub avail_mask: u16,
+    pub upper_total_cap: u8,
+    pub total_score: i16,
+    /// Per-category raw scores (bonus excluded). None means unfilled.
+    pub filled_raw: [Option<i16>; yz_core::NUM_CATS],
+    pub upper_raw_sum: i16,
+    pub upper_bonus_awarded: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateReplayStepV1 {
+    pub ply: u32,
+    pub turn_idx: u8,
+    pub player_to_move_before: u8,
+    pub rerolls_left_before: u8,
+    pub dice_sorted_before: [u8; 5],
+    pub chosen_action_idx: u8,
+    pub chosen_action_str: String,
+    pub player_to_move_after: u8,
+    pub rerolls_left_after: u8,
+    pub dice_sorted_after: [u8; 5],
+    pub players_after: [GateReplayPlayerV1; 2],
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateReplayTerminalV1 {
+    pub cand_score: i32,
+    pub best_score: i32,
+    pub outcome: String, // "win" | "loss" | "draw" from candidate POV
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateReplayTraceV1 {
+    pub trace_version: u32,
+    pub episode_seed: u64,
+    pub swap: bool,
+    pub cand_seat: u8,
+    pub best_seat: u8,
+    pub steps: Vec<GateReplayStepV1>,
+    pub terminal: Option<GateReplayTerminalV1>,
+}
+
+pub trait GateReplaySink {
+    /// Called when one gating game completes; implementers should persist the trace.
+    fn on_game(&mut self, trace: GateReplayTraceV1);
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OracleDiagStep {
@@ -573,6 +624,7 @@ pub fn gate_with_progress(
         &plan.schedule,
         progress,
         None,
+        None,
     )?;
 
     // Note: oracle diagnostics are computed offline (controller) for multi-process gating.
@@ -589,6 +641,7 @@ pub fn gate_schedule_subset(
     schedule: &[GameSpec],
     progress: Option<&mut dyn GateProgress>,
     oracle_sink: Option<&mut dyn OracleDiagSink>,
+    replay_sink: Option<&mut dyn GateReplaySink>,
 ) -> Result<GatePartial, GateError> {
     let (best_backend, cand_backend) = connect_two_backends(
         &opts.infer_endpoint,
@@ -604,6 +657,7 @@ pub fn gate_schedule_subset(
         schedule,
         progress,
         oracle_sink,
+        replay_sink,
     )
 }
 
@@ -615,6 +669,7 @@ fn gate_schedule_subset_with_backends(
     schedule: &[GameSpec],
     mut progress: Option<&mut dyn GateProgress>,
     mut oracle_sink: Option<&mut dyn OracleDiagSink>,
+    mut replay_sink: Option<&mut dyn GateReplaySink>,
 ) -> Result<GatePartial, GateError> {
     let total = schedule.len() as u32;
     let sprt_cfg = sprt_params(cfg)?;
@@ -665,6 +720,13 @@ fn gate_schedule_subset_with_backends(
         search: Option<SearchDriver>,
         search_backend: BackendSel,
         active: bool,
+        // Replay trace state (derived scorecards + step buffer).
+        filled_raw: [[Option<i16>; yz_core::NUM_CATS]; 2],
+        upper_raw_sum: [i16; 2],
+        upper_bonus_awarded: [bool; 2],
+        ply: u32,
+        turn_idx: u8,
+        trace_steps: Vec<GateReplayStepV1>,
     }
 
     impl GateGameTask {
@@ -704,6 +766,12 @@ fn gate_schedule_subset_with_backends(
                 search: None,
                 search_backend: BackendSel::Best,
                 active: true,
+                filled_raw: [[None; yz_core::NUM_CATS]; 2],
+                upper_raw_sum: [0, 0],
+                upper_bonus_awarded: [false, false],
+                ply: 0,
+                turn_idx: 0,
+                trace_steps: Vec::new(),
             })
         }
 
@@ -738,6 +806,7 @@ fn gate_schedule_subset_with_backends(
             cand_backend: &InferBackend,
             max_work: u32,
             oracle_sink: &mut Option<&mut dyn OracleDiagSink>,
+            replay_sink: &mut Option<&mut dyn GateReplaySink>,
         ) -> Result<StepResult, GateError> {
             if !self.active {
                 return Ok(StepResult {
@@ -792,14 +861,93 @@ fn gate_schedule_subset_with_backends(
                         }
                     }
 
+                    // Replay trace: record every executed move with enough context to replay.
+                    let dice_before = self.state.dice_sorted;
+                    let rerolls_before = self.state.rerolls_left;
+                    let player_before = self.state.player_to_move;
+                    let chosen_action_idx = yz_core::action_to_index(action);
+                    let chosen_action_str = format!("{action:?}");
+
+                    // Update derived scorecards for Mark before applying transition (needs dice_before).
+                    if let yz_core::Action::Mark(cat) = action {
+                        let actor = player_before as usize;
+                        let raw = yz_core::scores_for_dice(dice_before)[cat as usize] as i16;
+                        self.filled_raw[actor][cat as usize] = Some(raw);
+                        if cat < 6 {
+                            let prev_upper = self.upper_raw_sum[actor] as i32;
+                            let new_upper = prev_upper + raw as i32;
+                            if !self.upper_bonus_awarded[actor] && prev_upper < 63 && new_upper >= 63 {
+                                self.upper_bonus_awarded[actor] = true;
+                            }
+                            self.upper_raw_sum[actor] = new_upper.clamp(-32768, 32767) as i16;
+                        }
+                    }
+
                     let next = apply_action(self.state, action, &mut self.ctx)
                         .map_err(|_| GateError::IllegalTransition)?;
                     self.state = next;
                     self.search = None;
 
+                    // Mark ends a full turn.
+                    if matches!(action, yz_core::Action::Mark(_)) {
+                        self.turn_idx = self.turn_idx.saturating_add(1);
+                    }
+
+                    let players_after = [0usize, 1usize].map(|pi| {
+                        let ps = self.state.players[pi];
+                        GateReplayPlayerV1 {
+                            avail_mask: ps.avail_mask,
+                            upper_total_cap: ps.upper_total_cap,
+                            total_score: ps.total_score,
+                            filled_raw: self.filled_raw[pi],
+                            upper_raw_sum: self.upper_raw_sum[pi],
+                            upper_bonus_awarded: self.upper_bonus_awarded[pi],
+                        }
+                    });
+
+                    self.trace_steps.push(GateReplayStepV1 {
+                        ply: self.ply,
+                        turn_idx: self.turn_idx,
+                        player_to_move_before: player_before,
+                        rerolls_left_before: rerolls_before,
+                        dice_sorted_before: dice_before,
+                        chosen_action_idx,
+                        chosen_action_str,
+                        player_to_move_after: self.state.player_to_move,
+                        rerolls_left_after: self.state.rerolls_left,
+                        dice_sorted_after: self.state.dice_sorted,
+                        players_after,
+                    });
+                    self.ply = self.ply.saturating_add(1);
+
                     if is_terminal(&self.state) {
                         self.active = false;
                         let tr = Self::terminal_result(&self.state, self.cand_seat)?;
+
+                        // Emit full trace at terminal (best-effort).
+                        if let Some(s) = replay_sink.as_deref_mut() {
+                            let best_seat = 1u8 ^ self.cand_seat;
+                            let outcome = match tr.outcome {
+                                Outcome::Win => "win",
+                                Outcome::Loss => "loss",
+                                Outcome::Draw => "draw",
+                            }
+                            .to_string();
+                            s.on_game(GateReplayTraceV1 {
+                                trace_version: 1,
+                                episode_seed: self.gs.episode_seed,
+                                swap: self.gs.swap,
+                                cand_seat: self.cand_seat,
+                                best_seat,
+                                steps: std::mem::take(&mut self.trace_steps),
+                                terminal: Some(GateReplayTerminalV1 {
+                                    cand_score: tr.cand_score,
+                                    best_score: tr.best_score,
+                                    outcome,
+                                }),
+                            });
+                        }
+
                         return Ok(StepResult {
                             status: StepStatus::Terminal,
                             terminal: Some(tr),
@@ -871,7 +1019,7 @@ fn gate_schedule_subset_with_backends(
             if !t.active && next_idx >= schedule.len() {
                 continue;
             }
-            let r = t.step(best_backend, cand_backend, 64, &mut oracle_sink)?;
+            let r = t.step(best_backend, cand_backend, 64, &mut oracle_sink, &mut replay_sink)?;
             match r.status {
                 StepStatus::Progress => {
                     made_progress = true;

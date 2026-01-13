@@ -59,6 +59,62 @@ struct ReplayShardView {
     num_samples: Option<u64>,
 }
 
+// --- Gating replay trace (read-only; produced by yz gate-worker) ---
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GateReplayPlayerV1 {
+    avail_mask: u16,
+    upper_total_cap: u8,
+    total_score: i16,
+    filled_raw: [Option<i16>; yz_core::NUM_CATS],
+    upper_raw_sum: i16,
+    upper_bonus_awarded: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GateReplayStepV1 {
+    ply: u32,
+    turn_idx: u8,
+    player_to_move_before: u8,
+    rerolls_left_before: u8,
+    dice_sorted_before: [u8; 5],
+    chosen_action_idx: u8,
+    chosen_action_str: String,
+    player_to_move_after: u8,
+    rerolls_left_after: u8,
+    dice_sorted_after: [u8; 5],
+    players_after: [GateReplayPlayerV1; 2],
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GateReplayTerminalV1 {
+    cand_score: i32,
+    best_score: i32,
+    outcome: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GateReplayFileV1 {
+    trace_version: u32,
+    run_id: String,
+    iter_idx: u32,
+    best_model_id: u32,
+    cand_model_id: u32,
+    episode_seed: u64,
+    swap: bool,
+    cand_seat: u8,
+    best_seat: u8,
+    steps: Vec<GateReplayStepV1>,
+    terminal: Option<GateReplayTerminalV1>,
+}
+
+#[derive(Debug, Clone)]
+struct GateReplayPairEntry {
+    seed: u64,
+    swap0: Option<PathBuf>,
+    swap1: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Home,
@@ -66,6 +122,7 @@ enum Screen {
     ExtendingRun, // Input mode for naming an extended run (fork)
     Config,
     Dashboard,
+    Replay,
     Search,
     System,
 }
@@ -430,6 +487,17 @@ struct App {
     replay_total_samples_current: Option<u64>,
     replay_err: Option<String>,
 
+    // Gating replay viewer (runs/<id>/gate_replays/).
+    gate_replay_loaded_for_run: Option<String>,
+    gate_replay_iter: Option<u32>,
+    gate_replay_pairs: Vec<GateReplayPairEntry>,
+    gate_replay_selected: usize,
+    gate_replay_step_mode: bool,
+    gate_replay_step_idx: usize,
+    gate_replay_swap0: Option<GateReplayFileV1>,
+    gate_replay_swap1: Option<GateReplayFileV1>,
+    gate_replay_err: Option<String>,
+
     // System/Inference screen live state (1 Hz polling).
     system_agent: ureq::Agent,
     system_last_poll: Instant,
@@ -506,6 +574,16 @@ impl App {
             replay_current: Vec::new(),
             replay_total_samples_current: None,
             replay_err: None,
+
+            gate_replay_loaded_for_run: None,
+            gate_replay_iter: None,
+            gate_replay_pairs: Vec::new(),
+            gate_replay_selected: 0,
+            gate_replay_step_mode: true,
+            gate_replay_step_idx: 0,
+            gate_replay_swap0: None,
+            gate_replay_swap1: None,
+            gate_replay_err: None,
 
             system_agent,
             system_last_poll: Instant::now(),
@@ -864,6 +942,134 @@ impl App {
         self.refresh_replay_buffer(&run_dir);
     }
 
+    fn refresh_gate_replays(&mut self) {
+        let Some(run_dir) = self.run_dir() else {
+            self.gate_replay_loaded_for_run = None;
+            self.gate_replay_iter = None;
+            self.gate_replay_pairs.clear();
+            self.gate_replay_selected = 0;
+            self.gate_replay_step_idx = 0;
+            self.gate_replay_swap0 = None;
+            self.gate_replay_swap1 = None;
+            self.gate_replay_err = Some("no run selected".to_string());
+            return;
+        };
+
+        let rid = self.active_run_id.clone().unwrap_or_default();
+        let base = run_dir.join("gate_replays");
+        if !base.exists() {
+            self.gate_replay_loaded_for_run = Some(rid);
+            self.gate_replay_iter = None;
+            self.gate_replay_pairs.clear();
+            self.gate_replay_selected = 0;
+            self.gate_replay_step_idx = 0;
+            self.gate_replay_swap0 = None;
+            self.gate_replay_swap1 = None;
+            self.gate_replay_err = Some("no gate_replays/ yet (run gating first)".to_string());
+            return;
+        }
+
+        // Pick the latest iter_<NNN> folder.
+        let mut best_iter: Option<u32> = None;
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for ent in rd.flatten() {
+                if let Ok(ft) = ent.file_type() {
+                    if !ft.is_dir() {
+                        continue;
+                    }
+                }
+                let name = ent.file_name().to_string_lossy().to_string();
+                if let Some(s) = name.strip_prefix("iter_") {
+                    if let Ok(i) = s.parse::<u32>() {
+                        best_iter = Some(best_iter.map(|x| x.max(i)).unwrap_or(i));
+                    }
+                }
+            }
+        }
+        let Some(iter_idx) = best_iter else {
+            self.gate_replay_loaded_for_run = Some(rid);
+            self.gate_replay_iter = None;
+            self.gate_replay_pairs.clear();
+            self.gate_replay_selected = 0;
+            self.gate_replay_step_idx = 0;
+            self.gate_replay_swap0 = None;
+            self.gate_replay_swap1 = None;
+            self.gate_replay_err = Some("gate_replays/ has no iter_* folders".to_string());
+            return;
+        };
+        self.gate_replay_iter = Some(iter_idx);
+
+        let dir = base.join(format!("iter_{iter_idx:03}"));
+        let mut by_seed: HashMap<u64, GateReplayPairEntry> = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let fname = ent.file_name().to_string_lossy().to_string();
+                // seed_<seed>_swap_<0|1>.json
+                if !fname.starts_with("seed_") || !fname.ends_with(".json") {
+                    continue;
+                }
+                let stem = fname.trim_end_matches(".json");
+                let mut parts = stem.split("_");
+                let _seed_kw = parts.next();
+                let seed_s = parts.next().unwrap_or("");
+                let _swap_kw = parts.next();
+                let swap_s = parts.next().unwrap_or("");
+                let Ok(seed) = seed_s.parse::<u64>() else { continue };
+                let Ok(swap) = swap_s.parse::<u8>() else { continue };
+
+                let e = by_seed.entry(seed).or_insert(GateReplayPairEntry {
+                    seed,
+                    swap0: None,
+                    swap1: None,
+                });
+                if swap == 0 {
+                    e.swap0 = Some(p);
+                } else if swap == 1 {
+                    e.swap1 = Some(p);
+                }
+            }
+        }
+
+        let mut pairs: Vec<GateReplayPairEntry> = by_seed.into_values().collect();
+        pairs.sort_by_key(|e| e.seed);
+        self.gate_replay_pairs = pairs;
+        if self.gate_replay_selected >= self.gate_replay_pairs.len() {
+            self.gate_replay_selected = 0;
+        }
+
+        self.gate_replay_loaded_for_run = Some(rid);
+        self.gate_replay_err = None;
+        self.load_gate_replay_selected();
+    }
+
+    fn load_gate_replay_selected(&mut self) {
+        self.gate_replay_swap0 = None;
+        self.gate_replay_swap1 = None;
+        self.gate_replay_step_idx = 0;
+
+        let Some(sel) = self.gate_replay_pairs.get(self.gate_replay_selected).cloned() else {
+            return;
+        };
+        if let Some(p) = sel.swap0 {
+            if let Ok(bytes) = std::fs::read(&p) {
+                if let Ok(v) = serde_json::from_slice::<GateReplayFileV1>(&bytes) {
+                    self.gate_replay_swap0 = Some(v);
+                }
+            }
+        }
+        if let Some(p) = sel.swap1 {
+            if let Ok(bytes) = std::fs::read(&p) {
+                if let Ok(v) = serde_json::from_slice::<GateReplayFileV1>(&bytes) {
+                    self.gate_replay_swap1 = Some(v);
+                }
+            }
+        }
+    }
+
     fn parse_shard_id(name: &str) -> Option<u32> {
         // Accept "shard_000240.safetensors" or "shard_000240.meta.json"
         let s = name.strip_prefix("shard_")?;
@@ -1135,12 +1341,23 @@ impl App {
         // Default behavior: follow the current iteration so the latest rows are visible.
         self.dashboard_iter_follow = true;
         if self.shutdown_requested {
-            self.status = "cancelling… waiting for shutdown | r refresh".to_string();
+            self.status = "cancelling… waiting for shutdown | R refresh".to_string();
         } else {
             self.status =
-                "r refresh | l toggle learning/perf | d perf | s search | i system | e extend | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                "r replay | R refresh | l toggle learning/perf | d perf | s search | i system | e extend | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
                     .to_string();
         }
+    }
+
+    fn enter_replay(&mut self) {
+        if self.active_run_id.is_none() {
+            return;
+        }
+        self.refresh_gate_replays();
+        self.screen = Screen::Replay;
+        self.status =
+            "Space step | b back | s toggle step | ↑/↓ seed | r reload | Esc back | q quit"
+                .to_string();
     }
 
     fn enter_search(&mut self) {
@@ -1663,7 +1880,8 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::Char('s') => app.enter_search(),
                         KeyCode::Char('i') => app.enter_system(),
-                        KeyCode::Char('r') => app.refresh_dashboard(),
+                        KeyCode::Char('r') => app.enter_replay(),
+                        KeyCode::Char('R') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
                         KeyCode::Up => {
                             app.dashboard_iter_follow = false;
@@ -1687,6 +1905,59 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::End => {
                             app.dashboard_iter_follow = true;
+                        }
+                        _ => {}
+                    },
+                    Screen::Replay => match k.code {
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('r') => app.refresh_gate_replays(),
+                        KeyCode::Up => {
+                            if !app.gate_replay_pairs.is_empty() {
+                                app.gate_replay_selected =
+                                    app.gate_replay_selected.saturating_sub(1);
+                                app.load_gate_replay_selected();
+                            }
+                        }
+                        KeyCode::Down => {
+                            if !app.gate_replay_pairs.is_empty() {
+                                app.gate_replay_selected =
+                                    (app.gate_replay_selected + 1).min(app.gate_replay_pairs.len() - 1);
+                                app.load_gate_replay_selected();
+                            }
+                        }
+                        KeyCode::Char('s') => {
+                            app.gate_replay_step_mode = !app.gate_replay_step_mode;
+                            app.gate_replay_step_idx = 0;
+                        }
+                        KeyCode::Char(' ') => {
+                            if app.gate_replay_step_mode {
+                                app.gate_replay_step_idx = app.gate_replay_step_idx.saturating_add(1);
+                            }
+                        }
+                        KeyCode::Char('b') => {
+                            if app.gate_replay_step_mode {
+                                app.gate_replay_step_idx = app.gate_replay_step_idx.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Home => {
+                            if app.gate_replay_step_mode {
+                                app.gate_replay_step_idx = 0;
+                            }
+                        }
+                        KeyCode::End => {
+                            if app.gate_replay_step_mode {
+                                let max0 = app.gate_replay_swap0.as_ref().map(|t| t.steps.len()).unwrap_or(0);
+                                let max1 = app.gate_replay_swap1.as_ref().map(|t| t.steps.len()).unwrap_or(0);
+                                let max = max0.max(max1);
+                                app.gate_replay_step_idx = max.saturating_sub(1);
+                            }
                         }
                         _ => {}
                     },
@@ -1785,7 +2056,7 @@ pub fn run() -> io::Result<()> {
                     match h.join() {
                         Ok(()) => {
                             app.status =
-                                "Completed | r refresh | g start | Esc back | q quit".to_string();
+                                "Completed | R refresh | g start | Esc back | q quit".to_string();
                         }
                         Err(e) => {
                             let msg = if matches!(e, yz_controller::ControllerError::Cancelled) {
@@ -1801,7 +2072,7 @@ pub fn run() -> io::Result<()> {
                                 detail.push_str("…");
                             }
                             app.status = format!(
-                                "{msg}: {detail} | r refresh | g start | Esc back | q quit"
+                                "{msg}: {detail} | R refresh | g start | Esc back | q quit"
                             );
                         }
                     }
@@ -1816,7 +2087,7 @@ pub fn run() -> io::Result<()> {
             if matches!(app.screen, Screen::Dashboard | Screen::Search) {
                 app.refresh_dashboard();
                 if app.shutdown_requested {
-                    app.status = "cancelling… waiting for shutdown | r refresh".to_string();
+                    app.status = "cancelling… waiting for shutdown | R refresh".to_string();
                 }
             }
             if matches!(app.screen, Screen::System) {
@@ -3528,6 +3799,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
             }
         }
+        Screen::Replay => {
+            draw_gate_replay(f, app, chunks[0]);
+        }
         Screen::Search => {
             draw_search(f, app, chunks[0]);
         }
@@ -4821,6 +5095,242 @@ fn derive_rates(
     (rps, bps, mean, full_s, dead_s)
 }
 
+fn die_face(d: u8) -> char {
+    match d {
+        1 => '⚀',
+        2 => '⚁',
+        3 => '⚂',
+        4 => '⚃',
+        5 => '⚄',
+        6 => '⚅',
+        _ => '?',
+    }
+}
+
+fn fmt_dice(dice: [u8; 5]) -> String {
+    let mut s = String::new();
+    for (i, d) in dice.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push(die_face(*d));
+    }
+    s
+}
+
+fn label_for_player(p: u8, cand_seat: u8) -> &'static str {
+    if p == cand_seat {
+        "Cand"
+    } else {
+        "Best"
+    }
+}
+
+fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
+    let iter_s = app
+        .gate_replay_iter
+        .map(|i| format!("{i}"))
+        .unwrap_or_else(|| "-".to_string());
+    let title = Line::from(vec![
+        Span::styled("Replay", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(format!("run={rid}  iter={iter_s}")),
+    ]);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(5)])
+        .split(area);
+
+    // Header / knobs
+    let mut hdr: Vec<Line> = Vec::new();
+    let mode = if app.gate_replay_step_mode { "true" } else { "false" };
+    let n = app.gate_replay_pairs.len();
+    let seed = app
+        .gate_replay_pairs
+        .get(app.gate_replay_selected)
+        .map(|e| e.seed.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    hdr.push(Line::from(format!(
+        " Seed: {seed}  ({}/{})",
+        app.gate_replay_selected.saturating_add(1),
+        n
+    )));
+    hdr.push(Line::from(format!(" Step mode: {mode}  (s to toggle)")));
+    if app.gate_replay_step_mode {
+        let max0 = app.gate_replay_swap0.as_ref().map(|t| t.steps.len()).unwrap_or(0);
+        let max1 = app.gate_replay_swap1.as_ref().map(|t| t.steps.len()).unwrap_or(0);
+        let max = max0.max(max1);
+        hdr.push(Line::from(format!(
+            " Step: {} / {}  (Space/b/Home/End)",
+            app.gate_replay_step_idx,
+            max.saturating_sub(1)
+        )));
+    } else {
+        hdr.push(Line::from(" Transcript view (top→bottom)"));
+    }
+    hdr.push(Line::from(Span::styled(
+        " ↑/↓ seed | r reload | Esc back",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let hdr_p = Paragraph::new(hdr).block(Block::default().title(title).borders(Borders::ALL));
+    f.render_widget(hdr_p, rows[0]);
+
+    // Body: two seed-swap sides
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    fn render_side(
+        app: &App,
+        which: u8,
+        trace: Option<&GateReplayFileV1>,
+        area_h: u16,
+    ) -> Vec<Line<'static>> {
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let title = format!("swap={which}");
+        out.push(Line::from(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+
+        let Some(t) = trace else {
+            out.push(Line::from("(missing)"));
+            return out;
+        };
+        out.push(Line::from(format!(
+            " seed={}  models(best={},cand={})",
+            t.episode_seed, t.best_model_id, t.cand_model_id
+        )));
+
+        if app.gate_replay_step_mode {
+            let idx = app.gate_replay_step_idx;
+            if idx >= t.steps.len() {
+                if let Some(term) = &t.terminal {
+                    out.push(Line::from(""));
+                    out.push(Line::from(Span::styled(
+                        "Terminal",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    out.push(Line::from(format!(
+                        " outcome={}  cand={} best={}",
+                        term.outcome, term.cand_score, term.best_score
+                    )));
+                } else {
+                    out.push(Line::from("(no terminal info)"));
+                }
+                return out;
+            }
+            let s = &t.steps[idx];
+            let actor = label_for_player(s.player_to_move_before, t.cand_seat);
+            let next = label_for_player(s.player_to_move_after, t.cand_seat);
+            out.push(Line::from(""));
+            out.push(Line::from(format!(
+                " step={} ply={} turn={}  {}",
+                idx, s.ply, s.turn_idx, actor
+            )));
+            out.push(Line::from(format!(
+                " dice={}  rerolls_left={}",
+                fmt_dice(s.dice_sorted_before),
+                s.rerolls_left_before
+            )));
+            out.push(Line::from(format!(
+                " action={} ({})",
+                s.chosen_action_str, s.chosen_action_idx
+            )));
+            out.push(Line::from(format!(
+                " next={}  dice={}  rerolls_left={}",
+                next,
+                fmt_dice(s.dice_sorted_after),
+                s.rerolls_left_after
+            )));
+
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(
+                "Scorecards (after step)",
+                Style::default().fg(Color::DarkGray),
+            )));
+            // Compact per-player summary + filled categories.
+            for p in 0u8..=1u8 {
+                let ps = &s.players_after[p as usize];
+                let who = label_for_player(p, t.cand_seat);
+                let bonus = if ps.upper_bonus_awarded { "+50" } else { "-" };
+                out.push(Line::from(format!(
+                    " {who}: total={}  upper={}/63  bonus={}",
+                    ps.total_score, ps.upper_total_cap, bonus
+                )));
+                // Show a compact list of filled categories with raw scores.
+                let mut filled: Vec<String> = Vec::new();
+                for (i, v) in ps.filled_raw.iter().enumerate() {
+                    if let Some(x) = v {
+                        filled.push(format!("{i}:{x}"));
+                    }
+                }
+                if filled.is_empty() {
+                    out.push(Line::from("   (no marks yet)"));
+                } else {
+                    let joined = filled.join(" ");
+                    out.push(Line::from(format!("   {joined}")));
+                }
+            }
+        } else {
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(
+                "Transcript",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            // Render as many lines as fit.
+            let max_lines = area_h.saturating_sub(out.len() as u16 + 1) as usize;
+            for (i, s) in t.steps.iter().enumerate().take(max_lines) {
+                let actor = label_for_player(s.player_to_move_before, t.cand_seat);
+                let line = format!(
+                    "{:>3} {} r{} {}  → {}  → {} r{} {}",
+                    i,
+                    actor,
+                    s.rerolls_left_before,
+                    fmt_dice(s.dice_sorted_before),
+                    s.chosen_action_str,
+                    label_for_player(s.player_to_move_after, t.cand_seat),
+                    s.rerolls_left_after,
+                    fmt_dice(s.dice_sorted_after),
+                );
+                out.push(Line::from(line));
+            }
+            if let Some(term) = &t.terminal {
+                out.push(Line::from(""));
+                out.push(Line::from(format!(
+                    " terminal: outcome={} cand={} best={}",
+                    term.outcome, term.cand_score, term.best_score
+                )));
+            }
+        }
+        out
+    }
+
+    let left_lines = if let Some(e) = &app.gate_replay_err {
+        vec![Line::from(format!("(unavailable: {e})"))]
+    } else if app.gate_replay_pairs.is_empty() {
+        vec![Line::from("(no replay traces found)")]
+    } else {
+        render_side(app, 0, app.gate_replay_swap0.as_ref(), cols[0].height.saturating_sub(2))
+    };
+    let right_lines = if let Some(e) = &app.gate_replay_err {
+        vec![Line::from(format!("(unavailable: {e})"))]
+    } else if app.gate_replay_pairs.is_empty() {
+        vec![Line::from("(no replay traces found)")]
+    } else {
+        render_side(app, 1, app.gate_replay_swap1.as_ref(), cols[1].height.saturating_sub(2))
+    };
+
+    let left_p = Paragraph::new(left_lines).block(Block::default().borders(Borders::ALL));
+    let right_p = Paragraph::new(right_lines).block(Block::default().borders(Borders::ALL));
+    f.render_widget(left_p, cols[0]);
+    f.render_widget(right_p, cols[1]);
+}
+
 fn draw_search(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
     let title = Line::from(vec![
@@ -5568,5 +6078,89 @@ mod selfplay_summary_parse_tests {
         assert_eq!(v.visit_entropy_norm_p50, Some(0.42));
         assert_eq!(v.late_eval_discard_frac, Some(0.07));
         assert_eq!(v.delta_root_value_mean, Some(0.03));
+    }
+}
+
+#[cfg(test)]
+mod gate_replay_tests {
+    use super::*;
+
+    #[test]
+    fn loads_gate_replay_pairs_from_filesystem() {
+        let td = tempfile::tempdir().expect("tmp");
+        let runs_dir = td.path().to_path_buf();
+        let run_id = "r1";
+        let run_dir = runs_dir.join(run_id);
+        std::fs::create_dir_all(run_dir.join("gate_replays").join("iter_000")).unwrap();
+
+        let seed = 123u64;
+        let mk_trace = |swap: bool| -> serde_json::Value {
+            let nulls: Vec<serde_json::Value> = (0..yz_core::NUM_CATS)
+                .map(|_| serde_json::Value::Null)
+                .collect();
+            serde_json::json!({
+                "trace_version": 1,
+                "run_id": run_id,
+                "iter_idx": 0,
+                "best_model_id": 0,
+                "cand_model_id": 1,
+                "episode_seed": seed,
+                "swap": swap,
+                "cand_seat": if swap { 1 } else { 0 },
+                "best_seat": if swap { 0 } else { 1 },
+                "steps": [{
+                    "ply": 0,
+                    "turn_idx": 0,
+                    "player_to_move_before": 0,
+                    "rerolls_left_before": 2,
+                    "dice_sorted_before": [1,2,3,4,5],
+                    "chosen_action_idx": 32,
+                    "chosen_action_str": "Mark(0)",
+                    "player_to_move_after": 1,
+                    "rerolls_left_after": 2,
+                    "dice_sorted_after": [1,1,1,1,1],
+                    "players_after": [
+                        {
+                            "avail_mask": 32767,
+                            "upper_total_cap": 0,
+                            "total_score": 0,
+                            "filled_raw": nulls,
+                            "upper_raw_sum": 0,
+                            "upper_bonus_awarded": false
+                        },
+                        {
+                            "avail_mask": 32767,
+                            "upper_total_cap": 0,
+                            "total_score": 0,
+                            "filled_raw": nulls,
+                            "upper_raw_sum": 0,
+                            "upper_bonus_awarded": false
+                        }
+                    ]
+                }],
+                "terminal": { "cand_score": 10, "best_score": 11, "outcome": "loss" }
+            })
+        };
+
+        let p0 = run_dir
+            .join("gate_replays")
+            .join("iter_000")
+            .join(format!("seed_{seed}_swap_0.json"));
+        let p1 = run_dir
+            .join("gate_replays")
+            .join("iter_000")
+            .join(format!("seed_{seed}_swap_1.json"));
+        std::fs::write(&p0, serde_json::to_vec(&mk_trace(false)).unwrap()).unwrap();
+        std::fs::write(&p1, serde_json::to_vec(&mk_trace(true)).unwrap()).unwrap();
+
+        let mut app = App::new(runs_dir);
+        app.active_run_id = Some(run_id.to_string());
+        app.refresh_gate_replays();
+
+        assert_eq!(app.gate_replay_iter, Some(0));
+        assert_eq!(app.gate_replay_pairs.len(), 1);
+        assert_eq!(app.gate_replay_pairs[0].seed, seed);
+        assert!(app.gate_replay_swap0.is_some());
+        assert!(app.gate_replay_swap1.is_some());
     }
 }

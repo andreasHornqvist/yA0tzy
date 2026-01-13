@@ -2216,6 +2216,72 @@ OPTIONS:
     }
     let mut oracle_sink = oracle_log.as_mut().map(|w| OracleSink { w });
 
+    // Gate replay traces (JSON per game, best-effort).
+    // These are used by the TUI Replay screen to step through seed-swapped pairs.
+    let (run_id, iter_idx) = yz_logging::read_manifest(&run_dir.join("run.json"))
+        .map(|m| (m.run_id, m.controller_iteration_idx))
+        .unwrap_or_else(|_| (run_dir.file_name().unwrap_or_default().to_string_lossy().to_string(), 0));
+    let gate_replays_dir = run_dir
+        .join("gate_replays")
+        .join(format!("iter_{iter_idx:03}"));
+    let _ = std::fs::create_dir_all(&gate_replays_dir);
+
+    #[derive(serde::Serialize)]
+    struct GateReplayFileV1 {
+        trace_version: u32,
+        run_id: String,
+        iter_idx: u32,
+        best_model_id: u32,
+        cand_model_id: u32,
+        episode_seed: u64,
+        swap: bool,
+        cand_seat: u8,
+        best_seat: u8,
+        steps: Vec<yz_eval::GateReplayStepV1>,
+        terminal: Option<yz_eval::GateReplayTerminalV1>,
+    }
+
+    struct ReplaySink {
+        dir: PathBuf,
+        run_id: String,
+        iter_idx: u32,
+        best_model_id: u32,
+        cand_model_id: u32,
+    }
+    impl yz_eval::GateReplaySink for ReplaySink {
+        fn on_game(&mut self, trace: yz_eval::GateReplayTraceV1) {
+            let swap_i = if trace.swap { 1 } else { 0 };
+            let path = self
+                .dir
+                .join(format!("seed_{}_swap_{}.json", trace.episode_seed, swap_i));
+            let tmp = path.with_extension("json.tmp");
+            let out = GateReplayFileV1 {
+                trace_version: trace.trace_version,
+                run_id: self.run_id.clone(),
+                iter_idx: self.iter_idx,
+                best_model_id: self.best_model_id,
+                cand_model_id: self.cand_model_id,
+                episode_seed: trace.episode_seed,
+                swap: trace.swap,
+                cand_seat: trace.cand_seat,
+                best_seat: trace.best_seat,
+                steps: trace.steps,
+                terminal: trace.terminal,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&out) {
+                let _ = std::fs::write(&tmp, &bytes);
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+    let mut replay_sink = ReplaySink {
+        dir: gate_replays_dir,
+        run_id,
+        iter_idx,
+        best_model_id: best_id,
+        cand_model_id: cand_id,
+    };
+
     if let Some(w) = worker_stats.as_mut() {
         let _ = w.write_event(&GateWorkerStatsEvent {
             event: "gate_worker_first_game_start",
@@ -2265,6 +2331,7 @@ OPTIONS:
         oracle_sink
             .as_mut()
             .map(|s| s as &mut dyn yz_eval::OracleDiagSink),
+        Some(&mut replay_sink),
     )
     .unwrap_or_else(|e| {
         eprintln!("gate-worker failed: {e}");
