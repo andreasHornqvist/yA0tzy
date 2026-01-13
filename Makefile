@@ -10,6 +10,7 @@ help:
 	@echo "  make run-dev                  Start the TUI (dev; faster compile, slower runtime)"
 	@echo "  make tui                      Run the Ratatui UI (yz tui)"
 	@echo "  make start-run RUN_NAME=<id> CONFIG=<path>   Start a run from a config file (release; prints table)"
+	@echo "  make extend-run SRC=<id> DST=<id> [COPY_REPLAY=1]   Fork an existing run into a new run"
 	@echo "  make controller RUN=<id>      Run runs/<id> in foreground and print the iteration table"
 	@echo "  make cancel RUN=<id>          Request cancel for runs/<id> (writes cancel.request)"
 	@echo "  make infer-server             Run Python inference server (with hot-reload)"
@@ -38,6 +39,9 @@ help:
 	@echo "  RUN=<id>                       Run id under runs/"
 	@echo "  RUN_NAME=<id>                  Run name for start-run (directory under runs/)"
 	@echo "  DETACH=1                       Detach start-run (controller runs as child process)"
+	@echo "  SRC=<id>                       Source run id for extend-run"
+	@echo "  DST=<id>                       Destination run name for extend-run"
+	@echo "  COPY_REPLAY=1                  If set, copy replay/ when extending a run"
 
 .PHONY: _print_env
 _print_env:
@@ -117,6 +121,12 @@ start-run:
 	@if [ -z "$(RUN_NAME)" ]; then echo "Missing RUN_NAME=<id> (e.g. make start-run RUN_NAME=exp1 CONFIG=/tmp/cfg.yaml)"; exit 2; fi
 	@if [ -z "$(CONFIG)" ]; then echo "Missing CONFIG=<path> (e.g. make start-run RUN_NAME=exp1 CONFIG=/tmp/cfg.yaml)"; exit 2; fi
 	cargo run --release -p yz-cli --bin yz -- start-run --run-name "$(RUN_NAME)" --config "$(CONFIG)" --python-exe "$(PYTHON)" $(if $(DETACH),--detach,)
+
+.PHONY: extend-run
+extend-run:
+	@if [ -z "$(SRC)" ]; then echo "Missing SRC=<id> (e.g. make extend-run SRC=p9 DST=p9_ext_1)"; exit 2; fi
+	@if [ -z "$(DST)" ]; then echo "Missing DST=<id> (e.g. make extend-run SRC=p9 DST=p9_ext_1)"; exit 2; fi
+	cargo run --release -p yz-cli --bin yz -- extend-run --src "$(SRC)" --dst "$(DST)" $(if $(COPY_REPLAY),--copy-replay,)
 
 controller:
 	@if [ -z "$(RUN)" ]; then echo "Missing RUN=<id> (e.g. make controller RUN=exp1)"; exit 2; fi

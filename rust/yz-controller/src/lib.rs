@@ -490,6 +490,161 @@ fn ensure_run_layout(run_dir: &Path) -> Result<(), ControllerError> {
     Ok(())
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ControllerError> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for ent in std::fs::read_dir(src)? {
+        let ent = ent?;
+        let ft = ent.file_type()?;
+        let src_p = ent.path();
+        let dst_p = dst.join(ent.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&src_p, &dst_p)?;
+        } else if ft.is_file() {
+            let _ = std::fs::copy(&src_p, &dst_p)?;
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_run_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+
+fn ensure_unique_run_dir(runs_dir: &Path, base_name: &str) -> (String, PathBuf) {
+    let ts = yz_logging::now_ms();
+    let base = sanitize_run_name(base_name);
+    let id = if base.is_empty() {
+        format!("run_{ts}")
+    } else {
+        base
+    };
+    let mut final_id = id.clone();
+    if runs_dir.join(&final_id).exists() {
+        final_id = format!("{id}_{ts}");
+    }
+    let dir = runs_dir.join(&final_id);
+    (final_id, dir)
+}
+
+/// Extend (fork) an existing run into a new run directory, copying config and optionally replay.
+///
+/// Semantics:
+/// - Writes a fresh `run.json` for the destination that continues `controller_iteration_idx`
+///   from the source run's manifest.
+/// - Never copies logs/metrics history.
+pub fn extend_run(
+    runs_dir: &Path,
+    src_run_id: &str,
+    dst_run_name: &str,
+    copy_replay: bool,
+) -> Result<(String, PathBuf), ControllerError> {
+    let src_dir = runs_dir.join(src_run_id);
+    let src_run_json = src_dir.join("run.json");
+    if !src_run_json.exists() {
+        return Err(ControllerError::MissingManifest(src_run_json));
+    }
+    let src_manifest = yz_logging::read_manifest(&src_run_json)?;
+
+    let (dst_run_id, dst_dir) = ensure_unique_run_dir(runs_dir, dst_run_name);
+    ensure_run_layout(&dst_dir)?;
+
+    // Copy config snapshot/draft (best-effort).
+    let src_cfg = src_dir.join("config.yaml");
+    let src_draft = src_dir.join("config.draft.yaml");
+    let dst_cfg = dst_dir.join("config.yaml");
+    let dst_draft = dst_dir.join("config.draft.yaml");
+    if src_cfg.exists() {
+        std::fs::copy(&src_cfg, &dst_cfg)?;
+    } else if src_draft.exists() {
+        std::fs::copy(&src_draft, &dst_cfg)?;
+    }
+    if src_draft.exists() {
+        let _ = std::fs::copy(&src_draft, &dst_draft);
+    }
+
+    // Copy models (best.pt at minimum).
+    let src_best = src_dir.join("models").join("best.pt");
+    let dst_best = dst_dir.join("models").join("best.pt");
+    if src_best.exists() {
+        let _ = std::fs::copy(&src_best, &dst_best)?;
+    }
+
+    // Optional replay copy.
+    if copy_replay {
+        copy_dir_recursive(&src_dir.join("replay"), &dst_dir.join("replay"))?;
+    }
+
+    // Normalize config snapshot in destination.
+    let cfg = yz_core::Config::load(&dst_cfg).unwrap_or_default();
+    let (rel_cfg, cfg_hash) = yz_logging::write_config_snapshot_atomic(&dst_dir, &cfg)?;
+
+    let now = yz_logging::now_ms();
+    let best_ckpt = if dst_best.exists() {
+        Some("models/best.pt".to_string())
+    } else {
+        None
+    };
+
+    let m = RunManifestV1 {
+        run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
+        run_id: dst_run_id.clone(),
+        created_ts_ms: now,
+        protocol_version: src_manifest.protocol_version,
+        feature_schema_id: src_manifest.feature_schema_id,
+        action_space_id: src_manifest.action_space_id.clone(),
+        ruleset_id: src_manifest.ruleset_id.clone(),
+        git_hash: yz_logging::try_git_hash().or(src_manifest.git_hash.clone()),
+        config_hash: Some(cfg_hash.clone()),
+        config_snapshot: Some(rel_cfg),
+        config_snapshot_hash: Some(cfg_hash),
+        replay_dir: src_manifest.replay_dir.clone(),
+        logs_dir: src_manifest.logs_dir.clone(),
+        models_dir: src_manifest.models_dir.clone(),
+        selfplay_games_completed: 0,
+        train_step: 0,
+        best_checkpoint: best_ckpt,
+        candidate_checkpoint: None,
+        best_promoted_iter: src_manifest.best_promoted_iter,
+        train_last_loss_total: None,
+        train_last_loss_policy: None,
+        train_last_loss_value: None,
+        promotion_decision: None,
+        promotion_ts_ms: None,
+        gate_games: None,
+        gate_win_rate: None,
+        gate_draw_rate: None,
+        gate_wins: None,
+        gate_losses: None,
+        gate_draws: None,
+        gate_ci95_low: None,
+        gate_ci95_high: None,
+        gate_sprt: None,
+        gate_seeds_hash: None,
+        gate_oracle_match_rate_overall: None,
+        gate_oracle_match_rate_mark: None,
+        gate_oracle_match_rate_reroll: None,
+        gate_oracle_keepall_ignored: None,
+        controller_phase: Some(Phase::Idle.as_str().to_string()),
+        controller_status: Some(format!(
+            "extended from {src_run_id} (continue at iter {})",
+            src_manifest.controller_iteration_idx
+        )),
+        controller_last_ts_ms: Some(now),
+        controller_error: None,
+        model_reloads: 0,
+        controller_iteration_idx: src_manifest.controller_iteration_idx,
+        iterations: Vec::new(),
+    };
+
+    yz_logging::write_manifest_atomic(dst_dir.join("run.json"), &m)?;
+    Ok((dst_run_id, dst_dir))
+}
+
 fn ensure_manifest(
     run_dir: &Path,
     cfg: &yz_core::Config,
@@ -829,6 +984,99 @@ pub fn spawn_iteration(
         res
     });
     IterationHandle { cancel, join }
+}
+
+#[cfg(test)]
+mod extend_run_tests {
+    use super::*;
+
+    #[test]
+    fn extend_run_smoke_copies_config_and_continues_iter_idx() {
+        let td = tempfile::tempdir().unwrap();
+        let runs_dir = td.path();
+
+        // Create a minimal source run.
+        let src_id = "src_run";
+        let src_dir = runs_dir.join(src_id);
+        std::fs::create_dir_all(src_dir.join("logs")).unwrap();
+        std::fs::create_dir_all(src_dir.join("models")).unwrap();
+        std::fs::create_dir_all(src_dir.join("replay")).unwrap();
+
+        // Source config.
+        let cfg = yz_core::Config::default();
+        yz_logging::write_config_snapshot_atomic(&src_dir, &cfg).unwrap();
+
+        // Source best model + replay sample.
+        std::fs::write(src_dir.join("models").join("best.pt"), b"dummy").unwrap();
+        std::fs::write(src_dir.join("replay").join("shard_000.safetensors"), b"replay").unwrap();
+
+        // Source manifest with a non-zero iteration idx.
+        let m = RunManifestV1 {
+            run_manifest_version: yz_logging::RUN_MANIFEST_VERSION,
+            run_id: src_id.to_string(),
+            created_ts_ms: yz_logging::now_ms(),
+            protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
+            feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
+            action_space_id: "oracle_keepmask_v1".to_string(),
+            ruleset_id: "swedish_scandinavian_v1".to_string(),
+            git_hash: None,
+            config_hash: None,
+            config_snapshot: Some("config.yaml".to_string()),
+            config_snapshot_hash: None,
+            replay_dir: "replay".to_string(),
+            logs_dir: "logs".to_string(),
+            models_dir: "models".to_string(),
+            selfplay_games_completed: 0,
+            train_step: 0,
+            best_checkpoint: Some("models/best.pt".to_string()),
+            candidate_checkpoint: None,
+            best_promoted_iter: Some(7),
+            train_last_loss_total: None,
+            train_last_loss_policy: None,
+            train_last_loss_value: None,
+            promotion_decision: None,
+            promotion_ts_ms: None,
+            gate_games: None,
+            gate_win_rate: None,
+            gate_draw_rate: None,
+            gate_wins: None,
+            gate_losses: None,
+            gate_draws: None,
+            gate_ci95_low: None,
+            gate_ci95_high: None,
+            gate_sprt: None,
+            gate_seeds_hash: None,
+            gate_oracle_match_rate_overall: None,
+            gate_oracle_match_rate_mark: None,
+            gate_oracle_match_rate_reroll: None,
+            gate_oracle_keepall_ignored: None,
+            controller_phase: Some("idle".to_string()),
+            controller_status: Some("src".to_string()),
+            controller_last_ts_ms: Some(yz_logging::now_ms()),
+            controller_error: None,
+            model_reloads: 0,
+            controller_iteration_idx: 12,
+            iterations: Vec::new(),
+        };
+        yz_logging::write_manifest_atomic(src_dir.join("run.json"), &m).unwrap();
+
+        // Extend without replay copy.
+        let (dst_id, dst_dir) = extend_run(runs_dir, src_id, "dst_run", false).unwrap();
+        let dst_m = yz_logging::read_manifest(dst_dir.join("run.json")).unwrap();
+        assert_eq!(dst_m.run_id, dst_id);
+        assert_eq!(dst_m.controller_iteration_idx, 12);
+        assert_eq!(dst_m.best_promoted_iter, Some(7));
+        assert!(dst_dir.join("config.yaml").exists());
+        assert!(dst_dir.join("models").join("best.pt").exists());
+        // Logs are fresh (no metrics.ndjson by default).
+        assert!(!dst_dir.join("logs").join("metrics.ndjson").exists());
+        // Replay directory exists but should not have the copied file.
+        assert!(!dst_dir.join("replay").join("shard_000.safetensors").exists());
+
+        // Extend with replay copy.
+        let (_dst2_id, dst2_dir) = extend_run(runs_dir, src_id, "dst_run2", true).unwrap();
+        assert!(dst2_dir.join("replay").join("shard_000.safetensors").exists());
+    }
 }
 
 fn begin_iteration(

@@ -113,6 +113,7 @@ COMMANDS:
     oracle expected     Print oracle expected score (~248.44)
     oracle sim          Run oracle solitaire simulation
     start-run           Create a run from a config file and start it (foreground by default)
+    extend-run          Fork an existing run into a new run (copy config + optionally replay)
     controller          Run a run-dir (runs/<id>) in the foreground and print iteration summaries
     selfplay            Run self-play with MCTS + inference
     selfplay-worker     Internal: run one self-play worker process (spawned by controller)
@@ -130,6 +131,87 @@ OPTIONS:
 For more information, see the PRD or run `yz <COMMAND> --help`.
 "#
     );
+}
+
+fn cmd_extend_run(args: &[String]) {
+    let mut src: Option<String> = None;
+    let mut dst: Option<String> = None;
+    let mut runs_dir: String = "runs".to_string();
+    let mut copy_replay = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz extend-run
+
+USAGE:
+    yz extend-run --src SRC_RUN_ID --dst DST_RUN_NAME [--runs-dir DIR] [--copy-replay]
+
+OPTIONS:
+    --src SRC_RUN_ID      Source run id (directory under runs/)
+    --dst DST_RUN_NAME    New run name (directory under runs/; timestamp appended if exists)
+    --runs-dir DIR        Runs directory (default: runs)
+    --copy-replay         Copy replay/ from source into destination (default: off)
+"#
+                );
+                return;
+            }
+            "--src" => {
+                src = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--dst" => {
+                dst = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--runs-dir" => {
+                runs_dir = args.get(i + 1).cloned().unwrap_or_else(|| "runs".to_string());
+                i += 2;
+            }
+            "--copy-replay" => {
+                copy_replay = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("Unknown option for `yz extend-run`: {other}");
+                eprintln!("Run `yz extend-run --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let src = src.unwrap_or_else(|| {
+        eprintln!("Missing --src");
+        process::exit(1);
+    });
+    let dst = dst.unwrap_or_else(|| {
+        eprintln!("Missing --dst");
+        process::exit(1);
+    });
+    if src.trim().is_empty() {
+        eprintln!("--src must be non-empty");
+        process::exit(1);
+    }
+    if dst.trim().is_empty() {
+        eprintln!("--dst must be non-empty");
+        process::exit(1);
+    }
+
+    let runs_dir = PathBuf::from(runs_dir);
+    std::fs::create_dir_all(&runs_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create runs dir {}: {e}", runs_dir.display());
+        process::exit(1);
+    });
+
+    let (new_id, new_dir) =
+        yz_controller::extend_run(&runs_dir, &src, &dst, copy_replay).unwrap_or_else(|e| {
+            eprintln!("extend-run failed: {e}");
+            process::exit(1);
+        });
+    println!("run_id: {new_id}");
+    println!("run_dir: {}", new_dir.display());
 }
 
 fn sanitize_run_name(name: &str) -> String {
@@ -2966,6 +3048,9 @@ fn main() {
         }
         "start-run" => {
             cmd_start_run(&args[2..]);
+        }
+        "extend-run" => {
+            cmd_extend_run(&args[2..]);
         }
         "controller" => {
             cmd_controller(&args[2..]);
