@@ -63,6 +63,7 @@ struct ReplayShardView {
 enum Screen {
     Home,
     NamingRun, // Input mode for naming a new run
+    ExtendingRun, // Input mode for naming an extended run (fork)
     Config,
     Dashboard,
     Search,
@@ -386,6 +387,9 @@ struct App {
     selected: usize,
 
     active_run_id: Option<String>,
+    extend_source_run_id: Option<String>,
+    extend_include_replay: bool,
+    extend_return_to: Screen,
     cfg: yz_core::Config,
     form: FormState,
 
@@ -450,6 +454,8 @@ struct App {
 
     /// Input buffer for naming a new run.
     naming_input: String,
+    /// Input buffer for naming an extended run.
+    extend_input: String,
 }
 
 impl App {
@@ -466,6 +472,9 @@ impl App {
             runs: Vec::new(),
             selected: 0,
             active_run_id: None,
+            extend_source_run_id: None,
+            extend_include_replay: false,
+            extend_return_to: Screen::Home,
             cfg: crate::config_io::default_cfg_for_new_run(),
             form: FormState::default(),
             dashboard_manifest: None,
@@ -514,6 +523,7 @@ impl App {
             shutdown_requested: false,
             shutdown_exit_after: false,
             naming_input: String::new(),
+            extend_input: String::new(),
         }
     }
 
@@ -529,7 +539,7 @@ impl App {
             );
         } else {
             self.status =
-                "q: quit | r: refresh | n: new run | Enter: open | ↑/↓ select | PgUp/PgDn | Home/End"
+                "q: quit | r: refresh | n: new run | e: extend | Enter: open | ↑/↓ select | PgUp/PgDn | Home/End"
                     .to_string();
         }
     }
@@ -568,6 +578,168 @@ impl App {
         self.refresh_runs();
         self.selected = self.runs.iter().position(|r| r == &final_id).unwrap_or(0);
         Ok(())
+    }
+
+    fn begin_extend_selected_run(&mut self, return_to: Screen) {
+        if self.runs.is_empty() {
+            return;
+        }
+        let src = self.runs[self.selected].clone();
+        self.extend_source_run_id = Some(src);
+        self.extend_include_replay = false;
+        self.extend_input.clear();
+        self.extend_return_to = return_to;
+        self.screen = Screen::ExtendingRun;
+        self.status = "Extend run: type new name | Space: toggle replay copy | Enter: confirm | Esc: cancel".to_string();
+    }
+
+    fn begin_extend_active_run(&mut self, return_to: Screen) {
+        let Some(src) = self.active_run_id.clone() else {
+            return;
+        };
+        self.extend_source_run_id = Some(src);
+        self.extend_include_replay = false;
+        self.extend_input.clear();
+        self.extend_return_to = return_to;
+        self.screen = Screen::ExtendingRun;
+        self.status = "Extend run: type new name | Space: toggle replay copy | Enter: confirm | Esc: cancel".to_string();
+    }
+
+    fn extend_run_with_name(&mut self, name: &str) -> io::Result<String> {
+        let Some(src_id) = self.extend_source_run_id.clone() else {
+            return Err(io::Error::other("no source run selected"));
+        };
+        std::fs::create_dir_all(&self.runs_dir)?;
+
+        let src_dir = self.runs_dir.join(&src_id);
+        let src_run_json = src_dir.join("run.json");
+        if !src_run_json.exists() {
+            return Err(io::Error::other(format!(
+                "source run has no run.json: {}",
+                src_run_json.display()
+            )));
+        }
+        let src_manifest = yz_logging::read_manifest(&src_run_json)
+            .map_err(|e| io::Error::other(format!("failed to read source run.json: {e}")))?;
+
+        // Sanitize + ensure unique id in runs/
+        let sanitized: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        if sanitized.trim().is_empty() {
+            return Err(io::Error::other("new run name must be non-empty"));
+        }
+        let base_id = sanitized;
+        let mut final_id = base_id.clone();
+        if self.runs_dir.join(&final_id).exists() {
+            let ts = yz_logging::now_ms();
+            final_id = format!("{base_id}_{ts}");
+        }
+
+        let dst_dir = self.runs_dir.join(&final_id);
+        std::fs::create_dir_all(dst_dir.join("logs"))?;
+        std::fs::create_dir_all(dst_dir.join("models"))?;
+        std::fs::create_dir_all(dst_dir.join("replay"))?;
+
+        // Copy config snapshot/draft.
+        let src_cfg = src_dir.join("config.yaml");
+        let src_draft = src_dir.join(crate::config_io::CONFIG_DRAFT_NAME);
+        let dst_cfg = dst_dir.join("config.yaml");
+        let dst_draft = dst_dir.join(crate::config_io::CONFIG_DRAFT_NAME);
+        if src_cfg.exists() {
+            std::fs::copy(&src_cfg, &dst_cfg)?;
+        } else if src_draft.exists() {
+            std::fs::copy(&src_draft, &dst_cfg)?;
+        }
+        if src_draft.exists() {
+            let _ = std::fs::copy(&src_draft, &dst_draft);
+        }
+
+        // Copy models (best.pt at minimum).
+        let src_best = src_dir.join("models").join("best.pt");
+        let dst_best = dst_dir.join("models").join("best.pt");
+        if src_best.exists() {
+            let _ = std::fs::copy(&src_best, &dst_best);
+        }
+
+        // Optionally copy replay/.
+        if self.extend_include_replay {
+            let src_replay = src_dir.join("replay");
+            let dst_replay = dst_dir.join("replay");
+            if src_replay.exists() {
+                copy_dir_recursive(&src_replay, &dst_replay)?;
+            }
+        }
+
+        // Normalize + hash the copied config into config.yaml, then write a fresh run.json that
+        // continues counting from the source controller_iteration_idx.
+        let cfg = yz_core::Config::load(&dst_cfg).unwrap_or_default();
+        let (rel_cfg, cfg_hash) = yz_logging::write_config_snapshot_atomic(&dst_dir, &cfg)
+            .map_err(|e| io::Error::other(format!("failed to write config snapshot: {e}")))?;
+
+        let now = yz_logging::now_ms();
+        let best_ckpt = if dst_best.exists() {
+            Some("models/best.pt".to_string())
+        } else {
+            None
+        };
+        let mut m = RunManifestV1 {
+            run_manifest_version: src_manifest.run_manifest_version,
+            run_id: final_id.clone(),
+            created_ts_ms: now,
+            protocol_version: src_manifest.protocol_version,
+            feature_schema_id: src_manifest.feature_schema_id,
+            action_space_id: src_manifest.action_space_id.clone(),
+            ruleset_id: src_manifest.ruleset_id.clone(),
+            git_hash: yz_logging::try_git_hash().or(src_manifest.git_hash.clone()),
+            config_hash: Some(cfg_hash.clone()),
+            config_snapshot: Some(rel_cfg),
+            config_snapshot_hash: Some(cfg_hash),
+            replay_dir: src_manifest.replay_dir.clone(),
+            logs_dir: src_manifest.logs_dir.clone(),
+            models_dir: src_manifest.models_dir.clone(),
+            selfplay_games_completed: 0,
+            train_step: 0,
+            best_checkpoint: best_ckpt,
+            candidate_checkpoint: None,
+            best_promoted_iter: src_manifest.best_promoted_iter,
+            train_last_loss_total: None,
+            train_last_loss_policy: None,
+            train_last_loss_value: None,
+            promotion_decision: None,
+            promotion_ts_ms: None,
+            gate_games: None,
+            gate_win_rate: None,
+            gate_draw_rate: None,
+            gate_wins: None,
+            gate_losses: None,
+            gate_draws: None,
+            gate_ci95_low: None,
+            gate_ci95_high: None,
+            gate_sprt: None,
+            gate_seeds_hash: None,
+            gate_oracle_match_rate_overall: None,
+            gate_oracle_match_rate_mark: None,
+            gate_oracle_match_rate_reroll: None,
+            gate_oracle_keepall_ignored: None,
+            controller_phase: Some("idle".to_string()),
+            controller_status: Some(format!(
+                "extended from {src_id} (continue at iter {})",
+                src_manifest.controller_iteration_idx
+            )),
+            controller_last_ts_ms: Some(now),
+            controller_error: None,
+            model_reloads: 0,
+            controller_iteration_idx: src_manifest.controller_iteration_idx,
+            iterations: Vec::new(),
+        };
+        // If the source had a controller error, do not propagate it.
+        m.controller_error = None;
+        yz_logging::write_manifest_atomic(&dst_dir.join("run.json"), &m)
+            .map_err(|e| io::Error::other(format!("failed to write run.json: {e}")))?;
+
+        Ok(final_id)
     }
 
     fn enter_selected_run(&mut self) {
@@ -946,7 +1118,7 @@ impl App {
             self.status = "cancelling… waiting for shutdown | r refresh".to_string();
         } else {
             self.status =
-                "r refresh | l toggle learning/perf | d perf | s search | i system | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                "r refresh | l toggle learning/perf | d perf | s search | i system | e extend | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
                     .to_string();
         }
     }
@@ -1248,6 +1420,27 @@ fn list_runs(runs_dir: &Path) -> Vec<String> {
     out
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for ent in std::fs::read_dir(src)? {
+        let ent = ent?;
+        let ft = ent.file_type()?;
+        let name = ent.file_name();
+        let src_p = ent.path();
+        let dst_p = dst.join(name);
+        if ft.is_dir() {
+            copy_dir_recursive(&src_p, &dst_p)?;
+        } else if ft.is_file() {
+            // Best-effort overwrite (destination is a fresh run dir anyway).
+            let _ = std::fs::copy(&src_p, &dst_p)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> io::Result<()> {
     // Terminal init.
     enable_raw_mode()?;
@@ -1285,6 +1478,7 @@ pub fn run() -> io::Result<()> {
                             app.screen = Screen::NamingRun;
                             app.status = "Enter run name (Enter to confirm, Esc to cancel)".to_string();
                         }
+                        KeyCode::Char('e') => app.begin_extend_selected_run(Screen::Home),
                         KeyCode::Enter => app.enter_selected_run(),
                         KeyCode::Up => {
                             if app.selected > 0 {
@@ -1340,6 +1534,57 @@ pub fn run() -> io::Result<()> {
                         }
                         _ => {}
                     },
+                    Screen::ExtendingRun => match k.code {
+                        KeyCode::Esc => {
+                            app.screen = app.extend_return_to;
+                            app.extend_source_run_id = None;
+                            app.extend_input.clear();
+                            if matches!(app.screen, Screen::Home) {
+                                app.refresh_runs();
+                            } else if matches!(app.screen, Screen::Dashboard) {
+                                app.enter_dashboard();
+                            } else if matches!(app.screen, Screen::Config) {
+                                app.status = config_help(&app.form);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let name = app.extend_input.clone();
+                            match app.extend_run_with_name(&name) {
+                                Ok(new_id) => {
+                                    app.extend_source_run_id = None;
+                                    app.extend_input.clear();
+                                    app.active_run_id = Some(new_id.clone());
+                                    if let Some(run_dir) = app.run_dir() {
+                                        let (cfg, msg) = crate::config_io::load_cfg_for_run(&run_dir);
+                                        app.cfg = cfg;
+                                        app.form = FormState::default();
+                                        if let Some(msg) = msg {
+                                            app.status = msg;
+                                        } else {
+                                            app.status = "Extended run created".to_string();
+                                        }
+                                    }
+                                    app.screen = Screen::Config;
+                                    app.status = config_help(&app.form);
+                                }
+                                Err(e) => {
+                                    app.status = format!("extend failed: {e}");
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.extend_input.pop();
+                        }
+                        KeyCode::Char(' ') => {
+                            app.extend_include_replay = !app.extend_include_replay;
+                        }
+                        KeyCode::Char(c) => {
+                            if !c.is_control() {
+                                app.extend_input.push(c);
+                            }
+                        }
+                        _ => {}
+                    },
                     Screen::Config => match k.code {
                         KeyCode::Char('q') => {
                             if app.request_quit_or_cancel() {
@@ -1367,6 +1612,7 @@ pub fn run() -> io::Result<()> {
                             app.screen = Screen::Config;
                             app.status = config_help(&app.form);
                         }
+                        KeyCode::Char('e') => app.begin_extend_active_run(Screen::Dashboard),
                         KeyCode::Char('l') => {
                             app.dashboard_tab = match app.dashboard_tab {
                                 DashboardTab::Performance => DashboardTab::Learning,
@@ -2716,6 +2962,49 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         app.naming_input.clone()
                     },
                     if app.naming_input.is_empty() {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Enter to confirm, Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let p = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
+            f.render_widget(p, chunks[0]);
+        }
+        Screen::ExtendingRun => {
+            let src = app
+                .extend_source_run_id
+                .as_deref()
+                .unwrap_or("<no source>");
+            let title = Line::from(vec![Span::styled(
+                "Extend Run",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]);
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("  Source: {src}")));
+            lines.push(Line::from(format!(
+                "  Copy replay: {}  (Space to toggle)",
+                if app.extend_include_replay { "yes" } else { "no" }
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Enter a name for the new run:"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  ▸ "),
+                Span::styled(
+                    if app.extend_input.is_empty() {
+                        "(required)".to_string()
+                    } else {
+                        app.extend_input.clone()
+                    },
+                    if app.extend_input.is_empty() {
                         Style::default().fg(Color::DarkGray)
                     } else {
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
