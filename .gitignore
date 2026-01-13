@@ -67,4 +67,3 @@ perf.data*
 # Cursor / local agent artifacts
 .cursor/
 .ralph/
-RALPH_TASK.md
