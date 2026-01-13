@@ -292,8 +292,7 @@ fn build_infer_server_command(
 ) -> Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
     // Fallback: invoke the provided python executable directly.
-    let use_uv = (python_exe == "python")
-        && uv_available();
+    let use_uv = matches!(python_exe, "python" | "python3") && uv_available();
 
     let py_dir = python_project_dir_from_run_dir(run_dir);
 
@@ -850,10 +849,11 @@ pub fn spawn_iteration(
             // Clear any stale cancel request from a previous run attempt.
             let _ = std::fs::remove_file(run_dir.join("cancel.request"));
 
-            // Enforce uv-managed Python when using PATH python (TUI default).
-            if python_exe == "python" && !uv_available() {
+            // Enforce uv-managed Python when using PATH python/python3 (TUI + Makefile defaults).
+            // This avoids "works on my machine" failures from missing deps (numpy/torch/etc).
+            if matches!(python_exe.as_str(), "python" | "python3") && !uv_available() {
                 return Err(ControllerError::InferServer(
-                    "uv not found on PATH. Install uv (recommended) or run yz-controller with an explicit python_exe.".to_string(),
+                    "uv not found on PATH. Install uv and run `make py-sync`, or pass an explicit python executable that already has the required deps installed (e.g. a venv python).".to_string(),
                 ));
             }
 
@@ -1740,8 +1740,7 @@ fn build_train_command(
 ) -> std::process::Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
     // Fallback: invoke the provided python executable directly.
-    let use_uv = (python_exe == "python")
-        && uv_available();
+    let use_uv = matches!(python_exe, "python" | "python3") && uv_available();
 
     // We expect the standard repo layout: python package lives under ./python.
     let py_dir = python_project_dir_from_run_dir(run_dir);
@@ -1881,8 +1880,7 @@ fn build_model_init_command(
     python_exe: &str,
 ) -> std::process::Command {
     // Preferred runner: `uv run python -m yatzy_az ...` if uv is available.
-    let use_uv = (python_exe == "python")
-        && uv_available();
+    let use_uv = matches!(python_exe, "python" | "python3") && uv_available();
 
     let py_dir = python_project_dir_from_run_dir(run_dir);
     // Must use absolute path since command runs from py_dir, not cwd.
