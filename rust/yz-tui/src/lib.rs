@@ -73,6 +73,7 @@ struct GateReplayPlayerV1 {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GateReplayStepV1 {
+    #[allow(dead_code)]
     ply: u32,
     turn_idx: u8,
     player_to_move_before: u8,
@@ -80,8 +81,11 @@ struct GateReplayStepV1 {
     dice_sorted_before: [u8; 5],
     chosen_action_idx: u8,
     chosen_action_str: String,
+    #[allow(dead_code)]
     player_to_move_after: u8,
+    #[allow(dead_code)]
     rerolls_left_after: u8,
+    #[allow(dead_code)]
     dice_sorted_after: [u8; 5],
     players_after: [GateReplayPlayerV1; 2],
 }
@@ -100,6 +104,7 @@ struct GateReplayFileV1 {
     iter_idx: u32,
     best_model_id: u32,
     cand_model_id: u32,
+    #[allow(dead_code)]
     episode_seed: u64,
     swap: bool,
     cand_seat: u8,
@@ -5226,34 +5231,6 @@ fn die_face(d: u8) -> char {
     }
 }
 
-fn fmt_dice(dice: [u8; 5]) -> String {
-    let mut s = String::new();
-    for (i, d) in dice.iter().enumerate() {
-        if i > 0 {
-            s.push(' ');
-        }
-        s.push(die_face(*d));
-    }
-    s
-}
-
-fn fmt_dice_big(dice: [u8; 5]) -> [String; 3] {
-    let mut top = String::new();
-    let mut mid = String::new();
-    let mut bot = String::new();
-    for (i, d) in dice.iter().enumerate() {
-        if i > 0 {
-            top.push(' ');
-            mid.push(' ');
-            bot.push(' ');
-        }
-        top.push_str("┌───┐");
-        mid.push_str(&format!("│ {} │", die_face(*d)));
-        bot.push_str("└───┘");
-    }
-    [top, mid, bot]
-}
-
 fn kept_dice_from_mask(dice_sorted: [u8; 5], mask: u8) -> Vec<u8> {
     let mut kept = Vec::new();
     for (i, d) in dice_sorted.iter().enumerate() {
@@ -5414,6 +5391,10 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
             return out;
         };
         out.push(Line::from(format!(
+            "run={} iter={} trace_v={}  swap={}  seats(cand={},best={})",
+            t.run_id, t.iter_idx, t.trace_version, t.swap, t.cand_seat, t.best_seat
+        )));
+        out.push(Line::from(format!(
             "model_ids(best={},cand={})",
             t.best_model_id, t.cand_model_id
         )));
@@ -5531,9 +5512,11 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         for p in 0u8..=1u8 {
             let ps = &s.players_after[p as usize];
             let who = label_for_player(p, t.cand_seat);
+            let avail_left = ps.avail_mask.count_ones();
+            let bonus = if ps.upper_bonus_awarded { "+50" } else { "-" };
             out.push(Line::from(format!(
-                "{who}: total={}  upper={}/63",
-                ps.total_score, ps.upper_total_cap
+                "{who}: total={}  upper={}/63  upper_raw={}  bonus={}  avail_left={}",
+                ps.total_score, ps.upper_total_cap, ps.upper_raw_sum, bonus, avail_left
             )));
             for cat in 0u8..(yz_core::NUM_CATS as u8) {
                 let v = ps.filled_raw[cat as usize]
