@@ -672,9 +672,27 @@ impl App {
             }
         }
 
-        // Normalize + hash the copied config into config.yaml, then write a fresh run.json that
-        // continues counting from the source controller_iteration_idx.
-        let cfg = yz_core::Config::load(&dst_cfg).unwrap_or_default();
+        // Load the copied config. If the source run already completed all planned iterations,
+        // bump total_iterations so the extended run is runnable immediately (common expectation).
+        //
+        // Without this, extending a completed run will show "done (completed N/N)" and pressing
+        // 'g' won't start anything because controller_iteration_idx == total_iterations.
+        let mut cfg = yz_core::Config::load(&dst_cfg).unwrap_or_default();
+        let cur = src_manifest.controller_iteration_idx;
+        let planned = cfg.controller.total_iterations.unwrap_or(cur.max(1));
+        let mut bumped_total: Option<u32> = None;
+        if planned <= cur {
+            let new_total = cur.saturating_add(1).max(1);
+            cfg.controller.total_iterations = Some(new_total);
+            bumped_total = Some(new_total);
+            // Keep draft (if present) consistent with the snapshot, since Config screen prefers draft.
+            if dst_draft.exists() {
+                let _ = crate::config_io::save_cfg_draft_atomic(&dst_dir, &cfg);
+            }
+        }
+
+        // Normalize + hash into config.yaml, then write a fresh run.json that continues counting
+        // from the source controller_iteration_idx.
         let (rel_cfg, cfg_hash) = yz_logging::write_config_snapshot_atomic(&dst_dir, &cfg)
             .map_err(|e| io::Error::other(format!("failed to write config snapshot: {e}")))?;
 
@@ -725,8 +743,11 @@ impl App {
             gate_oracle_keepall_ignored: None,
             controller_phase: Some("idle".to_string()),
             controller_status: Some(format!(
-                "extended from {src_id} (continue at iter {})",
-                src_manifest.controller_iteration_idx
+                "extended from {src_id} (continue at iter {}){}",
+                src_manifest.controller_iteration_idx,
+                bumped_total
+                    .map(|t| format!(", bumped total_iterations to {t}"))
+                    .unwrap_or_default()
             )),
             controller_last_ts_ms: Some(now),
             controller_error: None,
@@ -3452,6 +3473,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     }
                 } else if phase == "idle" {
                     right_lines.push(Line::from("No iteration running."));
+                } else if phase == "done" {
+                    // Common case for extended runs: we intentionally do not copy the source run's
+                    // per-iteration summaries, so the Performance table can be empty even though
+                    // controller_iteration_idx > 0.
+                    right_lines.push(Line::from(format!(
+                        "Run complete. To keep going, set controller.total_iterations > {cur_idx} in Config and press 'g'."
+                    )));
                 } else {
                     right_lines.push(Line::from(format!(
                         "no iteration summary for idx={cur_idx}"
