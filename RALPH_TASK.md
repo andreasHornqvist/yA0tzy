@@ -1,8 +1,3 @@
----
-task: Implement TUI run extension + replay + server management + oracle diagnostics
-test_command: "cargo test -p yz-tui"
----
-
 # Task: TUI Feature Suite (Implementation)
 
 Implement the feature suite below (copied from `documentation/TUI_FEATURES_PLAN.md`) and keep it self-contained here.
