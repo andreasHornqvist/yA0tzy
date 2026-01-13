@@ -335,14 +335,29 @@ fn run_controller_foreground(
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    match handle.join() {
+    let code = match handle.join() {
         Ok(()) => 0,
         Err(yz_controller::ControllerError::Cancelled) => 2,
         Err(e) => {
             eprintln!("controller failed: {e}");
             1
         }
+    };
+
+    // If the controller finishes very quickly, the polling loop above might not print anything.
+    // Do one final read and print any completed iterations we haven't printed yet.
+    if print_iter_table {
+        if let Ok(m) = yz_logging::read_manifest(&run_json) {
+            for it in &m.iterations {
+                if it.idx >= printed_iters && it.ended_ts_ms.is_some() {
+                    print_iteration_table_row(it);
+                    printed_iters = it.idx.saturating_add(1);
+                }
+            }
+        }
     }
+
+    code
 }
 
 fn cmd_controller(args: &[String]) {

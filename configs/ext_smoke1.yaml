@@ -1,0 +1,63 @@
+# Extend-run smoke: tiny 1-iteration run with unique infer endpoints.
+# Goal: finish quickly, then verify `make extend-run` continues iteration index.
+
+inference:
+  bind: "unix:///tmp/yatzy_infer_ext_smoke1.sock"
+  device: "cpu"
+  protocol_version: 2
+  legal_mask_bitset: false
+  max_batch: 32
+  max_wait_us: 1000
+  metrics_bind: "127.0.0.1:18090"
+
+controller:
+  total_iterations: 1
+
+replay:
+  capacity_shards: 20
+
+mcts:
+  c_puct: 1.5
+  budget_reroll: 64
+  budget_mark: 64
+  max_inflight_per_game: 4
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.25
+  temperature_schedule:
+    kind: step
+    t0: 1.0
+    t1: 0.0
+    cutoff_turn: 10
+  virtual_loss_mode: n_virtual_only
+  virtual_loss: 1.0
+
+selfplay:
+  games_per_iteration: 6
+  workers: 1
+  threads_per_worker: 1
+  root_sample_every_n: 0
+
+training:
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adamw
+  reset_optimizer: true
+  epochs: 1
+  steps_per_iteration: 8
+  sample_mode: random_indexed
+  dataloader_workers: 0
+
+gating:
+  games: 6
+  seed: 0
+  seed_set_id: "dev_small_v1"
+  win_rate_threshold: 0.55
+  paired_seed_swap: true
+  deterministic_chance: true
+
+model:
+  hidden_dim: 128
+  num_blocks: 2
+  kind: residual
+
