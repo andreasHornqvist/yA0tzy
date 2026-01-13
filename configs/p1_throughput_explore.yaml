@@ -1,0 +1,77 @@
+# Tuned follow-up to runs/p1/config.yaml for better *effective* sims:
+# - Fewer/saner batches/sec by increasing max_batch (reduces per-batch overhead and backpressure).
+# - Reduce CPU oversubscription from selfplay threads.
+# - Slightly more exploration (dirichlet + temperature floor) to avoid early collapse when sims/move are constrained.
+#
+# Suggested run:
+#   make start-run RUN_NAME=p1_throughput_explore CONFIG=configs/p1_throughput_explore.yaml DETACH=1
+#
+# Notes:
+# - Uses a unique infer socket + metrics port so it can run alongside other detached runs.
+
+inference:
+  bind: "unix:///tmp/yatzy_infer_p1_throughput_explore.sock"
+  metrics_bind: "127.0.0.1:18085"
+  device: "cpu"
+  protocol_version: 2
+  legal_mask_bitset: false
+  max_batch: 64
+  max_wait_us: 1000
+  torch_threads: 8
+  torch_interop_threads: 1
+  debug_log: false
+  print_stats: false
+
+mcts:
+  c_puct: 1.6
+  budget_reroll: 400
+  budget_mark: 400
+  # Lower than p1 (8) to improve "effective sims" (less speculative parallelism).
+  max_inflight_per_game: 6
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.35
+  temperature_schedule:
+    kind: step
+    t0: 1.0
+    # p1 used 0.001 (very cold); raise floor slightly to keep exploration alive.
+    t1: 0.01
+    cutoff_turn: 10
+  virtual_loss_mode: n_virtual_only
+  virtual_loss: 1.0
+
+selfplay:
+  games_per_iteration: 100
+  # p1 was 10 workers * 2 threads = 20 CPU threads competing with inference.
+  workers: 8
+  threads_per_worker: 1
+  root_sample_every_n: 10
+
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 3
+  steps_per_iteration: null
+  sample_mode: random_indexed
+  dataloader_workers: 0
+
+gating:
+  games: 100
+  seed: 0
+  seed_set_id: dev_v1
+  win_rate_threshold: 0.55
+  paired_seed_swap: true
+  deterministic_chance: true
+  threads_per_worker: null
+
+replay:
+  capacity_shards: 30
+
+controller:
+  total_iterations: 100
+
+model:
+  hidden_dim: 256
+  num_blocks: 4
+  kind: mlp
+

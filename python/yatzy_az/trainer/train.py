@@ -65,6 +65,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Weight decay (L2) for AdamW (overrides config)",
     )
+    p.add_argument(
+        "--optimizer",
+        default=None,
+        choices=["adamw", "adam", "sgd"],
+        help="Optimizer (overrides config training.optimizer): adamw | adam | sgd",
+    )
     p.add_argument("--value-lambda", type=float, default=1.0, help="Weight for value loss")
     p.add_argument("--hidden", type=int, default=256, help="Hidden size")
     p.add_argument("--blocks", type=int, default=2, help="Number of residual blocks")
@@ -97,7 +103,7 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _init_model_and_opt(
-    *, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, device
+    *, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, optimizer: str, device
 ):
     import torch
 
@@ -105,12 +111,35 @@ def _init_model_and_opt(
 
     # Note: `blocks` means residual blocks for kind=residual, or MLP hidden layers for kind=mlp.
     model = YatzyNet(YatzyNetConfig(hidden=hidden, blocks=blocks, kind=str(kind))).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(weight_decay))
+    opt_kind = str(optimizer).strip().lower()
+    if opt_kind == "adamw":
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(weight_decay))
+    elif opt_kind == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=float(weight_decay))
+    elif opt_kind == "sgd":
+        # Minimal SGD variant; if we want to tune this, add explicit momentum/nesterov knobs later.
+        opt = torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=float(weight_decay),
+            nesterov=False,
+        )
+    else:
+        raise RuntimeError(f"unsupported optimizer={optimizer!r} (expected adamw|adam|sgd)")
     return model, opt
 
 
 def init_from_best(
-    *, best_path: Path, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, device
+    *,
+    best_path: Path,
+    hidden: int,
+    blocks: int,
+    kind: str,
+    lr: float,
+    weight_decay: float,
+    optimizer: str,
+    device,
 ):
     """Initialize candidate from best weights with a fresh optimizer (no state)."""
     d = _load_checkpoint(best_path)
@@ -129,6 +158,7 @@ def init_from_best(
         kind=str(kind),
         lr=lr,
         weight_decay=weight_decay,
+        optimizer=str(optimizer),
         device=device,
     )
     model.load_state_dict(d["model"])
@@ -141,7 +171,15 @@ def init_from_best(
 
 
 def resume_candidate(
-    *, candidate_path: Path, hidden: int, blocks: int, kind: str, lr: float, weight_decay: float, device
+    *,
+    candidate_path: Path,
+    hidden: int,
+    blocks: int,
+    kind: str,
+    lr: float,
+    weight_decay: float,
+    optimizer: str,
+    device,
 ):
     """Resume candidate training by loading model + optimizer state."""
     d = _load_checkpoint(candidate_path)
@@ -153,6 +191,12 @@ def resume_candidate(
         raise RuntimeError(
             f"model kind mismatch: candidate.pt kind={cand_kind!r} but requested kind={kind!r}"
         )
+    ckpt_opt = str(cand_cfg.get("optimizer", "")).strip().lower()
+    req_opt = str(optimizer).strip().lower()
+    if ckpt_opt and (ckpt_opt != req_opt):
+        raise RuntimeError(
+            f"optimizer mismatch: candidate.pt optimizer={ckpt_opt!r} but requested optimizer={req_opt!r}"
+        )
 
     model, opt = _init_model_and_opt(
         hidden=hidden,
@@ -160,11 +204,18 @@ def resume_candidate(
         kind=str(kind),
         lr=lr,
         weight_decay=weight_decay,
+        optimizer=str(optimizer),
         device=device,
     )
     model.load_state_dict(d["model"])
     if "optimizer" in d and d["optimizer"] is not None:
         opt.load_state_dict(d["optimizer"])
+        # Ensure current run hyperparams take effect even when resuming.
+        # (PyTorch optimizer state dict includes param_groups with lr/weight_decay.)
+        for g in opt.param_groups:
+            g["lr"] = float(lr)
+            if "weight_decay" in g:
+                g["weight_decay"] = float(weight_decay)
 
     meta = d.get("meta", {})
     train_step = int(meta.get("train_step", 0)) if isinstance(meta, dict) else 0
@@ -522,6 +573,22 @@ class _LearnSummaryAgg:
         self.pi_entropy_sum: float = 0.0
         self.pi_entropy_n: int = 0
 
+        # Policy diagnostics (cheap, per-sample) to help interpret collapse/exploration.
+        # Action-space is oracle_keepmask_v1 (A=47): 0..31 keepmask (reroll), 32..46 mark.
+        # We infer the *state type* from the legal mask: mark-states have any legal idx>=32.
+        self.n_legal = _Reservoir(20_000, seed=seed ^ 0xC0DEF00D)
+        self.pi_entropy_norm = _Reservoir(20_000, seed=seed ^ 0xE11E77)
+        self.pi_top1_mark = _Reservoir(20_000, seed=seed ^ 0xAA11AA11)
+        self.pi_top1_reroll = _Reservoir(20_000, seed=seed ^ 0xBB22BB22)
+        self.pi_entropy_mark = _Reservoir(20_000, seed=seed ^ 0xCC33CC33)
+        self.pi_entropy_reroll = _Reservoir(20_000, seed=seed ^ 0xDD44DD44)
+        self.pi_eff_mark = _Reservoir(20_000, seed=seed ^ 0xEE55EE55)
+        self.pi_eff_reroll = _Reservoir(20_000, seed=seed ^ 0xFF66FF66)
+        self.pi_entropy_mark_sum: float = 0.0
+        self.pi_entropy_mark_n: int = 0
+        self.pi_entropy_reroll_sum: float = 0.0
+        self.pi_entropy_reroll_n: int = 0
+
         # Policy alignment metrics (per-sample): model entropy and KL(target || model).
         self.pi_model_entropy = _Reservoir(20_000, seed=seed ^ 0xD15EA5E)
         self.pi_kl = _Reservoir(20_000, seed=seed ^ 0xB16B00B5)
@@ -529,6 +596,15 @@ class _LearnSummaryAgg:
         self.pi_model_entropy_n: int = 0
         self.pi_kl_sum: float = 0.0
         self.pi_kl_n: int = 0
+
+        # Alignment variants that ignore model illegal mass by renormalizing over legal.
+        self.pi_model_entropy_legal = _Reservoir(20_000, seed=seed ^ 0x13579BDF)
+        self.pi_kl_legal = _Reservoir(20_000, seed=seed ^ 0x2468ACE0)
+        self.pi_model_entropy_legal_sum: float = 0.0
+        self.pi_model_entropy_legal_n: int = 0
+        self.pi_kl_legal_sum: float = 0.0
+        self.pi_kl_legal_n: int = 0
+        self.p_top1_legal = _Reservoir(20_000, seed=seed ^ 0xABCDE)
 
         # Illegal-mass diagnostics (per-sample).
         # - pi_illegal_*: illegal mass in the replay target pi BEFORE masking (data quality)
@@ -575,6 +651,45 @@ class _LearnSummaryAgg:
             self.pi_entropy_sum += float(ent.sum().item())
             self.pi_entropy_n += int(ent.numel())
 
+            # Legal-count + normalized entropy (H / log(n_legal)).
+            if legal is not None:
+                legal_b = legal.to(dtype=torch.bool)
+                n_legal = legal_b.sum(dim=1).to(dtype=torch.float32)  # [B]
+                n_legal_cpu = n_legal.detach().cpu().tolist()
+                self.n_legal.add_many([float(x) for x in n_legal_cpu])
+
+                # For n_legal<=1 entropy is 0; use log(max(2,n)) to avoid division by 0.
+                den = torch.log(n_legal.clamp_min(2.0))
+                ent_norm = (ent / den).clamp(0.0, 1.0)
+                ent_norm_cpu = ent_norm.detach().float().cpu().tolist()
+                self.pi_entropy_norm.add_many(ent_norm_cpu)
+
+                # Split: mark vs reroll states (derived from legal mask).
+                if legal_b.shape[1] >= 33:
+                    is_mark_state = legal_b[:, 32:].any(dim=1)
+                else:
+                    is_mark_state = torch.zeros((legal_b.shape[0],), dtype=torch.bool, device=legal_b.device)
+                is_reroll_state = ~is_mark_state
+
+                if bool(is_mark_state.any().item()):
+                    ent_m = ent[is_mark_state]
+                    top1_m = top1[is_mark_state]
+                    eff_m = eff[is_mark_state]
+                    self.pi_entropy_mark.add_many(ent_m.detach().float().cpu().tolist())
+                    self.pi_top1_mark.add_many(top1_m.detach().float().cpu().tolist())
+                    self.pi_eff_mark.add_many(eff_m.detach().float().cpu().tolist())
+                    self.pi_entropy_mark_sum += float(ent_m.sum().item())
+                    self.pi_entropy_mark_n += int(ent_m.numel())
+                if bool(is_reroll_state.any().item()):
+                    ent_r = ent[is_reroll_state]
+                    top1_r = top1[is_reroll_state]
+                    eff_r = eff[is_reroll_state]
+                    self.pi_entropy_reroll.add_many(ent_r.detach().float().cpu().tolist())
+                    self.pi_top1_reroll.add_many(top1_r.detach().float().cpu().tolist())
+                    self.pi_eff_reroll.add_many(eff_r.detach().float().cpu().tolist())
+                    self.pi_entropy_reroll_sum += float(ent_r.sum().item())
+                    self.pi_entropy_reroll_n += int(ent_r.numel())
+
             # Optional policy alignment metrics (require model log-probs).
             if logp is not None:
                 logp = logp.detach()
@@ -591,6 +706,28 @@ class _LearnSummaryAgg:
                 self.pi_model_entropy_n += int(ent_model.numel())
                 self.pi_kl_sum += float(kl.sum().item())
                 self.pi_kl_n += int(kl.numel())
+
+                # Alignment over legal-renormalized model distribution (helps diagnose high illegal mass).
+                if legal is not None:
+                    legal_f = legal.to(dtype=torch.float32)
+                    p_legal = (p_model * legal_f).clamp_min(0.0)
+                    p_legal = p_legal / p_legal.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                    logp_legal = torch.log(p_legal.clamp_min(1e-12))
+                    ent_model_legal = -(p_legal * logp_legal).sum(dim=1)  # [B]
+                    ce_legal = -(pi * logp_legal).sum(dim=1)  # [B]
+                    kl_legal = (ce_legal - ent).clamp_min(0.0)  # [B]
+                    top1_model_legal = p_legal.max(dim=1).values  # [B]
+
+                    entml_cpu = ent_model_legal.detach().float().cpu().tolist()
+                    kll_cpu = kl_legal.detach().float().cpu().tolist()
+                    top1ml_cpu = top1_model_legal.detach().float().cpu().tolist()
+                    self.pi_model_entropy_legal.add_many(entml_cpu)
+                    self.pi_kl_legal.add_many(kll_cpu)
+                    self.p_top1_legal.add_many(top1ml_cpu)
+                    self.pi_model_entropy_legal_sum += float(ent_model_legal.sum().item())
+                    self.pi_model_entropy_legal_n += int(ent_model_legal.numel())
+                    self.pi_kl_legal_sum += float(kl_legal.sum().item())
+                    self.pi_kl_legal_n += int(kl_legal.numel())
 
                 # Model illegal mass (requires legal mask).
                 if legal is not None:
@@ -659,6 +796,32 @@ class _LearnSummaryAgg:
         out["pi_eff_actions_p50"] = float(e1)
         out["pi_eff_actions_p95"] = float(e2)
 
+        # Policy diagnostics (safe: only emit when we have data to avoid NaN JSON).
+        if self.n_legal.buf:
+            nl50, nl95 = self.n_legal.percentiles([0.50, 0.95])
+            out["n_legal_p50"] = float(nl50)
+            out["n_legal_p95"] = float(nl95)
+        if self.pi_entropy_norm.buf:
+            hn50, hn95 = self.pi_entropy_norm.percentiles([0.50, 0.95])
+            out["pi_entropy_norm_p50"] = float(hn50)
+            out["pi_entropy_norm_p95"] = float(hn95)
+        if self.pi_entropy_mark_n > 0:
+            out["pi_entropy_mean_mark"] = float(self.pi_entropy_mark_sum / float(max(1, self.pi_entropy_mark_n)))
+        if self.pi_entropy_reroll_n > 0:
+            out["pi_entropy_mean_reroll"] = float(self.pi_entropy_reroll_sum / float(max(1, self.pi_entropy_reroll_n)))
+        if self.pi_top1_mark.buf:
+            (_p50, p95m) = self.pi_top1_mark.percentiles([0.50, 0.95])
+            out["pi_top1_p95_mark"] = float(p95m)
+        if self.pi_top1_reroll.buf:
+            (_p50, p95r) = self.pi_top1_reroll.percentiles([0.50, 0.95])
+            out["pi_top1_p95_reroll"] = float(p95r)
+        if self.pi_eff_mark.buf:
+            (e50, _e95) = self.pi_eff_mark.percentiles([0.50, 0.95])
+            out["pi_eff_actions_p50_mark"] = float(e50)
+        if self.pi_eff_reroll.buf:
+            (e50, _e95) = self.pi_eff_reroll.percentiles([0.50, 0.95])
+            out["pi_eff_actions_p50_reroll"] = float(e50)
+
         # Policy alignment (optional; available when logp was provided).
         if self.pi_model_entropy_n > 0:
             out["pi_model_entropy_mean"] = float(
@@ -672,6 +835,21 @@ class _LearnSummaryAgg:
             k50, k95 = self.pi_kl.percentiles([0.50, 0.95])
             out["pi_kl_p50"] = float(k50)
             out["pi_kl_p95"] = float(k95)
+        if self.pi_model_entropy_legal_n > 0:
+            out["pi_model_entropy_legal_mean"] = float(
+                self.pi_model_entropy_legal_sum / float(max(1, self.pi_model_entropy_legal_n))
+            )
+            m50, m95 = self.pi_model_entropy_legal.percentiles([0.50, 0.95])
+            out["pi_model_entropy_legal_p50"] = float(m50)
+            out["pi_model_entropy_legal_p95"] = float(m95)
+        if self.pi_kl_legal_n > 0:
+            out["pi_kl_legal_mean"] = float(self.pi_kl_legal_sum / float(max(1, self.pi_kl_legal_n)))
+            k50, k95 = self.pi_kl_legal.percentiles([0.50, 0.95])
+            out["pi_kl_legal_p50"] = float(k50)
+            out["pi_kl_legal_p95"] = float(k95)
+        if self.p_top1_legal.buf:
+            (_p50, p95) = self.p_top1_legal.percentiles([0.50, 0.95])
+            out["p_top1_legal_p95"] = float(p95)
         if self.pi_entropy_n > 0 and self.pi_model_entropy_n > 0:
             out["pi_entropy_gap_mean"] = float(
                 (self.pi_entropy_sum / float(max(1, self.pi_entropy_n)))
@@ -844,6 +1022,8 @@ def run_from_args(args: argparse.Namespace) -> int:
             args.lr = float(cfg.training.learning_rate)
         if args.weight_decay is None:
             args.weight_decay = float(cfg.training.weight_decay)
+        if args.optimizer is None:
+            args.optimizer = str(getattr(cfg.training, "optimizer", "adamw"))
         if args.sample_mode is None:
             # Default to config if present; otherwise we prefer random_indexed for stability.
             args.sample_mode = getattr(cfg.training, "sample_mode", None)
@@ -860,6 +1040,8 @@ def run_from_args(args: argparse.Namespace) -> int:
         args.lr = 1e-3
     if args.weight_decay is None:
         args.weight_decay = 0.0
+    if args.optimizer is None:
+        args.optimizer = "adamw"
     if args.sample_mode is None:
         args.sample_mode = "random_indexed"
 
@@ -989,6 +1171,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             kind=str(args.kind),
             lr=float(args.lr),
             weight_decay=float(args.weight_decay),
+            optimizer=str(args.optimizer),
             device=device,
         )
     else:
@@ -1001,6 +1184,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             kind=str(args.kind),
             lr=float(args.lr),
             weight_decay=float(args.weight_decay),
+            optimizer=str(args.optimizer),
             device=device,
         )
 
@@ -1137,6 +1321,7 @@ def run_from_args(args: argparse.Namespace) -> int:
                 "hidden": int(args.hidden),
                 "blocks": int(args.blocks),
                 "kind": str(args.kind),
+                "optimizer": str(args.optimizer),
                 "feature_len": FEATURE_LEN,
                 "action_space_a": ACTION_SPACE_A,
             },

@@ -27,7 +27,7 @@ mcts:
     kind: step
     t0: 1.0
     t1: 0.0
-    cutoff_ply: 10
+    cutoff_turn: 10
   virtual_loss_mode: n_virtual_only
   virtual_loss: 1.0
 

@@ -67,6 +67,7 @@ fn pi_is_valid_distribution_and_respects_legality() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     })
     .unwrap();
     let infer = UniformInference;
@@ -123,6 +124,7 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     })
     .unwrap();
 
@@ -168,6 +170,7 @@ fn eval_mode_is_deterministic() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     };
     let infer = UniformInference;
 
@@ -202,6 +205,7 @@ fn root_noise_is_only_applied_in_rng_mode() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     };
     let infer = UniformInference;
 
@@ -238,6 +242,7 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     };
     let infer = UniformInference;
 
@@ -281,6 +286,7 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     };
 
     let mut ctx = yz_core::TurnContext::new_deterministic(42);
@@ -387,6 +393,7 @@ fn virtual_loss_modes_affect_pending_collision_tracking() {
         max_inflight: 8,
         virtual_loss_mode: VirtualLossMode::Off,
         virtual_loss: 0.0,
+        expansion_lock: false,
     };
     let cfg_nv = MctsConfig {
         virtual_loss_mode: VirtualLossMode::NVirtualOnly,

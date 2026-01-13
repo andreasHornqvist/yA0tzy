@@ -34,7 +34,9 @@ fn bench_puct_select(c: &mut Criterion) {
         dirichlet_alpha: 0.3,
         dirichlet_epsilon: 0.25,
         max_inflight: 8,
+        virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
+        expansion_lock: false,
     };
     let node = make_node();
     let legal = make_legal();

@@ -4,28 +4,28 @@ use crossterm::event::KeyModifiers;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    System,   // Inference server settings
-    Search,   // MCTS algorithm params
-    Pipeline, // Controller (iterations) + Self-play + Gating
-    Learning, // Training + Model
-    Data,     // Replay
+    Inference,
+    Search,
+    Pipeline,
+    Model,
+    Data,
 }
 
 impl Section {
     pub const ALL: [Section; 5] = [
-        Section::System,
+        Section::Inference,
         Section::Search,
         Section::Pipeline,
-        Section::Learning,
+        Section::Model,
         Section::Data,
     ];
 
     pub fn title(&self) -> &'static str {
         match self {
-            Section::System => "System",
+            Section::Inference => "Inference",
             Section::Search => "Search",
             Section::Pipeline => "Pipeline",
-            Section::Learning => "Learning",
+            Section::Model => "Model",
             Section::Data => "Data",
         }
     }
@@ -55,9 +55,10 @@ pub enum FieldId {
     MctsTempKind,
     MctsTempT0,
     MctsTempT1,
-    MctsTempCutoffPly,
+    MctsTempCutoffTurn,
     MctsVirtualLossMode,
     MctsVirtualLoss,
+    MctsKatagoExpansionLock,
 
     // selfplay
     SelfplayGamesPerIteration,
@@ -68,6 +69,9 @@ pub enum FieldId {
     TrainingMode, // Toggle between epochs and steps mode
     TrainingBatchSize,
     TrainingLearningRate,
+    TrainingContinuousCandidateTraining,
+    TrainingResetOptimizer,
+    TrainingOptimizer,
     TrainingEpochs,
     TrainingWeightDecay,
     TrainingStepsPerIteration,
@@ -79,6 +83,12 @@ pub enum FieldId {
     GatingWinRateThreshold,
     GatingPairedSeedSwap,
     GatingDeterministicChance,
+    GatingKatagoSprt,
+    GatingKatagoSprtMinGames,
+    GatingKatagoSprtMaxGames,
+    GatingKatagoSprtAlpha,
+    GatingKatagoSprtBeta,
+    GatingKatagoSprtDelta,
 
     // replay
     ReplayCapacityShards,
@@ -92,10 +102,13 @@ pub enum FieldId {
     ModelKind,
 }
 
+#[allow(dead_code)]
+const _HIDDEN_INFERENCE_FIELDS: [FieldId; 2] = [FieldId::InferDebugLog, FieldId::InferPrintStats];
+
 impl FieldId {
     pub fn section(&self) -> Section {
         match self {
-            // System: Inference server settings
+            // Inference
             FieldId::InferBind
             | FieldId::InferDevice
             | FieldId::InferProtocolVersion
@@ -105,10 +118,10 @@ impl FieldId {
             | FieldId::InferTorchThreads
             | FieldId::InferTorchInteropThreads
             | FieldId::InferDebugLog
-            | FieldId::InferPrintStats => Section::System,
+            | FieldId::InferPrintStats => Section::Inference,
 
-            // Search: MCTS algorithm params
-            FieldId::MctsCPuct
+            // Search: MCTS
+            | FieldId::MctsCPuct
             | FieldId::MctsBudgetReroll
             | FieldId::MctsBudgetMark
             | FieldId::MctsMaxInflightPerGame
@@ -117,32 +130,42 @@ impl FieldId {
             | FieldId::MctsTempKind
             | FieldId::MctsTempT0
             | FieldId::MctsTempT1
-            | FieldId::MctsTempCutoffPly
+            | FieldId::MctsTempCutoffTurn
             | FieldId::MctsVirtualLossMode
-            | FieldId::MctsVirtualLoss => Section::Search,
+            | FieldId::MctsVirtualLoss
+            | FieldId::MctsKatagoExpansionLock => Section::Search,
 
-            // Pipeline: Controller (iterations) + Self-play + Gating
+            // Pipeline: Controller + Self-play + Training + Gating
             FieldId::ControllerTotalIterations
             | FieldId::SelfplayGamesPerIteration
             | FieldId::SelfplayWorkers
             | FieldId::SelfplayThreadsPerWorker
+            | FieldId::TrainingMode
+            | FieldId::TrainingBatchSize
+            | FieldId::TrainingLearningRate
+            | FieldId::TrainingContinuousCandidateTraining
+            | FieldId::TrainingResetOptimizer
+            | FieldId::TrainingOptimizer
+            | FieldId::TrainingEpochs
+            | FieldId::TrainingWeightDecay
+            | FieldId::TrainingStepsPerIteration
             | FieldId::GatingGames
             | FieldId::GatingSeed
             | FieldId::GatingSeedSetId
             | FieldId::GatingWinRateThreshold
             | FieldId::GatingPairedSeedSwap
-            | FieldId::GatingDeterministicChance => Section::Pipeline,
+            | FieldId::GatingDeterministicChance
+            | FieldId::GatingKatagoSprt
+            | FieldId::GatingKatagoSprtMinGames
+            | FieldId::GatingKatagoSprtMaxGames
+            | FieldId::GatingKatagoSprtAlpha
+            | FieldId::GatingKatagoSprtBeta
+            | FieldId::GatingKatagoSprtDelta => Section::Pipeline,
 
-            // Learning: Training + Model
-            FieldId::TrainingMode
-            | FieldId::TrainingBatchSize
-            | FieldId::TrainingLearningRate
-            | FieldId::TrainingEpochs
-            | FieldId::TrainingWeightDecay
-            | FieldId::TrainingStepsPerIteration
-            | FieldId::ModelHiddenDim
+            // Model
+            FieldId::ModelHiddenDim
             | FieldId::ModelNumBlocks
-            | FieldId::ModelKind => Section::Learning,
+            | FieldId::ModelKind => Section::Model,
 
             // Data: Replay
             FieldId::ReplayCapacityShards => Section::Data,
@@ -171,9 +194,10 @@ impl FieldId {
             FieldId::MctsTempKind => "mcts.temperature_schedule.kind",
             FieldId::MctsTempT0 => "mcts.temperature_schedule.t0",
             FieldId::MctsTempT1 => "mcts.temperature_schedule.t1",
-            FieldId::MctsTempCutoffPly => "mcts.temperature_schedule.cutoff_ply",
+            FieldId::MctsTempCutoffTurn => "mcts.temperature_schedule.cutoff_turn",
             FieldId::MctsVirtualLossMode => "mcts.virtual_loss_mode",
             FieldId::MctsVirtualLoss => "mcts.virtual_loss",
+            FieldId::MctsKatagoExpansionLock => "mcts.katago.expansion_lock",
 
             FieldId::SelfplayGamesPerIteration => "selfplay.games_per_iteration",
             FieldId::SelfplayWorkers => "selfplay.workers",
@@ -182,6 +206,9 @@ impl FieldId {
             FieldId::TrainingMode => "training.mode",
             FieldId::TrainingBatchSize => "training.batch_size",
             FieldId::TrainingLearningRate => "training.learning_rate",
+            FieldId::TrainingContinuousCandidateTraining => "training.continuous_candidate_training (Space to toggle)",
+            FieldId::TrainingResetOptimizer => "training.reset_optimizer (Space to toggle)",
+            FieldId::TrainingOptimizer => "training.optimizer",
             FieldId::TrainingEpochs => "training.epochs",
             FieldId::TrainingWeightDecay => "training.weight_decay",
             FieldId::TrainingStepsPerIteration => "training.steps_per_iteration",
@@ -192,6 +219,12 @@ impl FieldId {
             FieldId::GatingWinRateThreshold => "gating.win_rate_threshold",
             FieldId::GatingPairedSeedSwap => "gating.paired_seed_swap",
             FieldId::GatingDeterministicChance => "gating.deterministic_chance",
+            FieldId::GatingKatagoSprt => "gating.katago.sprt",
+            FieldId::GatingKatagoSprtMinGames => "gating.katago.sprt_min_games",
+            FieldId::GatingKatagoSprtMaxGames => "gating.katago.sprt_max_games",
+            FieldId::GatingKatagoSprtAlpha => "gating.katago.sprt_alpha (false promote rate α)",
+            FieldId::GatingKatagoSprtBeta => "gating.katago.sprt_beta (false reject rate β)",
+            FieldId::GatingKatagoSprtDelta => "gating.katago.sprt_delta (± band around threshold)",
 
             FieldId::ReplayCapacityShards => "replay.capacity_shards",
 
@@ -255,7 +288,7 @@ impl fmt::Display for StepSize {
 }
 
 pub const ALL_FIELDS: &[FieldId] = &[
-    // System: Inference server settings
+    // Inference
     FieldId::InferBind,
     FieldId::InferDevice,
     FieldId::InferProtocolVersion,
@@ -264,9 +297,9 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::InferMaxWaitUs,
     FieldId::InferTorchThreads,
     FieldId::InferTorchInteropThreads,
-    FieldId::InferDebugLog,
-    FieldId::InferPrintStats,
-    // Search: MCTS algorithm params
+    // (intentionally hidden from TUI: inference.debug_log, inference.print_stats)
+
+    // Search
     FieldId::MctsCPuct,
     FieldId::MctsBudgetReroll,
     FieldId::MctsBudgetMark,
@@ -276,30 +309,43 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::MctsTempKind,
     FieldId::MctsTempT0,
     FieldId::MctsTempT1,
-    FieldId::MctsTempCutoffPly,
+    FieldId::MctsTempCutoffTurn,
     FieldId::MctsVirtualLossMode,
     FieldId::MctsVirtualLoss,
-    // Pipeline: Controller (iterations) + Self-play + Gating
+    FieldId::MctsKatagoExpansionLock,
+
+    // Pipeline
     FieldId::ControllerTotalIterations,
     FieldId::SelfplayGamesPerIteration,
     FieldId::SelfplayWorkers,
     FieldId::SelfplayThreadsPerWorker,
-    FieldId::GatingGames,
-    FieldId::GatingSeed,
-    FieldId::GatingSeedSetId,
-    FieldId::GatingWinRateThreshold,
-    FieldId::GatingPairedSeedSwap,
-    FieldId::GatingDeterministicChance,
-    // Learning: Training + Model
     FieldId::TrainingMode,
     FieldId::TrainingBatchSize,
     FieldId::TrainingLearningRate,
+    FieldId::TrainingContinuousCandidateTraining,
+    FieldId::TrainingResetOptimizer,
+    FieldId::TrainingOptimizer,
     FieldId::TrainingEpochs,
     FieldId::TrainingWeightDecay,
     FieldId::TrainingStepsPerIteration,
+    FieldId::GatingKatagoSprt,
+    FieldId::GatingGames,
+    FieldId::GatingKatagoSprtMinGames,
+    FieldId::GatingKatagoSprtMaxGames,
+    FieldId::GatingKatagoSprtAlpha,
+    FieldId::GatingKatagoSprtBeta,
+    FieldId::GatingKatagoSprtDelta,
+    FieldId::GatingSeedSetId,
+    FieldId::GatingSeed,
+    FieldId::GatingPairedSeedSwap,
+    FieldId::GatingDeterministicChance,
+    FieldId::GatingWinRateThreshold,
+
+    // Model
     FieldId::ModelHiddenDim,
     FieldId::ModelNumBlocks,
     FieldId::ModelKind,
-    // Data: Replay
+
+    // Data
     FieldId::ReplayCapacityShards,
 ];

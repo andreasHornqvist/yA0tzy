@@ -57,6 +57,13 @@ pub struct RunManifestV1 {
     pub best_checkpoint: Option<String>,
     pub candidate_checkpoint: Option<String>,
 
+    /// Latest iteration index that produced the current best model (if known).
+    ///
+    /// This is persisted for UI display; it can also be derived from iteration history,
+    /// but persisting avoids ambiguity under advanced training modes.
+    #[serde(default)]
+    pub best_promoted_iter: Option<u32>,
+
     // Training scalars (for TUI dashboard; best-effort).
     #[serde(default)]
     pub train_last_loss_total: Option<f64>,
@@ -72,6 +79,18 @@ pub struct RunManifestV1 {
     pub gate_win_rate: Option<f64>,
     #[serde(default)]
     pub gate_draw_rate: Option<f64>,
+    #[serde(default)]
+    pub gate_wins: Option<u64>,
+    #[serde(default)]
+    pub gate_losses: Option<u64>,
+    #[serde(default)]
+    pub gate_draws: Option<u64>,
+    #[serde(default)]
+    pub gate_ci95_low: Option<f64>,
+    #[serde(default)]
+    pub gate_ci95_high: Option<f64>,
+    #[serde(default)]
+    pub gate_sprt: Option<GateSprtSummaryV1>,
     pub gate_seeds_hash: Option<String>,
     pub gate_oracle_match_rate_overall: Option<f64>,
     pub gate_oracle_match_rate_mark: Option<f64>,
@@ -143,6 +162,19 @@ pub struct IterTrainSummaryV1 {
     pub last_loss_total: Option<f64>,
     pub last_loss_policy: Option<f64>,
     pub last_loss_value: Option<f64>,
+
+    /// Where this iteration's training initialized from: "best" | "candidate".
+    #[serde(default)]
+    pub init_from: Option<String>,
+    /// Iteration index corresponding to `init_from` (best_promoted_iter or previous iter).
+    #[serde(default)]
+    pub init_from_iter: Option<u32>,
+    /// Optimizer type used for this iteration's training (e.g. "adamw").
+    #[serde(default)]
+    pub optimizer_kind: Option<String>,
+    /// Whether optimizer state was resumed (true) or reset (false) at train start.
+    #[serde(default)]
+    pub optimizer_resumed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -159,12 +191,56 @@ pub struct IterGateSummaryV1 {
     pub games_completed: u64,
     pub win_rate: Option<f64>,
     pub draw_rate: Option<f64>,
+    #[serde(default)]
+    pub wins: Option<u64>,
+    #[serde(default)]
+    pub losses: Option<u64>,
+    #[serde(default)]
+    pub draws: Option<u64>,
+    #[serde(default)]
+    pub win_ci95_low: Option<f64>,
+    #[serde(default)]
+    pub win_ci95_high: Option<f64>,
     /// Mean final score of the candidate model across gating games.
     #[serde(default)]
     pub mean_cand_score: Option<f64>,
     /// Mean final score of the best model across gating games.
     #[serde(default)]
     pub mean_best_score: Option<f64>,
+    #[serde(default)]
+    pub sprt: Option<GateSprtSummaryV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GateSprtSummaryV1 {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub min_games: u64,
+    #[serde(default)]
+    pub max_games: u64,
+    #[serde(default)]
+    pub alpha: f64,
+    #[serde(default)]
+    pub beta: f64,
+    #[serde(default)]
+    pub delta: f64,
+    #[serde(default)]
+    pub p0: f64,
+    #[serde(default)]
+    pub p1: f64,
+    #[serde(default)]
+    pub llr: f64,
+    #[serde(default)]
+    pub bound_a: f64,
+    #[serde(default)]
+    pub bound_b: f64,
+    #[serde(default)]
+    pub decision: Option<String>, // "continue" | "accept_h1" | "accept_h0" | "inconclusive_max_games"
+    #[serde(default)]
+    pub decision_reason: Option<String>,
+    #[serde(default)]
+    pub games_at_decision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -505,6 +581,11 @@ pub struct SelfplayWorkerSummaryV1 {
     pub pi_max_p_hist: HistogramV1,       // [0,1]
     pub pi_eff_actions_hist: HistogramV1, // [1,A]
 
+    /// Root visit-entropy normalized by log(n_legal) (clamped to [0,1]).
+    /// Optional for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visit_entropy_norm_hist: Option<HistogramV1>, // [0,1]
+
     // Search outcomes.
     pub root_value_sum: f64,
     pub root_value_sumsq: f64,
@@ -513,6 +594,18 @@ pub struct SelfplayWorkerSummaryV1 {
     pub fallbacks_nz: u64,
     pub pending_collisions_sum: u64,
     pub pending_count_max_hist: HistogramV1,
+
+    // Search-improvement proxy.
+    #[serde(default)]
+    pub delta_root_value_sum: f64,
+    #[serde(default)]
+    pub delta_root_value_n: u64,
+
+    // Inference waste: leaf eval requests still in-flight when search ends.
+    #[serde(default)]
+    pub leaf_eval_submitted_sum: u64,
+    #[serde(default)]
+    pub leaf_eval_discarded_sum: u64,
 
     // Prior vs visit (search improvement).
     pub prior_kl_hist: HistogramV1, // [0,3] (clamped)
@@ -568,6 +661,14 @@ pub struct MetricsSelfplaySummaryV1 {
     pub pi_eff_actions_p50: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pi_eff_actions_p95: Option<f64>,
+
+    // Search quality.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visit_entropy_norm_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_eval_discard_frac: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_root_value_mean: Option<f64>,
 
     // Search stability.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1052,6 +1153,7 @@ mod tests {
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            best_promoted_iter: None,
             train_last_loss_total: None,
             train_last_loss_policy: None,
             train_last_loss_value: None,
@@ -1060,6 +1162,12 @@ mod tests {
             gate_games: None,
             gate_win_rate: None,
             gate_draw_rate: None,
+            gate_wins: None,
+            gate_losses: None,
+            gate_draws: None,
+            gate_ci95_low: None,
+            gate_ci95_high: None,
+            gate_sprt: None,
             gate_seeds_hash: None,
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
@@ -1110,6 +1218,7 @@ mod tests {
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            best_promoted_iter: None,
             train_last_loss_total: None,
             train_last_loss_policy: None,
             train_last_loss_value: None,
@@ -1118,6 +1227,12 @@ mod tests {
             gate_games: None,
             gate_win_rate: None,
             gate_draw_rate: None,
+            gate_wins: None,
+            gate_losses: None,
+            gate_draws: None,
+            gate_ci95_low: None,
+            gate_ci95_high: None,
+            gate_sprt: None,
             gate_seeds_hash: None,
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
@@ -1140,6 +1255,12 @@ mod tests {
         o.remove("train_last_loss_policy");
         o.remove("train_last_loss_value");
         o.remove("gate_draw_rate");
+        o.remove("gate_wins");
+        o.remove("gate_losses");
+        o.remove("gate_draws");
+        o.remove("gate_ci95_low");
+        o.remove("gate_ci95_high");
+        o.remove("gate_sprt");
 
         let got: RunManifestV1 = serde_json::from_value(v).unwrap();
         assert_eq!(got.controller_iteration_idx, 0);
@@ -1148,6 +1269,12 @@ mod tests {
         assert!(got.train_last_loss_policy.is_none());
         assert!(got.train_last_loss_value.is_none());
         assert!(got.gate_draw_rate.is_none());
+        assert!(got.gate_wins.is_none());
+        assert!(got.gate_losses.is_none());
+        assert!(got.gate_draws.is_none());
+        assert!(got.gate_ci95_low.is_none());
+        assert!(got.gate_ci95_high.is_none());
+        assert!(got.gate_sprt.is_none());
     }
 
     #[test]

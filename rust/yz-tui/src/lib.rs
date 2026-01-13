@@ -31,12 +31,41 @@ use crate::form::{EditMode, FieldId, FormState, Section, StepSize, ALL_FIELDS};
 use yz_core::config::TemperatureSchedule;
 use yz_logging::RunManifestV1;
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ReplaySnapshotV1 {
+    #[allow(dead_code)]
+    snapshot_version: u32,
+    #[allow(dead_code)]
+    replay_dir: String,
+    shards: Vec<ReplaySnapshotShardV1>,
+    #[allow(dead_code)]
+    total_samples: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ReplaySnapshotShardV1 {
+    safetensors: String,
+    #[allow(dead_code)]
+    meta: String,
+    #[allow(dead_code)]
+    num_samples: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayShardView {
+    #[allow(dead_code)]
+    shard_id: u32,
+    origin_iter: Option<u32>,
+    num_samples: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Home,
     NamingRun, // Input mode for naming a new run
     Config,
     Dashboard,
+    Search,
     System,
 }
 
@@ -84,14 +113,37 @@ struct LearnSummaryNdjsonV1 {
     pi_entropy_p50: Option<f64>,
     #[serde(default)]
     pi_entropy_p95: Option<f64>,
+    // Normalized entropy H(pi)/log(n_legal); helps compare across varying legal counts.
+    #[serde(default)]
+    pi_entropy_norm_p50: Option<f64>,
+    #[serde(default)]
+    pi_entropy_norm_p95: Option<f64>,
     #[serde(default)]
     pi_top1_p50: Option<f64>,
     #[serde(default)]
     pi_top1_p95: Option<f64>,
+    // Split by inferred state type using the legal mask structure (oracle_keepmask_v1).
+    #[serde(default)]
+    pi_entropy_mean_mark: Option<f64>,
+    #[serde(default)]
+    pi_entropy_mean_reroll: Option<f64>,
+    #[serde(default)]
+    pi_top1_p95_mark: Option<f64>,
+    #[serde(default)]
+    pi_top1_p95_reroll: Option<f64>,
     #[serde(default)]
     pi_eff_actions_p50: Option<f64>,
     #[serde(default)]
     pi_eff_actions_p95: Option<f64>,
+    #[serde(default)]
+    pi_eff_actions_p50_mark: Option<f64>,
+    #[serde(default)]
+    pi_eff_actions_p50_reroll: Option<f64>,
+    // Legal action count diagnostics (derived from legal mask).
+    #[serde(default)]
+    n_legal_p50: Option<f64>,
+    #[serde(default)]
+    n_legal_p95: Option<f64>,
 
     // Value predictions
     #[serde(default)]
@@ -126,6 +178,22 @@ struct LearnSummaryNdjsonV1 {
     pi_kl_p95: Option<f64>,
     #[serde(default)]
     pi_entropy_gap_mean: Option<f64>,
+
+    // Legal-renormalized alignment (ignores model illegal mass).
+    #[serde(default)]
+    pi_model_entropy_legal_mean: Option<f64>,
+    #[serde(default)]
+    pi_model_entropy_legal_p50: Option<f64>,
+    #[serde(default)]
+    pi_model_entropy_legal_p95: Option<f64>,
+    #[serde(default)]
+    pi_kl_legal_mean: Option<f64>,
+    #[serde(default)]
+    pi_kl_legal_p50: Option<f64>,
+    #[serde(default)]
+    pi_kl_legal_p95: Option<f64>,
+    #[serde(default)]
+    p_top1_legal_p95: Option<f64>,
 
     // Illegal-mass diagnostics (fractions in [0,1]).
     // - pi_illegal_*: mass in the *replay target* pi on illegal actions (before trainer masking)
@@ -183,6 +251,8 @@ struct SelfplaySummaryNdjsonV1 {
     #[serde(default)]
     pi_max_p_p95: Option<f64>,
     #[serde(default)]
+    pi_eff_actions_p50: Option<f64>,
+    #[serde(default)]
     pi_eff_actions_p95: Option<f64>,
 
     // Search stability + improvement.
@@ -198,6 +268,14 @@ struct SelfplaySummaryNdjsonV1 {
     noise_kl_mean: Option<f64>,
     #[serde(default)]
     noise_argmax_flip_rate: Option<f64>,
+
+    // Search quality (optional; newer controller versions).
+    #[serde(default)]
+    visit_entropy_norm_p50: Option<f64>,
+    #[serde(default)]
+    late_eval_discard_frac: Option<f64>,
+    #[serde(default)]
+    delta_root_value_mean: Option<f64>,
 
     // Game stats.
     #[serde(default)]
@@ -321,6 +399,11 @@ struct App {
     /// If true, keep the current iteration row visible (auto-follow). Any manual scroll disables it.
     dashboard_iter_follow: bool,
 
+    /// Search/MCTS screen selection state.
+    search_selected_iter: u32,
+    /// If true, auto-follow the controller's current iteration.
+    search_follow: bool,
+
     // Learning dashboard state (tail metrics.ndjson).
     learn_loaded_for_run: Option<String>,
     learn_metrics_offset: u64,
@@ -329,6 +412,16 @@ struct App {
     selfplay_by_iter: HashMap<u32, SelfplaySummaryNdjsonV1>,
     infer_snapshots: Vec<InferSnapshotNdjsonV1>,
     infer_last_ts_ms: u64,
+
+    // Replay buffer visualization (best-effort, cheap: small JSON snapshots + meta filenames).
+    replay_loaded_for_run: Option<String>,
+    replay_last_poll: Instant,
+    replay_scanned_up_to_iter: i32,
+    replay_max_snapshot_iter: Option<u32>,
+    replay_origin_by_shard: HashMap<u32, u32>, // shard_id -> first snapshot iter where it appears
+    replay_current: Vec<ReplayShardView>,
+    replay_total_samples_current: Option<u64>,
+    replay_err: Option<String>,
 
     // System/Inference screen live state (1 Hz polling).
     system_agent: ureq::Agent,
@@ -382,6 +475,8 @@ impl App {
             dashboard_tab: DashboardTab::Performance,
             dashboard_iter_scroll: 0,
             dashboard_iter_follow: true,
+            search_selected_iter: 0,
+            search_follow: true,
             learn_loaded_for_run: None,
             learn_metrics_offset: 0,
             learn_metrics_partial: String::new(),
@@ -389,6 +484,15 @@ impl App {
             selfplay_by_iter: HashMap::new(),
             infer_snapshots: Vec::new(),
             infer_last_ts_ms: 0,
+
+            replay_loaded_for_run: None,
+            replay_last_poll: Instant::now(),
+            replay_scanned_up_to_iter: -1,
+            replay_max_snapshot_iter: None,
+            replay_origin_by_shard: HashMap::new(),
+            replay_current: Vec::new(),
+            replay_total_samples_current: None,
+            replay_err: None,
 
             system_agent,
             system_last_poll: Instant::now(),
@@ -544,6 +648,13 @@ impl App {
             }
         }
 
+        // Keep Search screen selection pinned to the current iteration when in follow mode.
+        if self.search_follow {
+            if let Some(m) = &self.dashboard_manifest {
+                self.search_selected_iter = m.controller_iteration_idx;
+            }
+        }
+
         // Load planned iterations (best-effort) once per active run.
         let rid = self.active_run_id.clone().unwrap_or_default();
         if self.dashboard_planned_loaded_for_run.as_deref() != Some(rid.as_str()) {
@@ -558,6 +669,144 @@ impl App {
         }
 
         self.refresh_learning_metrics(&run_dir);
+        self.refresh_replay_buffer(&run_dir);
+    }
+
+    fn parse_shard_id(name: &str) -> Option<u32> {
+        // Accept "shard_000240.safetensors" or "shard_000240.meta.json"
+        let s = name.strip_prefix("shard_")?;
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        digits.parse::<u32>().ok()
+    }
+
+    fn refresh_replay_buffer(&mut self, run_dir: &Path) {
+        // Rate limit: scanning snapshot files is small but avoid doing it at 4Hz.
+        if self.replay_last_poll.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.replay_last_poll = Instant::now();
+
+        let rid = self.active_run_id.clone().unwrap_or_default();
+        if self.replay_loaded_for_run.as_deref() != Some(rid.as_str()) {
+            self.replay_loaded_for_run = Some(rid);
+            self.replay_scanned_up_to_iter = -1;
+            self.replay_max_snapshot_iter = None;
+            self.replay_origin_by_shard.clear();
+            self.replay_current.clear();
+            self.replay_total_samples_current = None;
+            self.replay_err = None;
+        }
+
+        // 1) Discover available replay snapshots.
+        let mut snapshot_iters: Vec<u32> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(run_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|x| x.to_str()) else {
+                    continue;
+                };
+                // replay_snapshot_iter_021.json
+                if !name.starts_with("replay_snapshot_iter_") || !name.ends_with(".json") {
+                    continue;
+                }
+                let mid = name
+                    .trim_end_matches(".json")
+                    .trim_start_matches("replay_snapshot_iter_");
+                if let Ok(i) = mid.parse::<u32>() {
+                    snapshot_iters.push(i);
+                }
+            }
+        }
+        snapshot_iters.sort_unstable();
+        let max_snapshot = snapshot_iters.iter().copied().max();
+        self.replay_max_snapshot_iter = max_snapshot;
+
+        // 2) Incrementally scan new snapshots to build shard -> origin iteration mapping.
+        if let Some(max_i) = max_snapshot {
+            let start = (self.replay_scanned_up_to_iter + 1).max(0) as u32;
+            for i in start..=max_i {
+                if !snapshot_iters.binary_search(&i).is_ok() {
+                    continue;
+                }
+                let f = run_dir.join(format!("replay_snapshot_iter_{i:03}.json"));
+                let bytes = match std::fs::read(&f) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let snap = match serde_json::from_slice::<ReplaySnapshotV1>(&bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for sh in snap.shards {
+                    if let Some(id) = Self::parse_shard_id(&sh.safetensors) {
+                        self.replay_origin_by_shard.entry(id).or_insert(i);
+                    }
+                }
+                self.replay_scanned_up_to_iter = i as i32;
+            }
+        }
+
+        // 3) Current buffer shards are the meta files in replay/ (capacity_shards count).
+        let replay_dir = run_dir.join("replay");
+        #[derive(Debug, serde::Deserialize)]
+        struct ShardMeta {
+            #[serde(default)]
+            num_samples: u64,
+        }
+
+        let mut shards: Vec<u32> = Vec::new();
+        let mut samples_by_shard: HashMap<u32, u64> = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(&replay_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|x| x.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("shard_") || !name.ends_with(".meta.json") {
+                    continue;
+                }
+                if let Some(id) = Self::parse_shard_id(name) {
+                    shards.push(id);
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        if let Ok(m) = serde_json::from_slice::<ShardMeta>(&bytes) {
+                            samples_by_shard.insert(id, m.num_samples);
+                        }
+                    }
+                }
+            }
+        } else {
+            self.replay_err = Some("replay/ not found".to_string());
+            self.replay_current.clear();
+            self.replay_total_samples_current = None;
+            return;
+        }
+        shards.sort_unstable();
+        let mut total = 0u64;
+        self.replay_current = shards
+            .into_iter()
+            .map(|id| {
+                let ns = samples_by_shard.get(&id).copied();
+                if let Some(v) = ns {
+                    total = total.saturating_add(v);
+                }
+                ReplayShardView {
+                    shard_id: id,
+                    origin_iter: self.replay_origin_by_shard.get(&id).copied(),
+                    num_samples: ns,
+                }
+            })
+            .collect();
+        self.replay_total_samples_current = Some(total);
+        self.replay_err = None;
     }
 
     fn refresh_learning_metrics(&mut self, run_dir: &Path) {
@@ -570,6 +819,19 @@ impl App {
             self.selfplay_by_iter.clear();
             self.infer_snapshots.clear();
             self.infer_last_ts_ms = 0;
+
+            // Reset replay buffer cache when switching runs.
+            self.replay_loaded_for_run = None;
+            self.replay_scanned_up_to_iter = -1;
+            self.replay_max_snapshot_iter = None;
+            self.replay_origin_by_shard.clear();
+            self.replay_current.clear();
+            self.replay_total_samples_current = None;
+            self.replay_err = None;
+
+            // Reset search selection when switching runs.
+            self.search_follow = true;
+            self.search_selected_iter = 0;
 
             // Reset system live deltas/series when switching runs.
             self.system_live = None;
@@ -684,9 +946,28 @@ impl App {
             self.status = "cancelling… waiting for shutdown | r refresh".to_string();
         } else {
             self.status =
-                "r refresh | l toggle learning/perf | d perf | i system | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                "r refresh | l toggle learning/perf | d perf | s search | i system | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
                     .to_string();
         }
+    }
+
+    fn enter_search(&mut self) {
+        if self.active_run_id.is_none() {
+            return;
+        }
+        self.refresh_dashboard();
+        self.screen = Screen::Search;
+        self.search_follow = true;
+        if let Some(m) = &self.dashboard_manifest {
+            self.search_selected_iter = m.controller_iteration_idx;
+        } else if let Some(k) = self.selfplay_by_iter.keys().max().copied() {
+            self.search_selected_iter = k;
+        } else {
+            self.search_selected_iter = 0;
+        }
+        self.status =
+            "r refresh | d perf | l learning | i system | s search | ↑/↓ select | PgUp/PgDn | Home/End | Esc back | q quit"
+                .to_string();
     }
 
     fn enter_system(&mut self) {
@@ -697,7 +978,7 @@ impl App {
         self.refresh_dashboard();
         self.screen = Screen::System;
         self.status =
-            "r refresh | d perf | l learning | i system | Esc back | q quit".to_string();
+            "r refresh | d perf | l learning | s search | i system | Esc back | q quit".to_string();
         // Force immediate live poll on next tick.
         self.system_last_poll = Instant::now()
             .checked_sub(Duration::from_secs(10))
@@ -1049,11 +1330,6 @@ pub fn run() -> io::Result<()> {
                             }
                             app.naming_input.clear();
                         }
-                        KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
-                        }
                         KeyCode::Backspace => {
                             app.naming_input.pop();
                         }
@@ -1103,6 +1379,7 @@ pub fn run() -> io::Result<()> {
                             app.dashboard_tab = DashboardTab::Performance;
                             app.enter_dashboard();
                         }
+                        KeyCode::Char('s') => app.enter_search(),
                         KeyCode::Char('i') => app.enter_system(),
                         KeyCode::Char('r') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
@@ -1131,6 +1408,61 @@ pub fn run() -> io::Result<()> {
                         }
                         _ => {}
                     },
+                    Screen::Search => match k.code {
+                        KeyCode::Char('q') => {
+                            if app.request_quit_or_cancel() {
+                                break;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            // Back to dashboard (keep the current tab).
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('d') => {
+                            app.dashboard_tab = DashboardTab::Performance;
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('l') => {
+                            app.dashboard_tab = DashboardTab::Learning;
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('i') => app.enter_system(),
+                        KeyCode::Char('s') => app.enter_search(),
+                        KeyCode::Char('r') => app.refresh_dashboard(),
+                        KeyCode::Char('f') => {
+                            app.search_follow = true;
+                            if let Some(m) = &app.dashboard_manifest {
+                                app.search_selected_iter = m.controller_iteration_idx;
+                            }
+                        }
+                        KeyCode::Up => {
+                            app.search_follow = false;
+                            app.search_selected_iter = app.search_selected_iter.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.search_follow = false;
+                            app.search_selected_iter = app.search_selected_iter.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            app.search_follow = false;
+                            app.search_selected_iter = app.search_selected_iter.saturating_sub(10);
+                        }
+                        KeyCode::PageDown => {
+                            app.search_follow = false;
+                            app.search_selected_iter = app.search_selected_iter.saturating_add(10);
+                        }
+                        KeyCode::Home => {
+                            app.search_follow = false;
+                            app.search_selected_iter = 0;
+                        }
+                        KeyCode::End => {
+                            app.search_follow = true;
+                            if let Some(m) = &app.dashboard_manifest {
+                                app.search_selected_iter = m.controller_iteration_idx;
+                            }
+                        }
+                        _ => {}
+                    },
                     Screen::System => match k.code {
                         KeyCode::Char('q') => {
                             if app.request_quit_or_cancel() {
@@ -1149,6 +1481,7 @@ pub fn run() -> io::Result<()> {
                             app.dashboard_tab = DashboardTab::Learning;
                             app.enter_dashboard();
                         }
+                        KeyCode::Char('s') => app.enter_search(),
                         KeyCode::Char('r') => {
                             app.refresh_dashboard();
                             app.system_last_poll = Instant::now()
@@ -1198,7 +1531,7 @@ pub fn run() -> io::Result<()> {
                     app.shutdown_exit_after = false;
                 }
             }
-            if matches!(app.screen, Screen::Dashboard) {
+            if matches!(app.screen, Screen::Dashboard | Screen::Search) {
                 app.refresh_dashboard();
                 if app.shutdown_requested {
                     app.status = "cancelling… waiting for shutdown | r refresh".to_string();
@@ -1222,6 +1555,87 @@ fn handle_config_key(app: &mut App, k: crossterm::event::KeyEvent) {
     // Keep status help fresh as mode changes.
     app.status = config_help(&app.form);
 
+    fn is_field_visible(cfg: &yz_core::Config, f: FieldId) -> bool {
+        // Keep in sync with `render_config_lines`.
+        if matches!(f, FieldId::MctsTempT1 | FieldId::MctsTempCutoffTurn)
+            && matches!(cfg.mcts.temperature_schedule, TemperatureSchedule::Constant { .. })
+        {
+            return false;
+        }
+        if f == FieldId::TrainingEpochs && cfg.training.steps_per_iteration.is_some() {
+            return false;
+        }
+        if f == FieldId::TrainingStepsPerIteration && cfg.training.steps_per_iteration.is_none() {
+            return false;
+        }
+        if f == FieldId::TrainingResetOptimizer && cfg.training.continuous_candidate_training {
+            return false;
+        }
+        if f == FieldId::GatingGames && cfg.gating.katago.sprt {
+            return false;
+        }
+        if matches!(
+            f,
+            FieldId::GatingKatagoSprtMinGames
+                | FieldId::GatingKatagoSprtMaxGames
+                | FieldId::GatingKatagoSprtAlpha
+                | FieldId::GatingKatagoSprtBeta
+                | FieldId::GatingKatagoSprtDelta
+        ) && !cfg.gating.katago.sprt
+        {
+            return false;
+        }
+        true
+    }
+
+    fn ensure_selected_visible(app: &mut App) {
+        if ALL_FIELDS.is_empty() {
+            app.form.selected_idx = 0;
+            return;
+        }
+        let mut sel = app.form.selected_idx.min(ALL_FIELDS.len().saturating_sub(1));
+        if is_field_visible(&app.cfg, ALL_FIELDS[sel]) {
+            app.form.selected_idx = sel;
+            return;
+        }
+        // Prefer scanning forward so navigation feels natural.
+        for i in sel..ALL_FIELDS.len() {
+            if is_field_visible(&app.cfg, ALL_FIELDS[i]) {
+                app.form.selected_idx = i;
+                return;
+            }
+        }
+        // Fallback: scan backward.
+        while sel > 0 {
+            sel -= 1;
+            if is_field_visible(&app.cfg, ALL_FIELDS[sel]) {
+                app.form.selected_idx = sel;
+                return;
+            }
+        }
+        app.form.selected_idx = 0;
+    }
+
+    fn step_selection(app: &mut App, dir: i32) {
+        if ALL_FIELDS.is_empty() {
+            app.form.selected_idx = 0;
+            return;
+        }
+        let mut i = app.form.selected_idx as i32;
+        loop {
+            i += dir.signum();
+            if i < 0 || i >= ALL_FIELDS.len() as i32 {
+                break;
+            }
+            let idx = i as usize;
+            if is_field_visible(&app.cfg, ALL_FIELDS[idx]) {
+                app.form.selected_idx = idx;
+                break;
+            }
+        }
+    }
+
+    ensure_selected_visible(app);
     let sel = app
         .form
         .selected_idx
@@ -1261,14 +1675,10 @@ fn handle_config_key(app: &mut App, k: crossterm::event::KeyEvent) {
         },
         EditMode::View => match k.code {
             KeyCode::Up => {
-                if app.form.selected_idx > 0 {
-                    app.form.selected_idx -= 1;
-                }
+                step_selection(app, -1);
             }
             KeyCode::Down => {
-                if app.form.selected_idx + 1 < ALL_FIELDS.len() {
-                    app.form.selected_idx += 1;
-                }
+                step_selection(app, 1);
             }
             KeyCode::Tab => jump_section(app, 1),
             KeyCode::BackTab => jump_section(app, -1),
@@ -1283,6 +1693,8 @@ fn handle_config_key(app: &mut App, k: crossterm::event::KeyEvent) {
         },
     }
 
+    // Config changes can hide/show fields; never leave the cursor on a hidden field.
+    ensure_selected_visible(app);
     app.status = config_help(&app.form);
 }
 
@@ -1295,18 +1707,77 @@ fn jump_section(app: &mut App, dir: i32) {
     let cur_idx = Section::ALL.iter().position(|s| *s == cur).unwrap_or(0) as i32;
     let next_idx = (cur_idx + dir).rem_euclid(Section::ALL.len() as i32) as usize;
     let next = Section::ALL[next_idx];
+    // Jump to the first *visible* field in that section.
     if let Some(pos) = ALL_FIELDS.iter().position(|f| f.section() == next) {
         app.form.selected_idx = pos;
+        // If the first field is hidden under current config, scan forward within the section.
+        for i in pos..ALL_FIELDS.len() {
+            let f = ALL_FIELDS[i];
+            if f.section() != next {
+                break;
+            }
+            // Reuse the same visibility logic as the config renderer.
+            let visible = !((matches!(f, FieldId::MctsTempT1 | FieldId::MctsTempCutoffTurn)
+                && matches!(app.cfg.mcts.temperature_schedule, TemperatureSchedule::Constant { .. }))
+                || (f == FieldId::TrainingEpochs && app.cfg.training.steps_per_iteration.is_some())
+                || (f == FieldId::TrainingStepsPerIteration
+                    && app.cfg.training.steps_per_iteration.is_none()));
+            if visible {
+                app.form.selected_idx = i;
+                break;
+            }
+        }
     }
 }
 
 fn toggle_or_cycle(app: &mut App, field: FieldId) {
+    fn list_seed_sets() -> Vec<String> {
+        use std::path::PathBuf;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/seed_sets");
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("txt") {
+                    continue;
+                }
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     match field {
+        FieldId::GatingSeedSetId => {
+            // Space-cycle over available seed set ids: None -> first -> ... -> None.
+            let sets = list_seed_sets();
+            if sets.is_empty() {
+                // Fallback: toggle between None and dev_v1.
+                app.cfg.gating.seed_set_id = match app.cfg.gating.seed_set_id.as_deref() {
+                    Some(s) if !s.is_empty() => None,
+                    _ => Some("dev_v1".to_string()),
+                };
+            } else {
+                let cur = app.cfg.gating.seed_set_id.clone().unwrap_or_default();
+                let idx = sets.iter().position(|s| *s == cur);
+                app.cfg.gating.seed_set_id = match idx {
+                    None => Some(sets[0].clone()),
+                    Some(i) if i + 1 < sets.len() => Some(sets[i + 1].clone()),
+                    _ => None,
+                };
+            }
+        }
         FieldId::GatingPairedSeedSwap => {
             app.cfg.gating.paired_seed_swap = !app.cfg.gating.paired_seed_swap;
         }
         FieldId::GatingDeterministicChance => {
             app.cfg.gating.deterministic_chance = !app.cfg.gating.deterministic_chance;
+        }
+        FieldId::GatingKatagoSprt => {
+            app.cfg.gating.katago.sprt = !app.cfg.gating.katago.sprt;
         }
         FieldId::InferDevice => {
             // Cycle: cpu → mps → cuda → cpu
@@ -1342,7 +1813,7 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 TemperatureSchedule::Constant { .. } => TemperatureSchedule::Step {
                     t0,
                     t1: 0.1,
-                    cutoff_ply: 10,
+                    cutoff_turn: 10,
                 },
                 TemperatureSchedule::Step { .. } => TemperatureSchedule::Constant { t0 },
             };
@@ -1355,6 +1826,9 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 _ => "q_penalty".to_string(),
             };
         }
+        FieldId::MctsKatagoExpansionLock => {
+            app.cfg.mcts.katago.expansion_lock = !app.cfg.mcts.katago.expansion_lock;
+        }
         FieldId::TrainingMode => {
             // Toggle between epochs mode (steps_per_iteration=None) and steps mode
             if app.cfg.training.steps_per_iteration.is_some() {
@@ -1365,6 +1839,21 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
                 // Default to 500 steps if not set
                 app.cfg.training.steps_per_iteration = Some(500);
             }
+        }
+        FieldId::TrainingContinuousCandidateTraining => {
+            app.cfg.training.continuous_candidate_training =
+                !app.cfg.training.continuous_candidate_training;
+        }
+        FieldId::TrainingResetOptimizer => {
+            app.cfg.training.reset_optimizer = !app.cfg.training.reset_optimizer;
+        }
+        FieldId::TrainingOptimizer => {
+            // Space-cycle: adamw → adam → sgd → adamw
+            app.cfg.training.optimizer = match app.cfg.training.optimizer.to_lowercase().as_str() {
+                "adamw" => "adam".to_string(),
+                "adam" => "sgd".to_string(),
+                _ => "adamw".to_string(),
+            };
         }
         FieldId::ModelKind => {
             // Cycle: residual → mlp → residual
@@ -1513,7 +2002,7 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 "step" => TemperatureSchedule::Step {
                     t0,
                     t1: 0.1,
-                    cutoff_ply: 10,
+                    cutoff_turn: 10,
                 },
                 _ => return Err("temperature kind must be constant|step".to_string()),
             };
@@ -1537,14 +2026,14 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 _ => Err("t1 only applies when kind=step".to_string()),
             }
         }
-        FieldId::MctsTempCutoffPly => {
+        FieldId::MctsTempCutoffTurn => {
             let v = buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
             match &mut cfg.mcts.temperature_schedule {
-                TemperatureSchedule::Step { cutoff_ply, .. } => {
-                    *cutoff_ply = v;
+                TemperatureSchedule::Step { cutoff_turn, .. } => {
+                    *cutoff_turn = v;
                     Ok(())
                 }
-                _ => Err("cutoff_ply only applies when kind=step".to_string()),
+                _ => Err("cutoff_turn only applies when kind=step".to_string()),
             }
         }
         FieldId::MctsVirtualLossMode => {
@@ -1560,6 +2049,20 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
         FieldId::MctsVirtualLoss => {
             cfg.mcts.virtual_loss = buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
             Ok(())
+        }
+        FieldId::MctsKatagoExpansionLock => {
+            let s = buf.trim().to_lowercase();
+            match s.as_str() {
+                "true" | "1" | "yes" | "y" => {
+                    cfg.mcts.katago.expansion_lock = true;
+                    Ok(())
+                }
+                "false" | "0" | "no" | "n" => {
+                    cfg.mcts.katago.expansion_lock = false;
+                    Ok(())
+                }
+                _ => Err("expansion_lock must be true|false".to_string()),
+            }
         }
 
         FieldId::SelfplayGamesPerIteration => {
@@ -1599,6 +2102,22 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
         FieldId::TrainingLearningRate => {
             cfg.training.learning_rate =
                 buf.parse::<f64>().map_err(|_| "invalid f64".to_string())?;
+            Ok(())
+        }
+        FieldId::TrainingContinuousCandidateTraining => {
+            cfg.training.continuous_candidate_training = buf
+                .parse::<bool>()
+                .map_err(|_| "invalid bool".to_string())?;
+            Ok(())
+        }
+        FieldId::TrainingResetOptimizer => {
+            cfg.training.reset_optimizer = buf
+                .parse::<bool>()
+                .map_err(|_| "invalid bool".to_string())?;
+            Ok(())
+        }
+        FieldId::TrainingOptimizer => {
+            cfg.training.optimizer = buf.trim().to_string();
             Ok(())
         }
         FieldId::TrainingEpochs => {
@@ -1650,6 +2169,37 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
             cfg.gating.deterministic_chance = buf
                 .parse::<bool>()
                 .map_err(|_| "invalid bool".to_string())?;
+            Ok(())
+        }
+        FieldId::GatingKatagoSprt => {
+            cfg.gating.katago.sprt = buf
+                .parse::<bool>()
+                .map_err(|_| "invalid bool".to_string())?;
+            Ok(())
+        }
+        FieldId::GatingKatagoSprtMinGames => {
+            cfg.gating.katago.sprt_min_games =
+                buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
+            Ok(())
+        }
+        FieldId::GatingKatagoSprtMaxGames => {
+            cfg.gating.katago.sprt_max_games =
+                buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?;
+            Ok(())
+        }
+        FieldId::GatingKatagoSprtAlpha => {
+            cfg.gating.katago.sprt_alpha =
+                buf.parse::<f64>().map_err(|_| "invalid f64".to_string())?;
+            Ok(())
+        }
+        FieldId::GatingKatagoSprtBeta => {
+            cfg.gating.katago.sprt_beta =
+                buf.parse::<f64>().map_err(|_| "invalid f64".to_string())?;
+            Ok(())
+        }
+        FieldId::GatingKatagoSprtDelta => {
+            cfg.gating.katago.sprt_delta =
+                buf.parse::<f64>().map_err(|_| "invalid f64".to_string())?;
             Ok(())
         }
 
@@ -1731,12 +2281,13 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
             TemperatureSchedule::Step { t1, .. } => format!("{:.4}", t1),
             _ => "(n/a)".to_string(),
         },
-        FieldId::MctsTempCutoffPly => match cfg.mcts.temperature_schedule {
-            TemperatureSchedule::Step { cutoff_ply, .. } => cutoff_ply.to_string(),
+        FieldId::MctsTempCutoffTurn => match cfg.mcts.temperature_schedule {
+            TemperatureSchedule::Step { cutoff_turn, .. } => cutoff_turn.to_string(),
             _ => "(n/a)".to_string(),
         },
         FieldId::MctsVirtualLossMode => cfg.mcts.virtual_loss_mode.clone(),
         FieldId::MctsVirtualLoss => format!("{:.3}", cfg.mcts.virtual_loss),
+        FieldId::MctsKatagoExpansionLock => cfg.mcts.katago.expansion_lock.to_string(),
 
         FieldId::SelfplayGamesPerIteration => cfg.selfplay.games_per_iteration.to_string(),
         FieldId::SelfplayWorkers => cfg.selfplay.workers.to_string(),
@@ -1751,6 +2302,11 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         }
         FieldId::TrainingBatchSize => cfg.training.batch_size.to_string(),
         FieldId::TrainingLearningRate => format!("{:.6}", cfg.training.learning_rate),
+        FieldId::TrainingContinuousCandidateTraining => {
+            cfg.training.continuous_candidate_training.to_string()
+        }
+        FieldId::TrainingResetOptimizer => cfg.training.reset_optimizer.to_string(),
+        FieldId::TrainingOptimizer => cfg.training.optimizer.clone(),
         FieldId::TrainingEpochs => cfg.training.epochs.to_string(),
         FieldId::TrainingWeightDecay => format!("{:.6}", cfg.training.weight_decay),
         FieldId::TrainingStepsPerIteration => cfg
@@ -1765,6 +2321,12 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::GatingWinRateThreshold => format!("{:.4}", cfg.gating.win_rate_threshold),
         FieldId::GatingPairedSeedSwap => cfg.gating.paired_seed_swap.to_string(),
         FieldId::GatingDeterministicChance => cfg.gating.deterministic_chance.to_string(),
+        FieldId::GatingKatagoSprt => cfg.gating.katago.sprt.to_string(),
+        FieldId::GatingKatagoSprtMinGames => cfg.gating.katago.sprt_min_games.to_string(),
+        FieldId::GatingKatagoSprtMaxGames => cfg.gating.katago.sprt_max_games.to_string(),
+        FieldId::GatingKatagoSprtAlpha => format!("{:.4}", cfg.gating.katago.sprt_alpha),
+        FieldId::GatingKatagoSprtBeta => format!("{:.4}", cfg.gating.katago.sprt_beta),
+        FieldId::GatingKatagoSprtDelta => format!("{:.4}", cfg.gating.katago.sprt_delta),
 
         FieldId::ReplayCapacityShards => cfg
             .replay
@@ -1867,6 +2429,10 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
                 (next.mcts.dirichlet_epsilon as f64 + d * inc).clamp(0.0, 1.0) as f32;
             true
         }
+        FieldId::MctsKatagoExpansionLock => {
+            next.mcts.katago.expansion_lock = !next.mcts.katago.expansion_lock;
+            true
+        }
         FieldId::MctsTempT0 => {
             let inc = if step == StepSize::Large { 0.5 } else { 0.1 };
             match &mut next.mcts.temperature_schedule {
@@ -1888,15 +2454,15 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
                 false
             }
         }
-        FieldId::MctsTempCutoffPly => {
+        FieldId::MctsTempCutoffTurn => {
             let inc = if step == StepSize::Large { 10 } else { 1 };
-            if let TemperatureSchedule::Step { cutoff_ply, .. } =
+            if let TemperatureSchedule::Step { cutoff_turn, .. } =
                 &mut next.mcts.temperature_schedule
             {
-                *cutoff_ply = if dir >= 0 {
-                    cutoff_ply.saturating_add(inc)
+                *cutoff_turn = if dir >= 0 {
+                    cutoff_turn.saturating_add(inc)
                 } else {
-                    cutoff_ply.saturating_sub(inc)
+                    cutoff_turn.saturating_sub(inc)
                 };
                 true
             } else {
@@ -2000,6 +2566,39 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
             let inc = if step == StepSize::Large { 0.05 } else { 0.01 };
             next.gating.win_rate_threshold =
                 (next.gating.win_rate_threshold + d * inc).clamp(0.0, 1.0);
+            true
+        }
+        FieldId::GatingKatagoSprtMinGames => {
+            let inc = if step == StepSize::Large { 20 } else { 5 };
+            next.gating.katago.sprt_min_games = if dir >= 0 {
+                next.gating.katago.sprt_min_games.saturating_add(inc)
+            } else {
+                next.gating.katago.sprt_min_games.saturating_sub(inc)
+            };
+            true
+        }
+        FieldId::GatingKatagoSprtMaxGames => {
+            let inc = if step == StepSize::Large { 100 } else { 20 };
+            next.gating.katago.sprt_max_games = if dir >= 0 {
+                next.gating.katago.sprt_max_games.saturating_add(inc)
+            } else {
+                next.gating.katago.sprt_max_games.saturating_sub(inc)
+            };
+            true
+        }
+        FieldId::GatingKatagoSprtAlpha => {
+            let inc = if step == StepSize::Large { 0.05 } else { 0.01 };
+            next.gating.katago.sprt_alpha = (next.gating.katago.sprt_alpha + d * inc).clamp(1e-6, 1.0);
+            true
+        }
+        FieldId::GatingKatagoSprtBeta => {
+            let inc = if step == StepSize::Large { 0.05 } else { 0.01 };
+            next.gating.katago.sprt_beta = (next.gating.katago.sprt_beta + d * inc).clamp(1e-6, 1.0);
+            true
+        }
+        FieldId::GatingKatagoSprtDelta => {
+            let inc = if step == StepSize::Large { 0.02 } else { 0.005 };
+            next.gating.katago.sprt_delta = (next.gating.katago.sprt_delta + d * inc).max(0.0);
             true
         }
         FieldId::ReplayCapacityShards => {
@@ -2196,8 +2795,30 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     }
 
                     // Header row
+                    // Keep header widths in sync with the row formatter below to avoid visual drift.
+                    const W_ITER: usize = 3;
+                    const W_DEC: usize = 8; // "Decision" is 8 chars
+                    const W_GG: usize = 11; // "GatingGames" is 11 chars
+                    const W_WR: usize = 6; // "WinRate" is 6 chars
+                    const W_SCORE: usize = 11; // " 123.4/ 567.8"
+                    const W_ORA: usize = 6; // "Oracle"
                     left.push(Line::from(Span::styled(
-                        " Iter   Decision   WinRate   Score(c/b)   Oracle    Loss (t/p/v)",
+                        format!(
+                            "  {iter:>W_ITER$}   {dec:>W_DEC$}   {gg:>W_GG$}   {wr:>W_WR$}   {sc:>W_SCORE$}   {ora:>W_ORA$}   {loss}",
+                            iter = "Iter",
+                            dec = "Decision",
+                            gg = "GatingGames",
+                            wr = "WinRate",
+                            sc = "Score(c/b)",
+                            ora = "Oracle",
+                            loss = "Loss (t/p/v)",
+                            W_ITER = W_ITER,
+                            W_DEC = W_DEC,
+                            W_GG = W_GG,
+                            W_WR = W_WR,
+                            W_SCORE = W_SCORE,
+                            W_ORA = W_ORA,
+                        ),
                         Style::default().fg(Color::DarkGray),
                     )));
 
@@ -2209,7 +2830,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         // Build iteration rows separately so we can slice for scrolling.
                         let mut iter_rows: Vec<Line> = Vec::new();
                         for it in &m.iterations {
-                            let marker = if it.idx == cur_idx { "▸" } else { " " };
+                            // ASCII marker to avoid wide-char rendering differences across terminals.
+                            let marker = if it.idx == cur_idx { ">" } else { " " };
                             let promo = it
                                 .promoted
                                 .map(|p| if p { "promote" } else { "reject" })
@@ -2219,8 +2841,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                                 .win_rate
                                 .map(|x| format!("{x:.3}"))
                                 .unwrap_or_else(|| "-".to_string());
+                            let gating_games = if it.gate.games_target > 0 {
+                                format!("{}/{}", it.gate.games_completed, it.gate.games_target)
+                            } else {
+                                "-".to_string()
+                            };
                             let score_cb = match (it.gate.mean_cand_score, it.gate.mean_best_score) {
-                                (Some(c), Some(b)) => format!("{c:.1}/{b:.1}"),
+                                (Some(c), Some(b)) => format!("{c:>5.1}/{b:>5.1}"),
                                 _ => "-".to_string(),
                             };
                             let oracle = it
@@ -2251,7 +2878,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             };
                             iter_rows.push(Line::from(Span::styled(
                                 format!(
-                                    "{marker} {:>3}   {promo:>7}   {wr:>6}   {score_cb:>9}   {oracle:>6}   {lt:>5}/{lp:>5}/{lv:>5}",
+                                    "{marker} {:>W_ITER$}   {promo:<W_DEC$}   {gating_games:>W_GG$}   {wr:>W_WR$}   {score_cb:>W_SCORE$}   {oracle:>W_ORA$}   {lt:>5}/{lp:>5}/{lv:>5}",
                                     it.idx
                                 ),
                                 row_style,
@@ -2336,6 +2963,35 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
                 let cur_idx = m.controller_iteration_idx;
                 let cur = m.iterations.iter().find(|it| it.idx == cur_idx);
+                // Persisted provenance (controller writes these at train start / promotion).
+                let best_iter = m
+                    .best_promoted_iter
+                    .or_else(|| {
+                        m.iterations
+                            .iter()
+                            .filter_map(|it| it.promoted.and_then(|p| if p { Some(it.idx) } else { None }))
+                            .max()
+                    })
+                    .unwrap_or(0);
+                if let Some(it) = cur {
+                    let opt = it.train.optimizer_kind.as_deref().unwrap_or("-");
+                    let resumed = it.train.optimizer_resumed.unwrap_or(false);
+                    let src = it
+                        .train
+                        .init_from
+                        .as_deref()
+                        .unwrap_or("-");
+                    let src_iter = it
+                        .train
+                        .init_from_iter
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    right_lines.push(Line::from(format!(
+                        "best=iter {best_iter} | train: {opt} ({}) from {src}:{src_iter}",
+                        if resumed { "resumed" } else { "reset" }
+                    )));
+                    right_lines.push(Line::from(""));
+                }
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -2391,6 +3047,43 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             let tot = it.gate.games_target.max(1);
                             right_lines.push(Line::from(format!("{done} / {tot} games")));
                             gauge = Some((done as f64 / tot as f64, String::new()));
+
+                            // Gate diagnostics (if available; filled at end of gate, and for SPRT).
+                            if let (Some(w), Some(l), Some(d)) =
+                                (it.gate.wins, it.gate.losses, it.gate.draws)
+                            {
+                                let n = (w + l + d).max(1) as f64;
+                                let wr = (w as f64 + 0.5 * d as f64) / n;
+                                let ci = match (it.gate.win_ci95_low, it.gate.win_ci95_high) {
+                                    (Some(lo), Some(hi)) => format!("  ci95=[{lo:.4},{hi:.4}]"),
+                                    _ => String::new(),
+                                };
+                                right_lines.push(Line::from(format!(
+                                    "W/D/L: {w}/{d}/{l}   win_rate={wr:.4}{ci}"
+                                )));
+                            }
+                            if let Some(s) = it.gate.sprt.as_ref() {
+                                let dec = s
+                                    .decision
+                                    .as_deref()
+                                    .unwrap_or(if s.enabled { "continue" } else { "disabled" });
+                                right_lines.push(Line::from(format!(
+                                    "SPRT: {dec}  llr={:.3}  A={:.3}  B={:.3}",
+                                    s.llr, s.bound_a, s.bound_b
+                                )));
+                                right_lines.push(Line::from(format!(
+                                    "p0/p1={:.3}/{:.3}  min/max={}/{}  Δ={:.3}  α/β={:.3}/{:.3}",
+                                    s.p0, s.p1, s.min_games, s.max_games, s.delta, s.alpha, s.beta
+                                )));
+                                if let Some(reason) = s.decision_reason.as_deref() {
+                                    if !reason.is_empty() {
+                                        right_lines.push(Line::from(format!("sprt_reason: {reason}")));
+                                    }
+                                }
+                            }
+                            if !right_lines.is_empty() {
+                                right_lines.push(Line::from(""));
+                            }
 
                             // Timing stats
                             if let Some(started) = it.gate.started_ts_ms {
@@ -2504,6 +3197,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
             }
         }
+        Screen::Search => {
+            draw_search(f, app, chunks[0]);
+        }
         Screen::System => {
             draw_system(f, app, chunks[0]);
         }
@@ -2522,16 +3218,27 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
         Span::raw(rid.to_string()),
     ]);
 
+    // Layout: reduced sparkline area + full-width replay panel + existing table/details.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(1)].as_ref())
+        .constraints(
+            [
+                Constraint::Length(8),  // sparklines (reduced)
+                Constraint::Length(12), // replay buffer (expanded)
+                Constraint::Min(1),     // table + details
+            ]
+            .as_ref(),
+        )
         .split(area);
+    let spark_area = chunks[0];
+    let replay_area = chunks[1];
+    let bottom_area = chunks[2];
 
-    // Sparklines (2x2)
+    // Sparklines (2 cols x 2 rows)
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(chunks[0]);
+        .split(spark_area);
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -2569,12 +3276,12 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
         },
         0,
     );
-    let top1_p95 = carry_series(
+    let top1_reroll_p95 = carry_series(
         max_iter,
         |i| {
             app.learn_by_iter
                 .get(&(i as u32))
-                .and_then(|x| x.pi_top1_p95)
+                .and_then(|x| x.pi_top1_p95_reroll.or(x.pi_top1_p95))
                 .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
         },
         0,
@@ -2589,16 +3296,26 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
         },
         0,
     );
-    let overturn = carry_series(
+    let illegal_model = carry_series(
         max_iter,
         |i| {
-            app.selfplay_by_iter
+            app.learn_by_iter
                 .get(&(i as u32))
-                .and_then(|x| x.prior_argmax_overturn_rate)
+                .and_then(|x| x.p_illegal_mass_mean)
                 .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
         },
         0,
     );
+    fn age_color(age_iters: u32) -> Color {
+        // Coarse buckets, tuned for readability in terminals.
+        match age_iters {
+            0..=1 => Color::Green,
+            2..=3 => Color::LightGreen,
+            4..=7 => Color::Yellow,
+            8..=15 => Color::LightRed,
+            _ => Color::Red,
+        }
+    }
 
     f.render_widget(
         Sparkline::default()
@@ -2608,28 +3325,285 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
     );
     f.render_widget(
         Sparkline::default()
-            .block(Block::default().title("top1 p95 (target)").borders(Borders::ALL))
-            .data(&top1_p95),
+            .block(
+                Block::default()
+                    .title("top1 p95 (target, reroll)")
+                    .borders(Borders::ALL),
+            )
+            .data(&top1_reroll_p95),
         left[1],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("illegal mass (model)").borders(Borders::ALL))
+            .data(&illegal_model),
+        right[0],
     );
     f.render_widget(
         Sparkline::default()
             .block(Block::default().title("ECE").borders(Borders::ALL))
             .data(&ece),
-        right[0],
-    );
-    f.render_widget(
-        Sparkline::default()
-            .block(Block::default().title("overturn rate").borders(Borders::ALL))
-            .data(&overturn),
         right[1],
     );
+
+    // Replay buffer panel (full width): composition + config + derived training info.
+    //
+    // This must handle varying replay.capacity_shards. When there are too many shards to render
+    // as one cell each, switch to a compact strip + histogram.
+    let mut buf_lines: Vec<Line> = Vec::new();
+    let buf_title = if let Some(max_i) = app.replay_max_snapshot_iter {
+        format!("Replay buffer  snap≤{max_i}")
+    } else {
+        "Replay buffer".to_string()
+    };
+    if let Some(e) = &app.replay_err {
+        buf_lines.push(Line::from(format!("(unavailable: {e})")));
+    } else if app.replay_current.is_empty() {
+        buf_lines.push(Line::from("(no shards yet)"));
+    } else {
+        let cur_iter = app.replay_max_snapshot_iter.unwrap_or(0);
+        let inner_w = replay_area.width.saturating_sub(2) as usize;
+        let inner_h = replay_area.height.saturating_sub(2) as usize;
+
+        let shards = &app.replay_current;
+        let n = shards.len();
+        let cap = app
+            .cfg
+            .replay
+            .capacity_shards
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let total_samples_cur = app.replay_total_samples_current.unwrap_or(0);
+        let avg_samples = if n > 0 {
+            total_samples_cur as f64 / n as f64
+        } else {
+            0.0
+        };
+
+        // Training config + derived steps.
+        let bs = app.cfg.training.batch_size.max(1) as u64;
+        let epochs = app.cfg.training.epochs.max(1) as u64;
+        let steps_mode = app.cfg.training.steps_per_iteration.is_some();
+        let sample_mode = app.cfg.training.sample_mode.as_str();
+        let steps_cfg = app.cfg.training.steps_per_iteration.unwrap_or(0) as u64;
+
+        // Prefer total_samples from the active iteration's learn_summary; fall back to latest; then current buffer sum.
+        let active_idx = app.dashboard_manifest.as_ref().map(|m| {
+            let cur = m.controller_iteration_idx;
+            if m.iterations.iter().any(|it| it.idx == cur) {
+                cur
+            } else {
+                cur.saturating_sub(1)
+            }
+        });
+        let total_samples_train = active_idx
+            .and_then(|i| app.learn_by_iter.get(&i).and_then(|x| x.total_samples))
+            .or_else(|| {
+                app.learn_by_iter
+                    .keys()
+                    .max()
+                    .and_then(|i| app.learn_by_iter.get(i).and_then(|x| x.total_samples))
+            })
+            .unwrap_or(total_samples_cur);
+        let epoch_steps = (total_samples_train + bs - 1) / bs;
+        let steps_derived = if steps_mode {
+            steps_cfg
+        } else {
+            epochs.saturating_mul(epoch_steps)
+        };
+
+        buf_lines.push(Line::from(format!(
+            "capacity_shards={cap} | shards_present={n} | samples≈{total_samples_cur} (avg≈{avg_samples:.0}/shard)"
+        )));
+        if steps_mode {
+            buf_lines.push(Line::from(format!(
+                "training: mode=steps  steps/iter={steps_cfg}  batch={bs}  sample_mode={sample_mode}"
+            )));
+        } else {
+            buf_lines.push(Line::from(format!(
+                "training: mode=epochs  epochs={epochs}  batch={bs}  sample_mode={sample_mode}"
+            )));
+        }
+        buf_lines.push(Line::from(format!(
+            "derived: total_samples≈{total_samples_train}  epoch_steps≈{epoch_steps}  steps_target≈{steps_derived}"
+        )));
+
+        // Composition histogram for CURRENT buffer: shards and samples by origin iter (top-K newest + old + unknown).
+        let mut count_by_iter: HashMap<u32, u32> = HashMap::new();
+        let mut samples_by_iter: HashMap<u32, u64> = HashMap::new();
+        let mut unknown = 0u32;
+        let mut unknown_samples = 0u64;
+        for sh in shards {
+            match sh.origin_iter {
+                Some(o) => {
+                    *count_by_iter.entry(o).or_insert(0) += 1;
+                    if let Some(ns) = sh.num_samples {
+                        *samples_by_iter.entry(o).or_insert(0) += ns;
+                    }
+                }
+                None => {
+                    unknown += 1;
+                    unknown_samples = unknown_samples.saturating_add(sh.num_samples.unwrap_or(0));
+                }
+            }
+        }
+        let mut keys: Vec<u32> = count_by_iter.keys().copied().collect();
+        keys.sort_unstable();
+        let k = 10usize;
+        let keep = keys.len().min(k);
+        let newest: Vec<u32> = keys.into_iter().rev().take(keep).collect();
+        let newest = {
+            let mut v = newest;
+            v.sort_unstable();
+            v
+        };
+        let mut old_count = 0u32;
+        let mut old_samples = 0u64;
+        let mut old_min: Option<u32> = None;
+        let mut old_max: Option<u32> = None;
+        for (&it, &c) in &count_by_iter {
+            if !newest.contains(&it) {
+                old_count += c;
+                old_samples = old_samples.saturating_add(samples_by_iter.get(&it).copied().unwrap_or(0));
+                old_min = Some(match old_min {
+                    Some(m) => m.min(it),
+                    None => it,
+                });
+                old_max = Some(match old_max {
+                    Some(m) => m.max(it),
+                    None => it,
+                });
+            }
+        }
+        let mut hist1 = String::new();
+        let mut hist2 = String::new();
+        if old_count > 0 {
+            let old_label = match (old_min, old_max) {
+                (Some(a), Some(b)) if a == b => format!("{a}"),
+                (Some(a), Some(b)) => format!("{a}-{b}"),
+                _ => "old".to_string(),
+            };
+            hist1.push_str(&format!("{old_label}:{old_count}"));
+            hist2.push_str(&format!("{old_label}:{old_samples}"));
+        }
+        for it in newest {
+            let c = count_by_iter.get(&it).copied().unwrap_or(0);
+            let s = samples_by_iter.get(&it).copied().unwrap_or(0);
+            if !hist1.is_empty() {
+                hist1.push_str("  ");
+                hist2.push_str("  ");
+            }
+            hist1.push_str(&format!("{it}:{c}"));
+            hist2.push_str(&format!("{it}:{s}"));
+        }
+        if unknown > 0 {
+            if !hist1.is_empty() {
+                hist1.push_str("  ");
+                hist2.push_str("  ");
+            }
+            hist1.push_str(&format!("??:{unknown}"));
+            hist2.push_str(&format!("??:{unknown_samples}"));
+        }
+        if hist1.len() > inner_w {
+            hist1.truncate(inner_w.saturating_sub(1));
+            hist1.push('…');
+        }
+        if hist2.len() > inner_w {
+            hist2.truncate(inner_w.saturating_sub(1));
+            hist2.push('…');
+        }
+        buf_lines.push(Line::from(Span::styled(
+            "origin_shards (iter:count):",
+            Style::default().fg(Color::DarkGray),
+        )));
+        buf_lines.push(Line::from(hist1));
+        buf_lines.push(Line::from(Span::styled(
+            "origin_samples (iter:samples):",
+            Style::default().fg(Color::DarkGray),
+        )));
+        buf_lines.push(Line::from(hist2));
+
+        // Age summary (in iterations) for current buffer.
+        let mut ages: Vec<u32> = shards
+            .iter()
+            .filter_map(|sh| sh.origin_iter.map(|o| cur_iter.saturating_sub(o)))
+            .collect();
+        ages.sort_unstable();
+        if !ages.is_empty() {
+            let p50 = ages[ages.len() / 2];
+            let idx95 = (ages.len().saturating_mul(95)) / 100;
+            let p95 = ages[idx95.min(ages.len().saturating_sub(1))];
+            buf_lines.push(Line::from(format!(
+                "age(iters): p50={p50}  p95={p95}  (newer=greener)"
+            )));
+        }
+
+        // Grid: show per-shard cells labeled as `i<iter>:<samples>` (colored by age).
+        let header_lines = buf_lines.len();
+        let remaining_h = inner_h.saturating_sub(header_lines).max(1);
+        let cell_w = 10usize; // e.g. "i49:0575 "
+        let cells_per_row = (inner_w / cell_w).max(1);
+        let max_rows = remaining_h;
+        let can_show_all = n <= cells_per_row.saturating_mul(max_rows);
+
+        if can_show_all {
+            let mut idx = 0usize;
+            for _row in 0..max_rows {
+                if idx >= n {
+                    break;
+                }
+                let end = (idx + cells_per_row).min(n);
+                let mut spans: Vec<Span> = Vec::new();
+                for sh in &shards[idx..end] {
+                    let cell = match (sh.origin_iter, sh.num_samples) {
+                        (Some(o), Some(ns)) => format!("i{o}:{ns}"),
+                        (Some(o), None) => format!("i{o}:?"),
+                        (None, Some(ns)) => format!("i??:{ns}"),
+                        (None, None) => "i??:?".to_string(),
+                    };
+                    let age = sh.origin_iter.map(|o| cur_iter.saturating_sub(o)).unwrap_or(1_000_000);
+                    let mut s = cell;
+                    // Pad/truncate to fixed width-1 then add a spacer.
+                    let pad_w = cell_w.saturating_sub(1);
+                    if s.len() > pad_w {
+                        s.truncate(pad_w.saturating_sub(1));
+                        s.push('…');
+                    }
+                    spans.push(Span::styled(
+                        format!("{s:<pad_w$} ", pad_w = pad_w),
+                        Style::default().fg(age_color(age)).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                buf_lines.push(Line::from(spans));
+                idx = end;
+            }
+        } else {
+            // Compact fallback: downsampled strip (color by age) + rely on histogram above.
+            let strip_w = inner_w.saturating_sub(6).max(1);
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled("buf: ", Style::default().fg(Color::DarkGray)));
+            for i in 0..strip_w {
+                let idx = (i as u64 * n as u64 / strip_w as u64) as usize;
+                let idx = idx.min(n.saturating_sub(1));
+                let sh = &shards[idx];
+                let age = sh.origin_iter.map(|o| cur_iter.saturating_sub(o)).unwrap_or(1_000_000);
+                spans.push(Span::styled("■", Style::default().fg(age_color(age))));
+            }
+            buf_lines.push(Line::from(spans));
+            buf_lines.push(Line::from(format!(
+                "grid omitted ({n} shards); see origin histogram above"
+            )));
+        }
+    }
+    let p =
+        Paragraph::new(buf_lines).block(Block::default().title(buf_title).borders(Borders::ALL));
+    f.render_widget(p, replay_area);
 
     // Bottom: table + details.
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)].as_ref())
-        .split(chunks[1]);
+        .split(bottom_area);
     let table_area = bottom[0];
     let detail_area = bottom[1];
 
@@ -2641,6 +3615,7 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
     const W_STALE: usize = 7;
     const W_PI: usize = 5;
     const W_TOP1: usize = 5;
+    const W_EFFA: usize = 5;
     const W_KL: usize = 5;
     const W_OVR: usize = 5;
     const W_VMEAN: usize = 5;
@@ -2649,13 +3624,14 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
 
     lines.push(Line::from(Span::styled(
         format!(
-            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {top1:>W_TOP1$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {ill:>W_ILL$}",
+            "  {idx:>W_IDX$}  {dec:<W_DEC$}  {wr:>W_WR$}  {stale:>W_STALE$}  {pi:>W_PI$}  {top1:>W_TOP1$}  {effa:>W_EFFA$}  {kl:>W_KL$}  {ovr:>W_OVR$}  {vmean:>W_VMEAN$}  {ece:>W_ECE$}  {ill:>W_ILL$}",
             idx = "Iter",
             dec = "Decision",
             wr = "WinRate",
             stale = "Stale95",
             pi = "PiEnt",
             top1 = "Top1%",
+            effa = "EffA",
             kl = "KL",
             ovr = "Ovr%",
             vmean = "Vmean",
@@ -2716,6 +3692,7 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 let stale95 = fmt_opt_u0(ls.and_then(|x| x.age_wall_s_p95), W_STALE);
                 let pi_ent = fmt_opt_f64(ls.and_then(|x| x.pi_entropy_mean), W_PI, 2);
                 let top1 = fmt_opt_pct(ls.and_then(|x| x.pi_top1_p95), W_TOP1);
+                let effa = fmt_opt_f64(ls.and_then(|x| x.pi_eff_actions_p50), W_EFFA, 1);
                 let kl = fmt_opt_f64(ls.and_then(|x| x.pi_kl_mean), W_KL, 2);
                 let ovr = fmt_opt_pct(ss.and_then(|x| x.prior_argmax_overturn_rate), W_OVR);
                 let vmean = fmt_opt_f64(ls.and_then(|x| x.v_pred_mean), W_VMEAN, 2);
@@ -2768,12 +3745,13 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 }
                 rows.push(Line::from(Span::styled(
                     format!(
-                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {top1}  {kl}  {ovr}  {vmean}  {ece}  {ill}",
+                        "{marker} {idx:>W_IDX$}  {dec:<W_DEC$}  {wr}  {stale:>W_STALE$}  {pi}  {top1}  {effa}  {kl}  {ovr}  {vmean}  {ece}  {ill}",
                         idx = it.idx,
                         dec = promo,
                         stale = stale95,
                         pi = pi_ent,
                         top1 = top1,
+                        effa = effa,
                         kl = kl,
                         ovr = ovr,
                         vmean = vmean,
@@ -2832,11 +3810,38 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 if let Some(v) = ls.pi_entropy_mean {
                     detail.push(Line::from(format!("pi_ent_tgt: {v:.3}")));
                 }
-                if let Some(v) = ls.pi_top1_p95 {
-                    detail.push(Line::from(format!("top1_p95_tgt: {:.1}%", v.clamp(0.0, 1.0) * 100.0)));
+                if let Some(v) = ls.pi_top1_p95_reroll.or(ls.pi_top1_p95) {
+                    detail.push(Line::from(format!(
+                        "top1_p95_reroll_tgt: {:.1}%",
+                        v.clamp(0.0, 1.0) * 100.0
+                    )));
+                }
+                if let Some(v) = ls.pi_top1_p95_mark.or(ls.pi_top1_p95) {
+                    detail.push(Line::from(format!(
+                        "top1_p95_mark_tgt: {:.1}%",
+                        v.clamp(0.0, 1.0) * 100.0
+                    )));
+                }
+                if let Some(v) = ls.pi_entropy_mean_reroll {
+                    detail.push(Line::from(format!("pi_ent_reroll_tgt: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_entropy_mean_mark {
+                    detail.push(Line::from(format!("pi_ent_mark_tgt: {v:.3}")));
                 }
                 if let Some(v) = ls.pi_eff_actions_p50 {
                     detail.push(Line::from(format!("effA_p50_tgt: {v:.1}")));
+                }
+                if let Some(v) = ls.pi_eff_actions_p50_reroll {
+                    detail.push(Line::from(format!("effA_p50_reroll_tgt: {v:.1}")));
+                }
+                if let Some(v) = ls.pi_eff_actions_p50_mark {
+                    detail.push(Line::from(format!("effA_p50_mark_tgt: {v:.1}")));
+                }
+                if let Some(v) = ls.pi_entropy_norm_p50 {
+                    detail.push(Line::from(format!("Hnorm_p50_tgt: {v:.3}")));
+                }
+                if let Some(v) = ls.n_legal_p50 {
+                    detail.push(Line::from(format!("n_legal_p50: {v:.0}")));
                 }
                 if let Some(v) = ls.pi_illegal_mass_mean {
                     detail.push(Line::from(format!(
@@ -2855,6 +3860,18 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 }
                 if let Some(v) = ls.pi_kl_mean {
                     detail.push(Line::from(format!("pi_KL: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_model_entropy_legal_mean {
+                    detail.push(Line::from(format!("pi_ent_model_legal: {v:.3}")));
+                }
+                if let Some(v) = ls.pi_kl_legal_mean {
+                    detail.push(Line::from(format!("pi_KL_legal: {v:.3}")));
+                }
+                if let Some(v) = ls.p_top1_legal_p95 {
+                    detail.push(Line::from(format!(
+                        "p_top1_p95_legal: {:.1}%",
+                        v.clamp(0.0, 1.0) * 100.0
+                    )));
                 }
                 if let Some(v) = ls.pi_entropy_gap_mean {
                     detail.push(Line::from(format!("ent_gap: {v:.3}")));
@@ -2964,33 +3981,113 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
     #[derive(Clone)]
     enum Row {
         Header(&'static str),
+        SubHeader(&'static str),
         Field(FieldId),
         Spacer,
         Error(String),
     }
 
     let mut rows: Vec<Row> = Vec::new();
+    fn is_visible(cfg: &yz_core::Config, f: FieldId) -> bool {
+        // Hide step-only fields when not applicable.
+        if matches!(f, FieldId::MctsTempT1 | FieldId::MctsTempCutoffTurn)
+            && matches!(cfg.mcts.temperature_schedule, TemperatureSchedule::Constant { .. })
+        {
+            return false;
+        }
+        // Hide epochs field when in steps mode.
+        if f == FieldId::TrainingEpochs && cfg.training.steps_per_iteration.is_some() {
+            return false;
+        }
+        // Hide steps_per_iteration field when in epochs mode.
+        if f == FieldId::TrainingStepsPerIteration && cfg.training.steps_per_iteration.is_none() {
+            return false;
+        }
+        // Continuous training: reset_optimizer is ignored, so hide it.
+        if f == FieldId::TrainingResetOptimizer && cfg.training.continuous_candidate_training {
+            return false;
+        }
+        // SPRT: show either fixed-games or sprt knobs.
+        if f == FieldId::GatingGames && cfg.gating.katago.sprt {
+            return false;
+        }
+        if matches!(
+            f,
+            FieldId::GatingKatagoSprtMinGames
+                | FieldId::GatingKatagoSprtMaxGames
+                | FieldId::GatingKatagoSprtAlpha
+                | FieldId::GatingKatagoSprtBeta
+                | FieldId::GatingKatagoSprtDelta
+        ) && !cfg.gating.katago.sprt
+        {
+            return false;
+        }
+        true
+    }
+
+    // Top-level sections, with Pipeline subheaders.
     for sec in Section::ALL {
         rows.push(Row::Header(sec.title()));
-        for f in ALL_FIELDS.iter().copied().filter(|f| f.section() == sec) {
-            // Hide step-only fields when not applicable.
-            if matches!(f, FieldId::MctsTempT1 | FieldId::MctsTempCutoffPly)
-                && matches!(
-                    app.cfg.mcts.temperature_schedule,
-                    TemperatureSchedule::Constant { .. }
-                )
-            {
-                continue;
+        match sec {
+            Section::Pipeline => {
+                // Controller-level pipeline control.
+                rows.push(Row::Field(FieldId::ControllerTotalIterations));
+                rows.push(Row::Spacer);
+                rows.push(Row::SubHeader("selfplay"));
+                for f in [
+                    FieldId::SelfplayGamesPerIteration,
+                    FieldId::SelfplayWorkers,
+                    FieldId::SelfplayThreadsPerWorker,
+                ] {
+                    if is_visible(&app.cfg, f) {
+                        rows.push(Row::Field(f));
+                    }
+                }
+                rows.push(Row::Spacer);
+                rows.push(Row::SubHeader("training"));
+                for f in [
+                    FieldId::TrainingMode,
+                    FieldId::TrainingBatchSize,
+                    FieldId::TrainingLearningRate,
+                    FieldId::TrainingContinuousCandidateTraining,
+                    FieldId::TrainingResetOptimizer,
+                    FieldId::TrainingOptimizer,
+                    FieldId::TrainingEpochs,
+                    FieldId::TrainingWeightDecay,
+                    FieldId::TrainingStepsPerIteration,
+                ] {
+                    if is_visible(&app.cfg, f) {
+                        rows.push(Row::Field(f));
+                    }
+                }
+                rows.push(Row::Spacer);
+                rows.push(Row::SubHeader("gating"));
+                for f in [
+                    FieldId::GatingKatagoSprt,
+                    FieldId::GatingGames,
+                    FieldId::GatingKatagoSprtMinGames,
+                    FieldId::GatingKatagoSprtMaxGames,
+                    FieldId::GatingKatagoSprtAlpha,
+                    FieldId::GatingKatagoSprtBeta,
+                    FieldId::GatingKatagoSprtDelta,
+                    FieldId::GatingSeedSetId,
+                    FieldId::GatingSeed,
+                    FieldId::GatingPairedSeedSwap,
+                    FieldId::GatingDeterministicChance,
+                    FieldId::GatingWinRateThreshold,
+                ] {
+                    if is_visible(&app.cfg, f) {
+                        rows.push(Row::Field(f));
+                    }
+                }
             }
-            // Hide epochs field when in steps mode.
-            if f == FieldId::TrainingEpochs && app.cfg.training.steps_per_iteration.is_some() {
-                continue;
+            _ => {
+                for f in ALL_FIELDS.iter().copied().filter(|f| f.section() == sec) {
+                    if is_visible(&app.cfg, f) {
+                        rows.push(Row::Field(f));
+                    }
+                }
             }
-            // Hide steps_per_iteration field when in epochs mode.
-            if f == FieldId::TrainingStepsPerIteration && app.cfg.training.steps_per_iteration.is_none() {
-                continue;
-            }
-            rows.push(Row::Field(f));
         }
         rows.push(Row::Spacer);
     }
@@ -3039,6 +4136,12 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
+                )]));
+            }
+            Row::SubHeader(t) => {
+                out.push(Line::from(vec![Span::styled(
+                    format!("  {t}"),
+                    Style::default().fg(Color::DarkGray),
                 )]));
             }
             Row::Spacer => out.push(Line::from("")),
@@ -3385,6 +4488,379 @@ fn derive_rates(
     *prev_flush_full_total = flush_full_total;
     *prev_flush_deadline_total = flush_deadline_total;
     (rps, bps, mean, full_s, dead_s)
+}
+
+fn draw_search(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
+    let title = Line::from(vec![
+        Span::styled("Search / MCTS", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(rid.to_string()),
+    ]);
+
+    let Some(m) = app.dashboard_manifest.as_ref() else {
+        let p = Paragraph::new(vec![
+            title,
+            Line::from(""),
+            Line::from(" (run.json not loaded yet)"),
+            Line::from(""),
+            Line::from("Tip: start an iteration, then press r to refresh."),
+        ])
+        .block(Block::default().borders(Borders::ALL));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(18), Constraint::Min(1)].as_ref())
+        .split(area);
+
+    let max_iter = m.iterations.len().max(1);
+
+    fn carry_series(
+        len: usize,
+        mut get: impl FnMut(usize) -> Option<u64>,
+        default: u64,
+    ) -> Vec<u64> {
+        let mut out = Vec::with_capacity(len);
+        let mut last = default;
+        for i in 0..len {
+            if let Some(v) = get(i) {
+                last = v;
+            }
+            out.push(last);
+        }
+        out
+    }
+
+    let hnorm_p50 = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.visit_entropy_norm_p50)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
+        },
+        0,
+    );
+    let late_discard = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.late_eval_discard_frac)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
+        },
+        0,
+    );
+    let pending_coll = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.pending_collisions_per_move)
+                .map(|v| (v.clamp(0.0, 10.0) * 1000.0) as u64)
+        },
+        0,
+    );
+    let noise_flip = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.noise_argmax_flip_rate)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
+        },
+        0,
+    );
+    let delta_v = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.delta_root_value_mean)
+                .map(|v| ((v.clamp(-1.0, 1.0) + 1.0) * 1000.0) as u64)
+        },
+        1000,
+    );
+    let top1_p95 = carry_series(
+        max_iter,
+        |i| {
+            app.selfplay_by_iter
+                .get(&(i as u32))
+                .and_then(|x| x.pi_max_p_p95)
+                .map(|v| (v.clamp(0.0, 1.0) * 1000.0) as u64)
+        },
+        0,
+    );
+
+    // Top: 2×3 sparklines
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(chunks[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(top[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(top[1]);
+
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("visit_entropy_norm_p50 x1000").borders(Borders::ALL))
+            .data(&hnorm_p50),
+        left[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("late_eval_discard_frac x1000").borders(Borders::ALL))
+            .data(&late_discard),
+        left[1],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("pending_collisions/move x1000").borders(Borders::ALL))
+            .data(&pending_coll),
+        left[2],
+    );
+
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("noise_argmax_flip_rate x1000").borders(Borders::ALL))
+            .data(&noise_flip),
+        right[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("delta_root_value_mean (+1)*1000").borders(Borders::ALL))
+            .data(&delta_v),
+        right[1],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().title("max_p95_visit x1000").borders(Borders::ALL))
+            .data(&top1_p95),
+        right[2],
+    );
+
+    // Bottom: table + details
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+        .split(chunks[1]);
+
+    fn fmt_opt_f64(v: Option<f64>, width: usize, prec: usize) -> String {
+        match v {
+            Some(x) if x.is_finite() => format!("{x:>width$.prec$}", width = width, prec = prec),
+            _ => format!("{:>width$}", "-", width = width),
+        }
+    }
+    fn fmt_opt_pct(v: Option<f64>, width: usize) -> String {
+        match v {
+            Some(x) if x.is_finite() => {
+                let p = x.clamp(0.0, 1.0) * 100.0;
+                format!("{p:>width$.1}", width = width)
+            }
+            _ => format!("{:>width$}", "-", width = width),
+        }
+    }
+
+    let cur_idx = m.controller_iteration_idx;
+    let mut sel = app.search_selected_iter;
+    if max_iter > 0 {
+        sel = sel.min((max_iter as u32).saturating_sub(1));
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(title);
+    lines.push(Line::from(""));
+
+    // Header
+    const W_IDX: usize = 4;
+    const W_H: usize = 5;
+    const W_LATE: usize = 6;
+    const W_COLL: usize = 6;
+    const W_FLIP: usize = 6;
+    const W_DV: usize = 7;
+    const W_TOP1: usize = 7;
+    const W_OVR: usize = 6;
+    const W_KL: usize = 5;
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {sel:>1}   {cur:>1}  {idx:>W_IDX$}  {h:>W_H$}  {late:>W_LATE$}  {coll:>W_COLL$}  {flip:>W_FLIP$}  {dv:>W_DV$}  {top1:>W_TOP1$}  {ovr:>W_OVR$}  {kl:>W_KL$}",
+            sel = "S",
+            cur = "C",
+            idx = "Iter",
+            h = "Hn50",
+            late = "late%",
+            coll = "coll",
+            flip = "flip%",
+            dv = "ΔV",
+            top1 = "top1%",
+            ovr = "ovr%",
+            kl = "KL",
+            W_IDX = W_IDX,
+            W_H = W_H,
+            W_LATE = W_LATE,
+            W_COLL = W_COLL,
+            W_FLIP = W_FLIP,
+            W_DV = W_DV,
+            W_TOP1 = W_TOP1,
+            W_OVR = W_OVR,
+            W_KL = W_KL,
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Build all rows then slice for scrolling.
+    let mut rows: Vec<Line> = Vec::new();
+    for it in &m.iterations {
+        let idx = it.idx;
+        let ss = app.selfplay_by_iter.get(&idx);
+        let h = fmt_opt_f64(ss.and_then(|x| x.visit_entropy_norm_p50), W_H, 3);
+        let late = fmt_opt_pct(ss.and_then(|x| x.late_eval_discard_frac), W_LATE);
+        let coll = fmt_opt_f64(ss.and_then(|x| x.pending_collisions_per_move), W_COLL, 3);
+        let flip = fmt_opt_pct(ss.and_then(|x| x.noise_argmax_flip_rate), W_FLIP);
+        let dv = fmt_opt_f64(ss.and_then(|x| x.delta_root_value_mean), W_DV, 3);
+        let top1 = fmt_opt_pct(ss.and_then(|x| x.pi_max_p_p95), W_TOP1);
+        let ovr = fmt_opt_pct(ss.and_then(|x| x.prior_argmax_overturn_rate), W_OVR);
+        let kl = fmt_opt_f64(ss.and_then(|x| x.prior_kl_mean), W_KL, 2);
+
+        // ASCII marker to avoid wide-char rendering differences across terminals.
+        let sel_mark = if idx == sel { ">" } else { " " };
+        let cur_mark = if idx == cur_idx { "*" } else { " " };
+
+        // Light alerting.
+        let mut warn = false;
+        if let Some(v) = ss.and_then(|x| x.visit_entropy_norm_p50) {
+            if v < 0.20 {
+                warn = true;
+            }
+        }
+        if let Some(v) = ss.and_then(|x| x.late_eval_discard_frac) {
+            if v > 0.10 {
+                warn = true;
+            }
+        }
+
+        let mut style = if idx == sel {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        if warn {
+            style = style.fg(Color::Yellow);
+        }
+
+        rows.push(Line::from(Span::styled(
+            format!(
+                "  {sel_mark}   {cur_mark}  {idx:>W_IDX$}  {h}  {late}  {coll}  {flip}  {dv}  {top1}  {ovr}  {kl}",
+            ),
+            style,
+        )));
+    }
+
+    let view_h = cols[0].height.saturating_sub(2) as usize;
+    let view_rows = view_h.saturating_sub(lines.len()).max(1);
+    let sel_pos = m
+        .iterations
+        .iter()
+        .position(|it| it.idx == sel)
+        .unwrap_or(rows.len().saturating_sub(1));
+    let max_start = rows.len().saturating_sub(view_rows);
+    let mut start = if sel_pos < view_rows {
+        0
+    } else {
+        sel_pos.saturating_sub(view_rows * 2 / 3)
+    };
+    start = start.min(max_start);
+    let end = (start + view_rows).min(rows.len());
+    for line in &rows[start..end] {
+        lines.push(line.clone());
+    }
+
+    let p_table = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    f.render_widget(p_table, cols[0]);
+
+    // Details panel
+    let ss = app.selfplay_by_iter.get(&sel);
+    let mut detail: Vec<Line> = Vec::new();
+    detail.push(Line::from(Span::styled(
+        format!("iter {sel}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if let Some(ss) = ss {
+        if let Some(v) = ss.visit_entropy_norm_p50 {
+            detail.push(Line::from(format!("Hnorm_p50: {v:.3}")));
+        }
+        if let Some(v) = ss.pi_max_p_p95 {
+            detail.push(Line::from(format!("max_p95_visit: {:.1}%", v * 100.0)));
+        }
+        if let Some(v) = ss.delta_root_value_mean {
+            detail.push(Line::from(format!("ΔV_mean: {v:+.3}")));
+        }
+        if let Some(v) = ss.late_eval_discard_frac {
+            detail.push(Line::from(format!("late_eval_discard: {:.1}%", v * 100.0)));
+        }
+        if let Some(v) = ss.pending_collisions_per_move {
+            detail.push(Line::from(format!("pending_coll/move: {v:.3}")));
+        }
+        if let Some(v) = ss.noise_argmax_flip_rate {
+            detail.push(Line::from(format!("noise_flip: {:.1}%", v * 100.0)));
+        }
+        if let Some(v) = ss.prior_argmax_overturn_rate {
+            detail.push(Line::from(format!("overturn: {:.1}%", v * 100.0)));
+        }
+        if let Some(v) = ss.prior_kl_mean {
+            detail.push(Line::from(format!("prior_KL: {v:.3}")));
+        }
+
+        // Simple diagnosis hints.
+        let collapse = ss
+            .visit_entropy_norm_p50
+            .is_some_and(|x| x < 0.20)
+            || ss.pi_max_p_p95.is_some_and(|x| x > 0.85);
+        let waste = ss.late_eval_discard_frac.is_some_and(|x| x > 0.10)
+            || ss.pending_collisions_per_move.is_some_and(|x| x > 0.20);
+        let noise_effective = ss.noise_argmax_flip_rate.is_some_and(|x| x > 0.05);
+        let improving = ss.prior_argmax_overturn_rate.is_some_and(|x| x > 0.02)
+            && ss.delta_root_value_mean.is_some_and(|x| x > 0.0);
+
+        detail.push(Line::from(""));
+        detail.push(Line::from(Span::styled(
+            "diagnosis:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        detail.push(Line::from(format!(" collapse: {}", if collapse { "yes" } else { "no" })));
+        detail.push(Line::from(format!(" waste: {}", if waste { "yes" } else { "no" })));
+        detail.push(Line::from(format!(
+            " noise_effective: {}",
+            if noise_effective { "yes" } else { "no" }
+        )));
+        detail.push(Line::from(format!(
+            " improving: {}",
+            if improving { "yes" } else { "no" }
+        )));
+    } else {
+        detail.push(Line::from(""));
+        detail.push(Line::from("(no selfplay_summary for this iteration)"));
+    }
+
+    let p_details =
+        Paragraph::new(detail).block(Block::default().title("Details").borders(Borders::ALL));
+    f.render_widget(p_details, cols[1]);
 }
 
 fn draw_system(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -3740,4 +5216,26 @@ mod learn_summary_parse_tests {
     }
 }
 
-// (no tests)
+#[cfg(test)]
+mod selfplay_summary_parse_tests {
+    use super::SelfplaySummaryNdjsonV1;
+
+    #[test]
+    fn parses_selfplay_summary_minimal() {
+        let s = r#"{"event":"selfplay_summary","iter_idx":2,"moves_executed":1234,"moves_s_mean":99.0,"pending_collisions_per_move":0.01}"#;
+        let v: SelfplaySummaryNdjsonV1 = serde_json::from_str(s).expect("parse");
+        assert_eq!(v.iter_idx, Some(2));
+        assert_eq!(v.moves_executed, Some(1234));
+        assert_eq!(v.pending_collisions_per_move, Some(0.01));
+    }
+
+    #[test]
+    fn parses_selfplay_summary_with_search_quality_fields() {
+        let s = r#"{"event":"selfplay_summary","iter_idx":3,"visit_entropy_norm_p50":0.42,"late_eval_discard_frac":0.07,"delta_root_value_mean":0.03}"#;
+        let v: SelfplaySummaryNdjsonV1 = serde_json::from_str(s).expect("parse");
+        assert_eq!(v.iter_idx, Some(3));
+        assert_eq!(v.visit_entropy_norm_p50, Some(0.42));
+        assert_eq!(v.late_eval_discard_frac, Some(0.07));
+        assert_eq!(v.delta_root_value_mean, Some(0.03));
+    }
+}

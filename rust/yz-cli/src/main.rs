@@ -637,6 +637,7 @@ OPTIONS:
             _ => yz_mcts::VirtualLossMode::QPenalty,
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
+        expansion_lock: cfg.mcts.katago.expansion_lock,
     };
 
     // Replay output is worker-local to avoid collisions.
@@ -793,6 +794,7 @@ OPTIONS:
         pi_entropy_hist: yz_logging::HistogramV1,
         pi_max_p_hist: yz_logging::HistogramV1,
         pi_eff_actions_hist: yz_logging::HistogramV1,
+        visit_entropy_norm_hist: yz_logging::HistogramV1,
 
         // Search scalars.
         root_value_sum: f64,
@@ -802,6 +804,12 @@ OPTIONS:
         fallbacks_nz: u64,
         pending_collisions_sum: u64,
         pending_count_max_hist: yz_logging::HistogramV1,
+
+        // Search quality.
+        delta_root_value_sum: f64,
+        delta_root_value_n: u64,
+        leaf_eval_submitted_sum: u64,
+        leaf_eval_discarded_sum: u64,
 
         // Prior vs visit.
         prior_kl_hist: yz_logging::HistogramV1,
@@ -916,6 +924,7 @@ OPTIONS:
                 pi_entropy_hist: yz_logging::HistogramV1::new(0.0, 4.0, HIST_BINS),
                 pi_max_p_hist: yz_logging::HistogramV1::new(0.0, 1.0, HIST_BINS),
                 pi_eff_actions_hist: yz_logging::HistogramV1::new(0.0, yz_core::A as f64, HIST_BINS),
+                visit_entropy_norm_hist: yz_logging::HistogramV1::new(0.0, 1.0, HIST_BINS),
                 root_value_sum: 0.0,
                 root_value_sumsq: 0.0,
                 root_value_n: 0,
@@ -923,6 +932,10 @@ OPTIONS:
                 fallbacks_nz: 0,
                 pending_collisions_sum: 0,
                 pending_count_max_hist: yz_logging::HistogramV1::new(0.0, 32.0, HIST_BINS),
+                delta_root_value_sum: 0.0,
+                delta_root_value_n: 0,
+                leaf_eval_submitted_sum: 0,
+                leaf_eval_discarded_sum: 0,
                 prior_kl_hist: yz_logging::HistogramV1::new(0.0, 3.0, HIST_BINS),
                 prior_kl_sum: 0.0,
                 prior_kl_n: 0,
@@ -969,6 +982,7 @@ OPTIONS:
                 pi_entropy_hist: self.pi_entropy_hist,
                 pi_max_p_hist: self.pi_max_p_hist,
                 pi_eff_actions_hist: self.pi_eff_actions_hist,
+                visit_entropy_norm_hist: Some(self.visit_entropy_norm_hist),
                 root_value_sum: self.root_value_sum,
                 root_value_sumsq: self.root_value_sumsq,
                 root_value_n: self.root_value_n,
@@ -976,6 +990,10 @@ OPTIONS:
                 fallbacks_nz: self.fallbacks_nz,
                 pending_collisions_sum: self.pending_collisions_sum,
                 pending_count_max_hist: self.pending_count_max_hist,
+                delta_root_value_sum: self.delta_root_value_sum,
+                delta_root_value_n: self.delta_root_value_n,
+                leaf_eval_submitted_sum: self.leaf_eval_submitted_sum,
+                leaf_eval_discarded_sum: self.leaf_eval_discarded_sum,
                 prior_kl_hist: self.prior_kl_hist,
                 prior_kl_sum: self.prior_kl_sum,
                 prior_kl_n: self.prior_kl_n,
@@ -1005,6 +1023,19 @@ OPTIONS:
             self.pi_max_p_hist.add(max_p);
             self.pi_eff_actions_hist.add(eff);
 
+            // Normalized root visit entropy: H(pi_visit) / log(n_legal) (clamped to [0,1]).
+            let n_legal = exec
+                .search
+                .root_priors_noisy
+                .as_ref()
+                .or(exec.search.root_priors_raw.as_ref())
+                .map(|p| p.iter().filter(|&&x| x.is_finite() && x > 0.0).count())
+                .unwrap_or_else(|| exec.search.pi.iter().filter(|&&x| x.is_finite() && x > 0.0).count())
+                .max(1);
+            let denom = (n_legal as f64).ln().max(1e-12);
+            let ent_norm = (ent / denom).clamp(0.0, 1.0);
+            self.visit_entropy_norm_hist.add(ent_norm);
+
             // Root value and search stability.
             let rv = exec.search.root_value as f64;
             self.root_value_sum += rv;
@@ -1019,6 +1050,19 @@ OPTIONS:
             self.pending_collisions_sum =
                 self.pending_collisions_sum.saturating_add(exec.search.pending_collisions as u64);
             self.pending_count_max_hist.add(exec.search.pending_count_max as f64);
+
+            // Search quality proxies.
+            let d = exec.search.delta_root_value as f64;
+            if d.is_finite() {
+                self.delta_root_value_sum += d;
+                self.delta_root_value_n = self.delta_root_value_n.saturating_add(1);
+            }
+            self.leaf_eval_submitted_sum = self
+                .leaf_eval_submitted_sum
+                .saturating_add(exec.search.leaf_eval_submitted as u64);
+            self.leaf_eval_discarded_sum = self
+                .leaf_eval_discarded_sum
+                .saturating_add(exec.search.leaf_eval_discarded as u64);
 
             // Search improvement: compare noisy priors to visit pi (when priors present).
             if let Some(prior_noisy) = &exec.search.root_priors_noisy {
@@ -1447,6 +1491,7 @@ OPTIONS:
         train_step: 0,
         best_checkpoint: None,
         candidate_checkpoint: None,
+        best_promoted_iter: None,
         train_last_loss_total: None,
         train_last_loss_policy: None,
         train_last_loss_value: None,
@@ -1455,6 +1500,12 @@ OPTIONS:
         gate_games: None,
         gate_win_rate: None,
         gate_draw_rate: None,
+        gate_wins: None,
+        gate_losses: None,
+        gate_draws: None,
+        gate_ci95_low: None,
+        gate_ci95_high: None,
+        gate_sprt: None,
         gate_seeds_hash: None,
         gate_oracle_match_rate_overall: None,
         gate_oracle_match_rate_mark: None,
@@ -1541,6 +1592,7 @@ OPTIONS:
             _ => yz_mcts::VirtualLossMode::QPenalty,
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
+        expansion_lock: cfg.mcts.katago.expansion_lock,
     };
 
     let mut tasks = Vec::new();
@@ -1788,7 +1840,7 @@ OPTIONS:
 
     let run_dir = PathBuf::from(run_dir);
     let cfg_path = run_dir.join("config.yaml");
-    let cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
+    let mut cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
         eprintln!("Failed to load config.yaml: {e}");
         process::exit(1);
     });
@@ -1839,6 +1891,7 @@ OPTIONS:
             _ => yz_mcts::VirtualLossMode::QPenalty,
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
+        expansion_lock: cfg.mcts.katago.expansion_lock,
     };
 
     // Progress + output directories (mirrors selfplay-worker layout, but under logs_gate_workers).
@@ -1854,6 +1907,12 @@ OPTIONS:
         num_workers: u32,
         games_target: u32,
         games_completed: u32,
+        #[serde(default)]
+        wins: u32,
+        #[serde(default)]
+        losses: u32,
+        #[serde(default)]
+        draws: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         first_game_started_ts_ms: Option<u64>,
         pid: u32,
@@ -1877,6 +1936,9 @@ OPTIONS:
             num_workers,
             games_target,
             games_completed: 0,
+            wins: 0,
+            losses: 0,
+            draws: 0,
             // Gate-worker doesn't have a scheduler heartbeat by default; record first-game-start
             // immediately so the controller/TUI can show setup time accurately.
             first_game_started_ts_ms: Some(first_game_started_ts_ms),
@@ -1887,6 +1949,7 @@ OPTIONS:
 
     struct ProgressSink {
         progress_path: PathBuf,
+        stop_path: PathBuf,
         worker_id: u32,
         num_workers: u32,
         games_target: u32,
@@ -1896,6 +1959,11 @@ OPTIONS:
         first_game_started_ts_ms: Option<u64>,
         first_done_logged: bool,
         last_progress_write: std::time::Instant,
+        last_stop_check: std::time::Instant,
+        stop_seen: bool,
+        wins: u32,
+        losses: u32,
+        draws: u32,
     }
     impl yz_eval::GateProgress for ProgressSink {
         fn on_game_completed(&mut self, completed: u32, _total: u32) {
@@ -1906,6 +1974,9 @@ OPTIONS:
                     num_workers: self.num_workers,
                     games_target: self.games_target,
                     games_completed: completed,
+                    wins: self.wins,
+                    losses: self.losses,
+                    draws: self.draws,
                     first_game_started_ts_ms: self.first_game_started_ts_ms,
                     pid: std::process::id(),
                     ts_ms: yz_logging::now_ms(),
@@ -1929,6 +2000,9 @@ OPTIONS:
         }
 
         fn on_tick(&mut self, stats: &yz_eval::GateTickStats) {
+            self.wins = stats.cand_wins;
+            self.losses = stats.cand_losses;
+            self.draws = stats.draws;
             // Heartbeat progress even before any game finishes, so the controller can surface
             // "waiting for first game" setup vs running time accurately.
             if self.last_progress_write.elapsed() >= std::time::Duration::from_millis(500) {
@@ -1939,6 +2013,9 @@ OPTIONS:
                         num_workers: self.num_workers,
                         games_target: self.games_target,
                         games_completed: stats.games_completed,
+                        wins: stats.cand_wins,
+                        losses: stats.cand_losses,
+                        draws: stats.draws,
                         first_game_started_ts_ms: self.first_game_started_ts_ms,
                         pid: std::process::id(),
                         ts_ms: yz_logging::now_ms(),
@@ -1982,6 +2059,22 @@ OPTIONS:
                 });
                 let _ = w.flush();
             }
+        }
+
+        fn should_stop(&mut self) -> bool {
+            if self.stop_seen {
+                return true;
+            }
+            // Avoid excessive filesystem polling.
+            if self.last_stop_check.elapsed() < std::time::Duration::from_millis(200) {
+                return false;
+            }
+            self.last_stop_check = std::time::Instant::now();
+            if self.stop_path.exists() {
+                self.stop_seen = true;
+                return true;
+            }
+            false
         }
     }
 
@@ -2040,6 +2133,7 @@ OPTIONS:
 
     let mut sink = ProgressSink {
         progress_path: progress_path.clone(),
+        stop_path: run_dir.join("gate_workers").join("stop.json"),
         worker_id,
         num_workers,
         games_target,
@@ -2049,7 +2143,16 @@ OPTIONS:
         first_game_started_ts_ms: Some(first_game_started_ts_ms),
         first_done_logged: false,
         last_progress_write: std::time::Instant::now(),
+        last_stop_check: std::time::Instant::now(),
+        stop_seen: false,
+        wins: 0,
+        losses: 0,
+        draws: 0,
     };
+
+    // IMPORTANT: gate-worker runs a fixed schedule slice. SPRT decisions are made centrally by the controller.
+    // Disable local SPRT logic inside each worker to avoid per-slice early-stop bias.
+    cfg.gating.katago.sprt = false;
 
     let partial = yz_eval::gate_schedule_subset(
         &cfg,
@@ -2078,7 +2181,10 @@ OPTIONS:
             worker_id,
             num_workers,
             games_target,
-            games_completed: games_target,
+            games_completed: partial.games,
+            wins: partial.cand_wins,
+            losses: partial.cand_losses,
+            draws: partial.draws,
             first_game_started_ts_ms: sink.first_game_started_ts_ms,
             pid: std::process::id(),
             ts_ms: yz_logging::now_ms(),
@@ -2240,6 +2346,7 @@ OPTIONS:
             _ => yz_mcts::VirtualLossMode::QPenalty,
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
+        expansion_lock: cfg.mcts.katago.expansion_lock,
     };
 
     let report = yz_eval::gate(
@@ -2258,7 +2365,22 @@ OPTIONS:
     });
 
     let wr = report.win_rate();
-    let decision = if wr + 1e-12 < cfg.gating.win_rate_threshold {
+    let decision = if cfg.gating.katago.sprt {
+        match report.sprt.as_ref().map(|s| s.decision) {
+            Some(yz_eval::SprtDecision::AcceptH1) => "promote",
+            Some(yz_eval::SprtDecision::AcceptH0) => "reject",
+            Some(yz_eval::SprtDecision::InconclusiveMaxGames)
+            | Some(yz_eval::SprtDecision::Continue)
+            | None => {
+                // Fallback to fixed-threshold decision.
+                if wr + 1e-12 < cfg.gating.win_rate_threshold {
+                    "reject"
+                } else {
+                    "promote"
+                }
+            }
+        }
+    } else if wr + 1e-12 < cfg.gating.win_rate_threshold {
         "reject"
     } else {
         "promote"
@@ -2266,25 +2388,36 @@ OPTIONS:
     if let Some(id) = cfg.gating.seed_set_id.as_deref() {
         println!(
             "Seed source: seed_set_id={id} requested_games={}",
-            cfg.gating.games
+            if cfg.gating.katago.sprt {
+                cfg.gating.katago.sprt_max_games
+            } else {
+                cfg.gating.games
+            }
         );
     } else {
         println!(
             "Seed source: seed={} requested_games={}",
-            cfg.gating.seed, cfg.gating.games
+            cfg.gating.seed,
+            if cfg.gating.katago.sprt {
+                cfg.gating.katago.sprt_max_games
+            } else {
+                cfg.gating.games
+            }
         );
     }
     for w in &report.warnings {
         eprintln!("warning: {w}");
     }
     println!(
-        "Gating complete. decision={} games={} wins={} losses={} draws={} win_rate={:.4} mean_score_diff={:.2} se={:.3} ci95=[{:.3},{:.3}] seeds_hash={}",
+        "Gating complete. decision={} games={} wins={} losses={} draws={} win_rate={:.4} win_ci95=[{:.4},{:.4}] mean_score_diff={:.2} se={:.3} ci95=[{:.3},{:.3}] seeds_hash={}",
         decision,
         report.games,
         report.cand_wins,
         report.cand_losses,
         report.draws,
         wr,
+        report.win_rate_ci95_low,
+        report.win_rate_ci95_high,
         report.mean_score_diff(),
         report.score_diff_se,
         report.score_diff_ci95_low,
@@ -2299,6 +2432,34 @@ OPTIONS:
             Ok(mut m) => {
                 m.gate_games = Some(report.games as u64);
                 m.gate_win_rate = Some(wr);
+                m.gate_draw_rate = Some(report.draw_rate);
+                m.gate_wins = Some(report.cand_wins as u64);
+                m.gate_losses = Some(report.cand_losses as u64);
+                m.gate_draws = Some(report.draws as u64);
+                m.gate_ci95_low = Some(report.win_rate_ci95_low);
+                m.gate_ci95_high = Some(report.win_rate_ci95_high);
+                m.gate_sprt = report.sprt.as_ref().map(|s| yz_logging::GateSprtSummaryV1 {
+                    enabled: true,
+                    min_games: s.min_games as u64,
+                    max_games: s.max_games as u64,
+                    alpha: s.alpha,
+                    beta: s.beta,
+                    delta: s.delta,
+                    p0: s.p0,
+                    p1: s.p1,
+                    llr: s.llr,
+                    bound_a: s.bound_a,
+                    bound_b: s.bound_b,
+                    decision: Some(match s.decision {
+                        yz_eval::SprtDecision::Continue => "continue",
+                        yz_eval::SprtDecision::AcceptH1 => "accept_h1",
+                        yz_eval::SprtDecision::AcceptH0 => "accept_h0",
+                        yz_eval::SprtDecision::InconclusiveMaxGames => "inconclusive_max_games",
+                    }
+                    .to_string()),
+                    decision_reason: None,
+                    games_at_decision: Some(s.games_at_decision as u64),
+                });
                 m.gate_seeds_hash = Some(report.seeds_hash.clone());
                 m.gate_oracle_match_rate_overall = Some(report.oracle_match_rate_overall);
                 m.gate_oracle_match_rate_mark = Some(report.oracle_match_rate_mark);

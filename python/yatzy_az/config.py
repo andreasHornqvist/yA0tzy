@@ -64,6 +64,17 @@ class InferenceConfig(BaseModel):
 class MctsConfig(BaseModel):
     """MCTS algorithm configuration."""
 
+    class KataGoConfig(BaseModel):
+        """KataGo-inspired parallel search knobs."""
+
+        expansion_lock: bool = Field(
+            default=False,
+            description=(
+                "If true, avoid selecting in-flight reserved edges when any non-pending legal edge exists "
+                "(reduces parallel herding/collisions)."
+            ),
+        )
+
     c_puct: float = Field(description="PUCT exploration constant")
     budget_reroll: int = Field(description="Simulation budget for reroll decisions")
     budget_mark: int = Field(
@@ -81,7 +92,7 @@ class MctsConfig(BaseModel):
         default_factory=lambda: {"kind": "constant", "t0": 1.0},
         description=(
             "Executed-move temperature schedule (does not affect replay pi targets). "
-            'Example: {"kind":"step","t0":1.0,"t1":0.0,"cutoff_ply":10}'
+            'Example: {"kind":"step","t0":1.0,"t1":0.0,"cutoff_turn":10} (alias: cutoff_ply)'
         ),
     )
     virtual_loss_mode: str = Field(
@@ -96,6 +107,10 @@ class MctsConfig(BaseModel):
     virtual_loss: float = Field(
         default=1.0,
         description="Virtual loss magnitude (used when virtual_loss_mode != off).",
+    )
+    katago: KataGoConfig = Field(
+        default_factory=KataGoConfig,
+        description="KataGo-inspired parallel search knobs.",
     )
 
 
@@ -121,6 +136,24 @@ class TrainingConfig(BaseModel):
 
     batch_size: int = Field(description="Mini-batch size for gradient updates")
     learning_rate: float = Field(description="Learning rate")
+    optimizer: str = Field(
+        default="adamw",
+        description="Optimizer: adamw | adam | sgd",
+    )
+    continuous_candidate_training: bool = Field(
+        default=False,
+        description=(
+            "If true, keep training the candidate continuously across iterations (even on gate rejects). "
+            "Self-play still uses best until promotion."
+        ),
+    )
+    reset_optimizer: bool = Field(
+        default=True,
+        description=(
+            "If true, initialize candidate from best weights with a fresh optimizer each iteration. "
+            "If false, resume from the previous iteration's candidate checkpoint (keeps optimizer state)."
+        ),
+    )
     epochs: int = Field(description="Number of epochs per training iteration")
     weight_decay: float = Field(
         default=0.0, description="Weight decay (L2) for AdamW/SGD (0 disables)"
@@ -184,6 +217,44 @@ class ModelConfig(BaseModel):
     )
 
 
+class GatingKatagoConfig(BaseModel):
+    """KataGo-style gating options (sequential tests like SPRT)."""
+
+    sprt: bool = Field(
+        default=False,
+        description=(
+            "Enable win-rate SPRT (sequential probability ratio test) around "
+            "`gating.win_rate_threshold`."
+        ),
+    )
+    sprt_min_games: int = Field(
+        default=40,
+        description="Minimum number of games to play before SPRT can decide.",
+    )
+    sprt_max_games: int = Field(
+        default=200,
+        description=(
+            "Maximum number of games to play when SPRT is enabled. "
+            "With paired_seed_swap=true you need at least sprt_max_games/2 seeds."
+        ),
+    )
+    sprt_alpha: float = Field(
+        default=0.05,
+        description="SPRT alpha (false promote) target.",
+    )
+    sprt_beta: float = Field(
+        default=0.05,
+        description="SPRT beta (false reject) target.",
+    )
+    sprt_delta: float = Field(
+        default=0.03,
+        description=(
+            "SPRT indifference half-width: p0 = thr - delta, p1 = thr + delta "
+            "(thr = gating.win_rate_threshold)."
+        ),
+    )
+
+
 class GatingConfig(BaseModel):
     """Gating (candidate vs best evaluation) configuration."""
 
@@ -192,7 +263,7 @@ class GatingConfig(BaseModel):
         default=0, description="Base seed for deterministic paired-seed scheduling in gating"
     )
     seed_set_id: str | None = Field(
-        default="dev_v1",
+        default="dev_v2",
         description=(
             "Optional fixed dev seed set id. If set, gating loads "
             "`configs/seed_sets/<id>.txt` and uses those seeds instead of deriving from `seed`."
@@ -210,6 +281,10 @@ class GatingConfig(BaseModel):
             "Use deterministic event-keyed chance stream for gating/eval (optional). "
             "Recommended for reproducible experiments; disable for more realistic variance."
         ),
+    )
+    katago: GatingKatagoConfig = Field(
+        default_factory=GatingKatagoConfig,
+        description="KataGo-style gating options (SPRT, etc).",
     )
 
 

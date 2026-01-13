@@ -525,6 +525,7 @@ fn ensure_manifest(
             train_step: 0,
             best_checkpoint: None,
             candidate_checkpoint: None,
+            best_promoted_iter: None,
             train_last_loss_total: None,
             train_last_loss_policy: None,
             train_last_loss_value: None,
@@ -533,6 +534,12 @@ fn ensure_manifest(
             gate_games: None,
             gate_win_rate: None,
             gate_draw_rate: None,
+            gate_wins: None,
+            gate_losses: None,
+            gate_draws: None,
+            gate_ci95_low: None,
+            gate_ci95_high: None,
+            gate_sprt: None,
             gate_seeds_hash: None,
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
@@ -1048,10 +1055,47 @@ fn finalize_iteration(
 ) -> Result<(), ControllerError> {
     let wr = manifest.gate_win_rate;
     let threshold = cfg.gating.win_rate_threshold;
-    let promoted = wr.map(|x| x >= threshold);
-    let reason = wr
+    let mut promoted = wr.map(|x| x >= threshold);
+    let mut reason = wr
         .map(|x| format!("win_rate={x:.4} threshold={threshold:.4}"))
         .unwrap_or_default();
+
+    // If SPRT gating is enabled and we have diagnostics, prefer the sequential test decision.
+    if cfg.gating.katago.sprt {
+        if let Some(s) = manifest.gate_sprt.as_ref() {
+            let d = s.decision.as_deref().unwrap_or("continue");
+            match d {
+                "accept_h1" => {
+                    promoted = Some(true);
+                }
+                "accept_h0" => {
+                    promoted = Some(false);
+                }
+                "inconclusive_max_games" | "continue" => {
+                    // Fall back to fixed-threshold decision.
+                }
+                _ => {}
+            }
+            let ci = match (manifest.gate_ci95_low, manifest.gate_ci95_high) {
+                (Some(lo), Some(hi)) => format!(" ci95=[{lo:.4},{hi:.4}]"),
+                _ => "".to_string(),
+            };
+            reason = format!(
+                "{} sprt(decision={} llr={:.3} A={:.3} B={:.3} p0={:.3} p1={:.3} games_at_decision={}){}",
+                reason,
+                d,
+                s.llr,
+                s.bound_a,
+                s.bound_b,
+                s.p0,
+                s.p1,
+                s.games_at_decision.unwrap_or(0),
+                ci
+            )
+            .trim()
+            .to_string();
+        }
+    }
 
     let candidate_path = run_dir.join("models").join("candidate.pt");
     let best_path = run_dir.join("models").join("best.pt");
@@ -1061,6 +1105,7 @@ fn finalize_iteration(
         if candidate_path.exists() {
             copy_atomic(&candidate_path, &best_path)?;
             manifest.best_checkpoint = Some("models/best.pt".to_string());
+            manifest.best_promoted_iter = Some(iter_idx);
         } else {
             // Defensive: candidate doesn't exist. Log warning but don't fail.
             eprintln!(
@@ -1074,6 +1119,12 @@ fn finalize_iteration(
         it.ended_ts_ms = Some(yz_logging::now_ms());
         it.gate.win_rate = wr;
         it.gate.draw_rate = manifest.gate_draw_rate;
+        it.gate.wins = manifest.gate_wins;
+        it.gate.losses = manifest.gate_losses;
+        it.gate.draws = manifest.gate_draws;
+        it.gate.win_ci95_low = manifest.gate_ci95_low;
+        it.gate.win_ci95_high = manifest.gate_ci95_high;
+        it.gate.sprt = manifest.gate_sprt.clone();
         it.oracle.match_rate_overall = manifest.gate_oracle_match_rate_overall;
         it.oracle.match_rate_mark = manifest.gate_oracle_match_rate_mark;
         it.oracle.match_rate_reroll = manifest.gate_oracle_match_rate_reroll;
@@ -1188,6 +1239,9 @@ fn emit_selfplay_summary_metrics(
     let mut pi_entropy_hist = summaries[0].pi_entropy_hist.clone();
     let mut pi_max_p_hist = summaries[0].pi_max_p_hist.clone();
     let mut pi_eff_actions_hist = summaries[0].pi_eff_actions_hist.clone();
+    let mut visit_entropy_norm_hist: Option<yz_logging::HistogramV1> = summaries
+        .iter()
+        .find_map(|s| s.visit_entropy_norm_hist.clone());
     let mut pending_count_max_hist = summaries[0].pending_count_max_hist.clone();
     let mut prior_kl_hist = summaries[0].prior_kl_hist.clone();
     let mut noise_kl_hist = summaries[0].noise_kl_hist.clone();
@@ -1199,6 +1253,10 @@ fn emit_selfplay_summary_metrics(
     let mut root_value_n = 0u64;
     let mut fallbacks_nz = 0u64;
     let mut pending_collisions_sum = 0u64;
+    let mut delta_root_value_sum = 0.0f64;
+    let mut delta_root_value_n = 0u64;
+    let mut leaf_eval_submitted_sum = 0u64;
+    let mut leaf_eval_discarded_sum = 0u64;
 
     let mut prior_kl_sum = 0.0f64;
     let mut prior_kl_n = 0u64;
@@ -1218,6 +1276,13 @@ fn emit_selfplay_summary_metrics(
         pi_entropy_hist.merge_inplace(&s.pi_entropy_hist);
         pi_max_p_hist.merge_inplace(&s.pi_max_p_hist);
         pi_eff_actions_hist.merge_inplace(&s.pi_eff_actions_hist);
+        if let Some(h) = &s.visit_entropy_norm_hist {
+            if let Some(dst) = visit_entropy_norm_hist.as_mut() {
+                dst.merge_inplace(h);
+            } else {
+                visit_entropy_norm_hist = Some(h.clone());
+            }
+        }
         pending_count_max_hist.merge_inplace(&s.pending_count_max_hist);
         prior_kl_hist.merge_inplace(&s.prior_kl_hist);
         noise_kl_hist.merge_inplace(&s.noise_kl_hist);
@@ -1229,6 +1294,12 @@ fn emit_selfplay_summary_metrics(
         root_value_n = root_value_n.saturating_add(s.root_value_n);
         fallbacks_nz = fallbacks_nz.saturating_add(s.fallbacks_nz);
         pending_collisions_sum = pending_collisions_sum.saturating_add(s.pending_collisions_sum);
+        delta_root_value_sum += s.delta_root_value_sum;
+        delta_root_value_n = delta_root_value_n.saturating_add(s.delta_root_value_n);
+        leaf_eval_submitted_sum =
+            leaf_eval_submitted_sum.saturating_add(s.leaf_eval_submitted_sum);
+        leaf_eval_discarded_sum =
+            leaf_eval_discarded_sum.saturating_add(s.leaf_eval_discarded_sum);
 
         prior_kl_sum += s.prior_kl_sum;
         prior_kl_n = prior_kl_n.saturating_add(s.prior_kl_n);
@@ -1267,6 +1338,20 @@ fn emit_selfplay_summary_metrics(
     };
     let pending_collisions_per_move = if moves_executed > 0 {
         Some((pending_collisions_sum as f64) / (moves_executed as f64))
+    } else {
+        None
+    };
+
+    let visit_entropy_norm_p50 = visit_entropy_norm_hist
+        .as_ref()
+        .and_then(|h| h.quantile_estimate(0.50));
+    let late_eval_discard_frac = if leaf_eval_submitted_sum > 0 {
+        Some((leaf_eval_discarded_sum as f64) / (leaf_eval_submitted_sum as f64))
+    } else {
+        None
+    };
+    let delta_root_value_mean = if delta_root_value_n > 0 {
+        Some(delta_root_value_sum / (delta_root_value_n as f64))
     } else {
         None
     };
@@ -1319,6 +1404,9 @@ fn emit_selfplay_summary_metrics(
             pi_max_p_p95: pi_max_p_hist.quantile_estimate(0.95),
             pi_eff_actions_p50: pi_eff_actions_hist.quantile_estimate(0.50),
             pi_eff_actions_p95: pi_eff_actions_hist.quantile_estimate(0.95),
+            visit_entropy_norm_p50,
+            late_eval_discard_frac,
+            delta_root_value_mean,
             root_value_mean,
             root_value_std,
             fallbacks_rate,
@@ -1416,7 +1504,9 @@ fn build_train_command(
     let out_models = run_dir_abs.join("models");
     let replay_dir = run_dir_abs.join("replay");
     let best_pt = run_dir_abs.join("models").join("best.pt");
+    let cand_pt = run_dir_abs.join("models").join("candidate.pt");
     let config_yaml = run_dir_abs.join("config.yaml");
+    let run_json = run_dir_abs.join("run.json");
     // Use per-iteration replay snapshots so pruning/new shards never break training.
     // (Trainer will create this snapshot if missing; it is used to freeze the dataset for that iteration.)
     let snapshot_path = run_dir_abs.join(format!("replay_snapshot_iter_{iter_idx:03}.json"));
@@ -1427,6 +1517,37 @@ fn build_train_command(
     let kind = cfg.model.kind.as_str();
     let num_workers = cfg.training.dataloader_workers.to_string();
     let sample_mode = cfg.training.sample_mode.as_str();
+    let optimizer = cfg.training.optimizer.as_str();
+    // Candidate init behavior:
+    //
+    // - continuous_candidate_training=true:
+    //     keep training candidate across rejects -> always resume from candidate.pt if it exists.
+    //     (reset_optimizer is ignored in this mode)
+    //
+    // - continuous_candidate_training=false (default):
+    //     train from best each iter; optionally resume optimizer state only when prev iter promoted
+    //     (so candidate==best) to avoid "training the rejected model" across iterations.
+    let prev_promoted = if iter_idx == 0 {
+        false
+    } else {
+        yz_logging::read_manifest(&run_json)
+            .ok()
+            .map(|m| {
+                m.iterations
+                    .iter()
+                    .find(|it| it.idx == iter_idx.saturating_sub(1))
+                    .and_then(|it| it.promoted)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    };
+    let resume_candidate = if cfg.training.continuous_candidate_training {
+        cand_pt.exists()
+    } else {
+        !cfg.training.reset_optimizer && cand_pt.exists() && prev_promoted
+    };
+    let best_path_arg = best_pt.to_string_lossy().to_string();
+    let cand_path_arg = cand_pt.to_string_lossy().to_string();
 
     if use_uv {
         let mut cmd = std::process::Command::new("uv");
@@ -1442,8 +1563,15 @@ fn build_train_command(
             out_models.to_string_lossy().as_ref(),
             "--config",
             config_yaml.to_string_lossy().as_ref(),
-            "--best",
-            best_pt.to_string_lossy().as_ref(),
+            // Candidate init behavior:
+            // - reset_optimizer=true (default): train starts from best with fresh optimizer
+            // - reset_optimizer=false: train resumes from previous candidate (keeps optimizer state)
+            if resume_candidate { "--resume" } else { "--best" },
+            if resume_candidate {
+                cand_path_arg.as_str()
+            } else {
+                best_path_arg.as_str()
+            },
             "--snapshot",
             snapshot_path.to_string_lossy().as_ref(),
             "--hidden",
@@ -1456,6 +1584,8 @@ fn build_train_command(
             &num_workers,
             "--sample-mode",
             sample_mode,
+            "--optimizer",
+            optimizer,
         ]);
         cmd
     } else {
@@ -1472,8 +1602,12 @@ fn build_train_command(
             out_models.to_string_lossy().as_ref(),
             "--config",
             config_yaml.to_string_lossy().as_ref(),
-            "--best",
-            best_pt.to_string_lossy().as_ref(),
+            if resume_candidate { "--resume" } else { "--best" },
+            if resume_candidate {
+                cand_path_arg.as_str()
+            } else {
+                best_path_arg.as_str()
+            },
             "--snapshot",
             snapshot_path.to_string_lossy().as_ref(),
             "--hidden",
@@ -1486,6 +1620,8 @@ fn build_train_command(
             &num_workers,
             "--sample-mode",
             sample_mode,
+            "--optimizer",
+            optimizer,
         ]);
         cmd
     }
@@ -1610,9 +1746,43 @@ fn run_train_subprocess(
     // Mark train start in iteration summary (merge-safe with trainer updates).
     let started_ts = yz_logging::now_ms();
     update_manifest_atomic(&run_json, |m| {
+        // Compute provenance BEFORE taking a mutable borrow of the current iteration.
+        let best_iter = m
+            .iterations
+            .iter()
+            .filter_map(|it| it.promoted.and_then(|p| if p { Some(it.idx) } else { None }))
+            .max();
+        let prev_promoted = if iter_idx == 0 {
+            false
+        } else {
+            m.iterations
+                .iter()
+                .find(|it| it.idx == iter_idx.saturating_sub(1))
+                .and_then(|it| it.promoted)
+                .unwrap_or(false)
+        };
+        let cand_exists = run_dir.join("models").join("candidate.pt").exists();
+        let resume = if cfg.training.continuous_candidate_training {
+            cand_exists
+        } else {
+            !cfg.training.reset_optimizer && cand_exists && prev_promoted
+        };
+
         if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
             it.train.started_ts_ms = Some(started_ts);
             it.train.ended_ts_ms = None;
+            // Persist train provenance for Dashboard (d).
+            m.best_promoted_iter = best_iter;
+
+            it.train.optimizer_kind = Some(cfg.training.optimizer.clone());
+            it.train.optimizer_resumed = Some(resume);
+            if resume {
+                it.train.init_from = Some("candidate".to_string());
+                it.train.init_from_iter = iter_idx.checked_sub(1);
+            } else {
+                it.train.init_from = Some("best".to_string());
+                it.train.init_from_iter = best_iter;
+            }
         }
         m.controller_last_ts_ms = Some(started_ts);
     })?;
@@ -2136,7 +2306,17 @@ fn run_selfplay(
     let num_workers = cfg.selfplay.workers.max(1);
     let games_total = cfg.selfplay.games_per_iteration.max(1);
     let base_total = manifest.selfplay_games_completed;
-    let seed_base = manifest.created_ts_ms ^ 0xC0FFEEu64;
+    // IMPORTANT: vary self-play randomness across iterations.
+    //
+    // Previously we used a constant seed_base derived only from created_ts_ms, which meant that if
+    // the best model stayed unchanged (candidate repeatedly rejected), self-play could become
+    // effectively identical across iterations. That makes learning appear "stuck" for the wrong
+    // reason.
+    //
+    // We keep determinism *within* a run by deriving from (created_ts_ms, iter_idx), but ensure
+    // each iteration gets fresh trajectories.
+    let seed_base = (manifest.created_ts_ms ^ 0xC0FFEEu64)
+        ^ (iter_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64);
 
     // Partition games across workers.
     let base = games_total / num_workers;
@@ -2406,6 +2586,9 @@ fn run_gate(
     let logs_gate_workers_dir = run_dir.join("logs_gate_workers");
     std::fs::create_dir_all(&gate_workers_dir)?;
     std::fs::create_dir_all(&logs_gate_workers_dir)?;
+    // Remove any stale stop file from a previous run.
+    let stop_path = gate_workers_dir.join("stop.json");
+    let _ = std::fs::remove_file(&stop_path);
 
     // Partition schedule across workers.
     let num_workers = cfg.selfplay.workers.max(1) as usize;
@@ -2503,14 +2686,32 @@ fn run_gate(
         children.push((*wid, out_path, child));
     }
 
-    fn read_gate_worker_progress_sum(logs_gate_workers_dir: &Path) -> (u32, Option<u64>) {
+    #[derive(Debug, Clone, Copy, Default)]
+    struct GateProgressAgg {
+        completed: u32,
+        wins: u32,
+        losses: u32,
+        draws: u32,
+        first_game_started_min_ts_ms: Option<u64>,
+    }
+
+    fn read_gate_worker_progress_sum(logs_gate_workers_dir: &Path) -> GateProgressAgg {
         #[derive(serde::Deserialize)]
         struct P {
             games_completed: u32,
             #[serde(default)]
+            wins: u32,
+            #[serde(default)]
+            losses: u32,
+            #[serde(default)]
+            draws: u32,
+            #[serde(default)]
             first_game_started_ts_ms: Option<u64>,
         }
         let mut sum = 0u32;
+        let mut wins = 0u32;
+        let mut losses = 0u32;
+        let mut draws = 0u32;
         let mut first_game_min: Option<u64> = None;
         if let Ok(rd) = std::fs::read_dir(logs_gate_workers_dir) {
             for e in rd.flatten() {
@@ -2522,6 +2723,9 @@ fn run_gate(
                 if let Ok(bytes) = std::fs::read(&f) {
                     if let Ok(pp) = serde_json::from_slice::<P>(&bytes) {
                         sum = sum.saturating_add(pp.games_completed);
+                        wins = wins.saturating_add(pp.wins);
+                        losses = losses.saturating_add(pp.losses);
+                        draws = draws.saturating_add(pp.draws);
                         if let Some(ts) = pp.first_game_started_ts_ms {
                             first_game_min = Some(match first_game_min {
                                 Some(cur) => cur.min(ts),
@@ -2532,10 +2736,17 @@ fn run_gate(
                 }
             }
         }
-        (sum, first_game_min)
+        GateProgressAgg {
+            completed: sum,
+            wins,
+            losses,
+            draws,
+            first_game_started_min_ts_ms: first_game_min,
+        }
     }
 
     let mut last_manifest_ts = std::time::Instant::now();
+    let mut sprt_stop_written: Option<(String, u32)> = None; // (decision, games_at_decision)
     while !children.is_empty() {
         if ctrl.cancelled() {
             for (_, _, mut c) in children {
@@ -2567,14 +2778,100 @@ fn run_gate(
 
         // Live progress: sum worker progress and update run.json for the TUI.
         if last_manifest_ts.elapsed() >= Duration::from_millis(250) {
-            let (sum, first_game_min) = read_gate_worker_progress_sum(&logs_gate_workers_dir);
-            let completed = sum.min(total_games);
+            let agg = read_gate_worker_progress_sum(&logs_gate_workers_dir);
+            let completed = agg.completed.min(total_games);
             if let Ok(mut mm) = yz_logging::read_manifest(&run_json) {
                 if let Some(it) = mm.iterations.iter_mut().find(|it| it.idx == iter_idx) {
                     it.gate.games_completed = completed as u64;
                     it.gate.games_target = total_games as u64;
                     if it.gate.first_game_started_ts_ms.is_none() {
-                        it.gate.first_game_started_ts_ms = first_game_min;
+                        it.gate.first_game_started_ts_ms = agg.first_game_started_min_ts_ms;
+                    }
+                    // Live counts (best-effort).
+                    it.gate.wins = Some(agg.wins as u64);
+                    it.gate.losses = Some(agg.losses as u64);
+                    it.gate.draws = Some(agg.draws as u64);
+                    let denom = (agg.wins + agg.losses + agg.draws).max(1) as f64;
+                    it.gate.win_rate = Some((agg.wins as f64 + 0.5 * agg.draws as f64) / denom);
+                }
+
+                // Controller-driven SPRT: decide from aggregated W/D/L and request workers stop.
+                if cfg.gating.katago.sprt && sprt_stop_written.is_none() {
+                    let min_games = cfg.gating.katago.sprt_min_games.max(1);
+                    if completed >= min_games {
+                        let thr = cfg.gating.win_rate_threshold;
+                        let delta = cfg.gating.katago.sprt_delta;
+                        let p0 = thr - delta;
+                        let p1 = thr + delta;
+                        let alpha = cfg.gating.katago.sprt_alpha;
+                        let beta = cfg.gating.katago.sprt_beta;
+                        let a = ((1.0 - beta) / alpha).ln();
+                        let b = (beta / (1.0 - alpha)).ln();
+                        let w2 = (2 * agg.wins + agg.draws) as f64;
+                        let l2 = (2 * agg.losses + agg.draws) as f64;
+                        let llr = w2 * (p1 / p0).ln() + l2 * ((1.0 - p1) / (1.0 - p0)).ln();
+
+                        let decision = if llr >= a {
+                            Some("accept_h1")
+                        } else if llr <= b {
+                            Some("accept_h0")
+                        } else {
+                            None
+                        };
+
+                        // Persist live SPRT diag for the TUI.
+                        let sprt = yz_logging::GateSprtSummaryV1 {
+                            enabled: true,
+                            min_games: min_games as u64,
+                            max_games: total_games as u64,
+                            alpha,
+                            beta,
+                            delta,
+                            p0,
+                            p1,
+                            llr,
+                            bound_a: a,
+                            bound_b: b,
+                            decision: Some(decision.unwrap_or("continue").to_string()),
+                            decision_reason: Some(
+                                decision
+                                    .map(|d| if d == "accept_h1" { "llr>=A" } else { "llr<=B" })
+                                    .unwrap_or("continue")
+                                    .to_string(),
+                            ),
+                            games_at_decision: decision.map(|_| completed as u64),
+                        };
+                        if let Some(it) = mm.iterations.iter_mut().find(|it| it.idx == iter_idx) {
+                            it.gate.sprt = Some(sprt.clone());
+                        }
+                        mm.gate_sprt = Some(sprt);
+
+                        if let Some(d) = decision {
+                            // Write stop file (workers only check existence).
+                            #[derive(serde::Serialize)]
+                            struct StopFile<'a> {
+                                ts_ms: u64,
+                                decision: &'a str,
+                                games_at_decision: u32,
+                                llr: f64,
+                                a: f64,
+                                b: f64,
+                            }
+                            let stop = StopFile {
+                                ts_ms: yz_logging::now_ms(),
+                                decision: d,
+                                games_at_decision: completed,
+                                llr,
+                                a,
+                                b,
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&stop) {
+                                let _ = std::fs::write(&stop_path, bytes);
+                            } else {
+                                let _ = std::fs::write(&stop_path, b"{\"decision\":\"stop\"}");
+                            }
+                            sprt_stop_written = Some((d.to_string(), completed));
+                        }
                     }
                 }
                 let _ = yz_logging::write_manifest_atomic(&run_json, &mm);
@@ -2709,6 +3006,65 @@ fn run_gate(
     m.gate_games = Some(report.games as u64);
     m.gate_win_rate = Some(wr);
     m.gate_draw_rate = Some(report.draw_rate);
+    m.gate_wins = Some(report.cand_wins as u64);
+    m.gate_losses = Some(report.cand_losses as u64);
+    m.gate_draws = Some(report.draws as u64);
+    m.gate_ci95_low = Some(report.win_rate_ci95_low);
+    m.gate_ci95_high = Some(report.win_rate_ci95_high);
+    m.gate_sprt = if cfg.gating.katago.sprt {
+        let min_games = cfg.gating.katago.sprt_min_games.max(1);
+        let thr = cfg.gating.win_rate_threshold;
+        let delta = cfg.gating.katago.sprt_delta;
+        let p0 = thr - delta;
+        let p1 = thr + delta;
+        let alpha = cfg.gating.katago.sprt_alpha;
+        let beta = cfg.gating.katago.sprt_beta;
+        let a = ((1.0 - beta) / alpha).ln();
+        let b = (beta / (1.0 - alpha)).ln();
+        let w2 = (2 * report.cand_wins + report.draws) as f64;
+        let l2 = (2 * report.cand_losses + report.draws) as f64;
+        let llr = w2 * (p1 / p0).ln() + l2 * ((1.0 - p1) / (1.0 - p0)).ln();
+
+        let (decision, games_at_decision, decision_reason) = if let Some((d, g)) = &sprt_stop_written
+        {
+            (
+                d.as_str(),
+                Some(*g as u64),
+                Some(if d == "accept_h1" { "llr>=A" } else { "llr<=B" }.to_string()),
+            )
+        } else if report.games >= min_games {
+            if llr >= a {
+                ("accept_h1", Some(report.games as u64), Some("llr>=A".to_string()))
+            } else if llr <= b {
+                ("accept_h0", Some(report.games as u64), Some("llr<=B".to_string()))
+            } else if report.games >= total_games {
+                ("inconclusive_max_games", None, Some("max_games".to_string()))
+            } else {
+                ("continue", None, Some("continue".to_string()))
+            }
+        } else {
+            ("continue", None, Some("min_games".to_string()))
+        };
+
+        Some(yz_logging::GateSprtSummaryV1 {
+            enabled: true,
+            min_games: min_games as u64,
+            max_games: total_games as u64,
+            alpha,
+            beta,
+            delta,
+            p0,
+            p1,
+            llr,
+            bound_a: a,
+            bound_b: b,
+            decision: Some(decision.to_string()),
+            decision_reason,
+            games_at_decision,
+        })
+    } else {
+        None
+    };
     m.gate_seeds_hash = Some(report.seeds_hash.clone());
     m.gate_oracle_match_rate_overall = Some(oracle_overall);
     m.gate_oracle_match_rate_mark = Some(oracle_mark);
@@ -2717,7 +3073,26 @@ fn run_gate(
 
     // Emit gate_summary metrics event (best-effort).
     {
-        let decision = if wr + 1e-12 < cfg.gating.win_rate_threshold {
+        let decision = if cfg.gating.katago.sprt {
+            match m.gate_sprt.as_ref().and_then(|s| s.decision.as_deref()) {
+                Some("accept_h1") => "promote",
+                Some("accept_h0") => "reject",
+                Some("inconclusive_max_games") | Some("continue") | None => {
+                    if wr + 1e-12 < cfg.gating.win_rate_threshold {
+                        "reject"
+                    } else {
+                        "promote"
+                    }
+                }
+                _ => {
+                    if wr + 1e-12 < cfg.gating.win_rate_threshold {
+                        "reject"
+                    } else {
+                        "promote"
+                    }
+                }
+            }
+        } else if wr + 1e-12 < cfg.gating.win_rate_threshold {
             "reject"
         } else {
             "promote"
@@ -2762,10 +3137,16 @@ fn run_gate(
 
     // Also update current iteration entry (final values).
     if let Some(it) = m.iterations.iter_mut().find(|it| it.idx == iter_idx) {
-        it.gate.games_target = report.games as u64;
+        it.gate.games_target = total_games as u64;
         it.gate.games_completed = report.games as u64;
         it.gate.win_rate = Some(wr);
         it.gate.draw_rate = Some(report.draw_rate);
+        it.gate.wins = Some(report.cand_wins as u64);
+        it.gate.losses = Some(report.cand_losses as u64);
+        it.gate.draws = Some(report.draws as u64);
+        it.gate.win_ci95_low = Some(report.win_rate_ci95_low);
+        it.gate.win_ci95_high = Some(report.win_rate_ci95_high);
+        it.gate.sprt = m.gate_sprt.clone();
         it.gate.mean_cand_score = Some(report.mean_cand_score());
         it.gate.mean_best_score = Some(report.mean_best_score());
         it.gate.ended_ts_ms = Some(yz_logging::now_ms());
@@ -2811,6 +3192,7 @@ mod cancel_tests {
                 train_step: 0,
                 best_checkpoint: None,
                 candidate_checkpoint: None,
+                best_promoted_iter: None,
                 train_last_loss_total: None,
                 train_last_loss_policy: None,
                 train_last_loss_value: None,
@@ -2819,6 +3201,12 @@ mod cancel_tests {
                 gate_games: None,
                 gate_win_rate: None,
                 gate_draw_rate: None,
+                gate_wins: None,
+                gate_losses: None,
+                gate_draws: None,
+                gate_ci95_low: None,
+                gate_ci95_high: None,
+                gate_sprt: None,
                 gate_seeds_hash: None,
                 gate_oracle_match_rate_overall: None,
                 gate_oracle_match_rate_mark: None,

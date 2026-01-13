@@ -54,7 +54,7 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
         TemperatureSchedule::Step {
             t0,
             t1,
-            cutoff_ply: _,
+            cutoff_turn: _,
         } => {
             if t0 < 0.0 || t1 < 0.0 {
                 return Err("mcts.temperature_schedule.t0/t1 must be >= 0".to_string());
@@ -97,6 +97,10 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if cfg.training.learning_rate <= 0.0 {
         return Err("training.learning_rate must be > 0".to_string());
     }
+    match cfg.training.optimizer.as_str() {
+        "adamw" | "adam" | "sgd" => {}
+        _ => return Err("training.optimizer must be 'adamw', 'adam', or 'sgd'".to_string()),
+    }
     if cfg.training.weight_decay < 0.0 {
         return Err("training.weight_decay must be >= 0".to_string());
     }
@@ -115,6 +119,51 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     }
     if !(0.0..=1.0).contains(&cfg.gating.win_rate_threshold) {
         return Err("gating.win_rate_threshold must be in [0,1]".to_string());
+    }
+    if cfg.gating.katago.sprt {
+        let min_games = cfg.gating.katago.sprt_min_games;
+        let max_games = cfg.gating.katago.sprt_max_games;
+        if min_games < 1 {
+            return Err("gating.katago.sprt_min_games must be >= 1".to_string());
+        }
+        if max_games < min_games {
+            return Err("gating.katago.sprt_max_games must be >= sprt_min_games".to_string());
+        }
+        if cfg.gating.paired_seed_swap {
+            if min_games % 2 != 0 {
+                return Err(
+                    "gating.katago.sprt_min_games must be even when gating.paired_seed_swap=true"
+                        .to_string(),
+                );
+            }
+            if max_games % 2 != 0 {
+                return Err(
+                    "gating.katago.sprt_max_games must be even when gating.paired_seed_swap=true"
+                        .to_string(),
+                );
+            }
+        }
+        let alpha = cfg.gating.katago.sprt_alpha;
+        let beta = cfg.gating.katago.sprt_beta;
+        if !(0.0 < alpha && alpha < 1.0) {
+            return Err("gating.katago.sprt_alpha must be in (0,1)".to_string());
+        }
+        if !(0.0 < beta && beta < 1.0) {
+            return Err("gating.katago.sprt_beta must be in (0,1)".to_string());
+        }
+        let delta = cfg.gating.katago.sprt_delta;
+        if !(0.0 < delta && delta < 1.0) {
+            return Err("gating.katago.sprt_delta must be in (0,1)".to_string());
+        }
+        let thr = cfg.gating.win_rate_threshold;
+        let p0 = thr - delta;
+        let p1 = thr + delta;
+        if !(p0 > 0.0 && p1 < 1.0 && p0 < p1) {
+            return Err(
+                "gating.katago.sprt requires p0=thr-delta and p1=thr+delta with 0<p0<p1<1"
+                    .to_string(),
+            );
+        }
     }
 
     // replay

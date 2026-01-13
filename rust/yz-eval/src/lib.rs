@@ -237,6 +237,9 @@ pub struct GateTickStats {
     pub ticks: u64,
     pub tasks: u32,
     pub games_completed: u32,
+    pub cand_wins: u32,
+    pub cand_losses: u32,
+    pub draws: u32,
     pub would_block: u64,
     pub progress: u64,
     pub terminal: u64,
@@ -247,6 +250,10 @@ pub struct GateTickStats {
 /// Optional progress sink for gating (used by TUI/controller to render live progress bars).
 pub trait GateProgress {
     fn on_game_completed(&mut self, completed: u32, total: u32);
+    /// Optional: allow the caller to stop launching new games (e.g., controller-driven SPRT stop).
+    fn should_stop(&mut self) -> bool {
+        false
+    }
     fn on_tick(&mut self, _stats: &GateTickStats) {
         // Optional; default is no-op.
     }
@@ -258,6 +265,119 @@ pub struct GatePlan {
     pub seeds: Vec<u64>,
     pub seeds_hash: String,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SprtDecision {
+    Continue,
+    AcceptH1,
+    AcceptH0,
+    InconclusiveMaxGames,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct SprtDiag {
+    pub min_games: u32,
+    pub max_games: u32,
+    pub alpha: f64,
+    pub beta: f64,
+    pub delta: f64,
+    pub thr: f64,
+    pub p0: f64,
+    pub p1: f64,
+    pub llr: f64,
+    pub bound_a: f64,
+    pub bound_b: f64,
+    pub decision: SprtDecision,
+    /// The number of completed games when the decision was first reached (may be < games played due to overshoot).
+    pub games_at_decision: u32,
+}
+
+fn sprt_params(cfg: &yz_core::Config) -> Result<Option<(u32, u32, f64, f64, f64, f64, f64)>, GateError> {
+    if !cfg.gating.katago.sprt {
+        return Ok(None);
+    }
+    let min_games = cfg.gating.katago.sprt_min_games;
+    let max_games = cfg.gating.katago.sprt_max_games;
+    if min_games == 0 {
+        return Err(GateError::InvalidConfig(
+            "gating.katago.sprt_min_games must be > 0",
+        ));
+    }
+    if max_games < min_games {
+        return Err(GateError::InvalidConfig(
+            "gating.katago.sprt_max_games must be >= sprt_min_games",
+        ));
+    }
+    if cfg.gating.paired_seed_swap {
+        if !min_games.is_multiple_of(2) {
+            return Err(GateError::InvalidConfig(
+                "gating.katago.sprt_min_games must be even when gating.paired_seed_swap=true",
+            ));
+        }
+        if !max_games.is_multiple_of(2) {
+            return Err(GateError::InvalidConfig(
+                "gating.katago.sprt_max_games must be even when gating.paired_seed_swap=true",
+            ));
+        }
+    }
+    let alpha = cfg.gating.katago.sprt_alpha;
+    let beta = cfg.gating.katago.sprt_beta;
+    let delta = cfg.gating.katago.sprt_delta;
+    let thr = cfg.gating.win_rate_threshold;
+    if !(0.0 < alpha && alpha < 1.0) {
+        return Err(GateError::InvalidConfig("gating.katago.sprt_alpha must be in (0,1)"));
+    }
+    if !(0.0 < beta && beta < 1.0) {
+        return Err(GateError::InvalidConfig("gating.katago.sprt_beta must be in (0,1)"));
+    }
+    if !(0.0 < delta && delta < 1.0) {
+        return Err(GateError::InvalidConfig("gating.katago.sprt_delta must be in (0,1)"));
+    }
+    let p0 = thr - delta;
+    let p1 = thr + delta;
+    if !(p0 > 0.0 && p1 < 1.0 && p0 < p1) {
+        return Err(GateError::InvalidConfig(
+            "SPRT requires p0=thr-delta and p1=thr+delta with 0<p0<p1<1",
+        ));
+    }
+    Ok(Some((min_games, max_games, alpha, beta, delta, p0, p1)))
+}
+
+fn sprt_llr(wins: u32, draws: u32, losses: u32, p0: f64, p1: f64) -> f64 {
+    // Half-point binomial transform: draw counts as 0.5 win.
+    let w2 = (2 * wins + draws) as f64;
+    let l2 = (2 * losses + draws) as f64;
+    w2 * (p1 / p0).ln() + l2 * ((1.0 - p1) / (1.0 - p0)).ln()
+}
+
+fn sprt_bounds(alpha: f64, beta: f64) -> (f64, f64) {
+    // Standard Wald thresholds.
+    let a = ((1.0 - beta) / alpha).ln();
+    let b = (beta / (1.0 - alpha)).ln();
+    (a, b)
+}
+
+fn wilson_ci95(successes: u64, trials: u64) -> (f64, f64) {
+    if trials == 0 {
+        return (0.0, 1.0);
+    }
+    let n = trials as f64;
+    let phat = (successes as f64) / n;
+    let z = 1.959_963_984_540_054_f64; // 95% two-sided
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let center = (phat + z2 / (2.0 * n)) / denom;
+    let half = (z / denom)
+        * ((phat * (1.0 - phat) / n) + (z2 / (4.0 * n * n))).sqrt();
+    ((center - half).clamp(0.0, 1.0), (center + half).clamp(0.0, 1.0))
+}
+
+fn win_ci95_halfpoint(wins: u32, draws: u32, losses: u32) -> (f64, f64) {
+    let w2 = (2 * wins + draws) as u64;
+    let l2 = (2 * losses + draws) as u64;
+    let n2 = w2 + l2;
+    wilson_ci95(w2, n2)
 }
 
 /// Effective per-process gating parallelism (number of in-flight games per gate-worker).
@@ -281,18 +401,25 @@ pub fn effective_gate_parallel_games(cfg: &yz_core::Config) -> u32 {
 }
 
 pub fn gate_plan(cfg: &yz_core::Config) -> Result<GatePlan, GateError> {
+    // When SPRT is enabled, treat sprt_max_games as the gating games cap / UI target.
+    let requested_games = if cfg.gating.katago.sprt {
+        sprt_params(cfg)?.map(|(_, max, _, _, _, _, _)| max).unwrap_or(cfg.gating.games)
+    } else {
+        cfg.gating.games
+    };
+
     let (schedule, seeds, warnings) = if let Some(id) = cfg.gating.seed_set_id.as_deref() {
-        if cfg.gating.paired_seed_swap && !cfg.gating.games.is_multiple_of(2) {
+        if cfg.gating.paired_seed_swap && !requested_games.is_multiple_of(2) {
             return Err(GateError::InvalidConfig(
                 "gating.games must be even when gating.paired_seed_swap=true",
             ));
         }
         let seeds = load_seed_set(id)?;
-        gating_schedule_from_seed_set(&seeds, cfg.gating.games, cfg.gating.paired_seed_swap)
+        gating_schedule_from_seed_set(&seeds, requested_games, cfg.gating.paired_seed_swap)
     } else {
         let seeds = derived_seed_list(
             cfg.gating.seed,
-            cfg.gating.games,
+            requested_games,
             cfg.gating.paired_seed_swap,
         )?;
         let schedule = schedule_from_seed_list(&seeds, cfg.gating.paired_seed_swap);
@@ -317,6 +444,7 @@ pub struct GatePartial {
     pub cand_score_diff_sumsq: f64, // sum of (diff^2)
     pub cand_score_sum: i64,
     pub best_score_sum: i64,
+    pub sprt: Option<SprtDiag>,
 }
 
 impl GatePartial {
@@ -329,6 +457,7 @@ impl GatePartial {
         self.cand_score_diff_sumsq += other.cand_score_diff_sumsq;
         self.cand_score_sum = self.cand_score_sum.saturating_add(other.cand_score_sum);
         self.best_score_sum = self.best_score_sum.saturating_add(other.best_score_sum);
+        // SPRT diag is only meaningful for single-process SPRT gating; leave it unset when merging.
     }
 
     pub fn into_report(self, plan: GatePlan) -> GateReport {
@@ -343,6 +472,11 @@ impl GatePartial {
         report.seeds = plan.seeds;
         report.seeds_hash = plan.seeds_hash;
         report.warnings = plan.warnings;
+        report.sprt = self.sprt;
+
+        let (lo, hi) = win_ci95_halfpoint(self.cand_wins, self.draws, self.cand_losses);
+        report.win_rate_ci95_low = lo;
+        report.win_rate_ci95_high = hi;
 
         compute_score_diff_stats_from_moments(
             self.cand_score_diff_sum,
@@ -370,12 +504,15 @@ pub struct GateReport {
     pub score_diff_se: f64,
     pub score_diff_ci95_low: f64,
     pub score_diff_ci95_high: f64,
+    pub win_rate_ci95_low: f64,
+    pub win_rate_ci95_high: f64,
     pub draw_rate: f64,
     pub warnings: Vec<String>,
     pub oracle_match_rate_overall: f64,
     pub oracle_match_rate_mark: f64,
     pub oracle_match_rate_reroll: f64,
     pub oracle_keepall_ignored: u64,
+    pub sprt: Option<SprtDiag>,
 }
 
 impl GateReport {
@@ -480,12 +617,12 @@ fn gate_schedule_subset_with_backends(
     mut oracle_sink: Option<&mut dyn OracleDiagSink>,
 ) -> Result<GatePartial, GateError> {
     let total = schedule.len() as u32;
+    let sprt_cfg = sprt_params(cfg)?;
 
     // Always disable root Dirichlet noise in gating/eval.
     mcts_cfg.dirichlet_epsilon = 0.0;
 
     let mut partial = GatePartial::default();
-    partial.games = total;
 
     if schedule.is_empty() {
         // Keep semantics: 0 scheduled -> 0 completed (progress never called).
@@ -712,12 +849,22 @@ fn gate_schedule_subset_with_backends(
     let mut next_idx: usize = init_n;
 
     let mut completed: u32 = 0;
+    let mut stop_launching = false;
+    let mut sprt_diag: Option<SprtDiag> = None;
     let mut sched_ticks: u64 = 0;
     let mut sched_progress: u64 = 0;
     let mut sched_would_block: u64 = 0;
     let mut sched_terminal: u64 = 0;
     let mut last_tick_emit = std::time::Instant::now();
-    while (completed as usize) < schedule.len() {
+
+    loop {
+        if (completed as usize) >= schedule.len() {
+            break;
+        }
+        if stop_launching && tasks.iter().all(|t| !t.active) {
+            break;
+        }
+
         let mut made_progress = false;
         sched_ticks += 1;
         for t in tasks.iter_mut() {
@@ -750,10 +897,50 @@ fn gate_schedule_subset_with_backends(
                         if let Some(p) = progress.as_deref_mut() {
                             p.on_game_completed(completed, total);
                         }
+
+                        // SPRT: update decision after each completed game, and stop launching new games once decided.
+                        if let Some((min_games, _max_games, alpha, beta, delta, p0, p1)) = sprt_cfg {
+                            if sprt_diag.is_none() && completed >= min_games {
+                                let llr = sprt_llr(
+                                    partial.cand_wins,
+                                    partial.draws,
+                                    partial.cand_losses,
+                                    p0,
+                                    p1,
+                                );
+                                let (a, b) = sprt_bounds(alpha, beta);
+                                let (decision, stop_now) = if llr >= a {
+                                    (SprtDecision::AcceptH1, true)
+                                } else if llr <= b {
+                                    (SprtDecision::AcceptH0, true)
+                                } else {
+                                    (SprtDecision::Continue, false)
+                                };
+                                if stop_now {
+                                    stop_launching = true;
+                                    next_idx = schedule.len(); // stop refilling slots; allow small overshoot from in-flight games.
+                                    sprt_diag = Some(SprtDiag {
+                                        min_games,
+                                        max_games: total,
+                                        alpha,
+                                        beta,
+                                        delta,
+                                        thr: cfg.gating.win_rate_threshold,
+                                        p0,
+                                        p1,
+                                        llr,
+                                        bound_a: a,
+                                        bound_b: b,
+                                        decision,
+                                        games_at_decision: completed,
+                                    });
+                                }
+                            }
+                        }
                     }
 
                     // Start a new game in this slot if schedule items remain.
-                    if next_idx < schedule.len() {
+                    if !stop_launching && next_idx < schedule.len() {
                         let gs = schedule[next_idx];
                         next_idx += 1;
                         t.reset(cfg, mcts_cfg, gs)?;
@@ -765,6 +952,10 @@ fn gate_schedule_subset_with_backends(
 
         // Optional: periodic tick stats for diagnostics.
         if let Some(p) = progress.as_deref_mut() {
+            if !stop_launching && p.should_stop() {
+                stop_launching = true;
+                next_idx = schedule.len();
+            }
             if last_tick_emit.elapsed() >= Duration::from_secs(1) {
                 let b = best_backend.stats_snapshot();
                 let c = cand_backend.stats_snapshot();
@@ -772,6 +963,9 @@ fn gate_schedule_subset_with_backends(
                     ticks: sched_ticks,
                     tasks: tasks.len() as u32,
                     games_completed: completed,
+                    cand_wins: partial.cand_wins,
+                    cand_losses: partial.cand_losses,
+                    draws: partial.draws,
                     would_block: sched_would_block,
                     progress: sched_progress,
                     terminal: sched_terminal,
@@ -790,6 +984,35 @@ fn gate_schedule_subset_with_backends(
             cand_backend.wait_for_progress(Duration::from_micros(100));
         }
     }
+    partial.games = completed;
+    partial.sprt = if let Some(diag) = sprt_diag {
+        Some(diag)
+    } else if let Some((min_games, _max_games, alpha, beta, delta, p0, p1)) = sprt_cfg {
+        // SPRT enabled but no early decision; mark as inconclusive at max games.
+        let llr = sprt_llr(partial.cand_wins, partial.draws, partial.cand_losses, p0, p1);
+        let (a, b) = sprt_bounds(alpha, beta);
+        Some(SprtDiag {
+            min_games,
+            max_games: total,
+            alpha,
+            beta,
+            delta,
+            thr: cfg.gating.win_rate_threshold,
+            p0,
+            p1,
+            llr,
+            bound_a: a,
+            bound_b: b,
+            decision: if completed >= min_games {
+                SprtDecision::InconclusiveMaxGames
+            } else {
+                SprtDecision::Continue
+            },
+            games_at_decision: completed,
+        })
+    } else {
+        None
+    };
     Ok(partial)
 }
 
@@ -1119,6 +1342,7 @@ gating:
                     max_inflight: 4,
                     virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
                     virtual_loss: 1.0,
+                    expansion_lock: false,
                 },
             },
         )
@@ -1215,5 +1439,69 @@ gating:
         assert_eq!(a.matched_mark, b.matched_mark);
         assert_eq!(a.total_reroll, b.total_reroll);
         assert_eq!(a.matched_reroll, b.matched_reroll);
+    }
+
+    #[test]
+    fn sprt_llr_is_zero_when_p0_equals_p1() {
+        // Degenerate case: p0==p1 should give llr=0 regardless of outcomes.
+        // (We never allow this in config, but it sanity-checks the math helper.)
+        let p = 0.55;
+        let llr = sprt_llr(10, 4, 6, p, p);
+        assert!(llr.is_finite());
+        assert!((llr - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sprt_accepts_h1_when_all_wins() {
+        // With a strong win stream, llr should quickly exceed A.
+        let alpha = 0.05;
+        let beta = 0.05;
+        let (a, _b) = sprt_bounds(alpha, beta);
+        let p0 = 0.52;
+        let p1 = 0.58;
+        let mut wins = 0u32;
+        for _ in 0..200 {
+            wins += 1;
+            let llr = sprt_llr(wins, 0, 0, p0, p1);
+            if llr >= a {
+                return;
+            }
+        }
+        panic!("expected llr to cross A for all-wins stream within 200 games");
+    }
+
+    #[test]
+    fn sprt_accepts_h0_when_all_losses() {
+        // With a strong loss stream, llr should quickly go below B.
+        let alpha = 0.05;
+        let beta = 0.05;
+        let (_a, b) = sprt_bounds(alpha, beta);
+        let p0 = 0.52;
+        let p1 = 0.58;
+        let mut losses = 0u32;
+        for _ in 0..200 {
+            losses += 1;
+            let llr = sprt_llr(0, 0, losses, p0, p1);
+            if llr <= b {
+                return;
+            }
+        }
+        panic!("expected llr to cross B for all-losses stream within 200 games");
+    }
+
+    #[test]
+    fn sprt_draw_counts_as_half_point() {
+        // One draw should be equivalent to half win + half loss in the doubled-trials view.
+        let p0 = 0.52;
+        let p1 = 0.58;
+        let llr_draw = sprt_llr(0, 1, 0, p0, p1);
+        let llr_half = 0.5 * sprt_llr(1, 0, 0, p0, p1) + 0.5 * sprt_llr(0, 0, 1, p0, p1);
+        assert!((llr_draw - llr_half).abs() < 1e-9);
+    }
+
+    #[test]
+    fn win_ci95_halfpoint_smoke_bounds() {
+        let (lo, hi) = win_ci95_halfpoint(10, 10, 10);
+        assert!(0.0 <= lo && lo <= hi && hi <= 1.0);
     }
 }

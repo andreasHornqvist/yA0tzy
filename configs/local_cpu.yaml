@@ -73,7 +73,7 @@ gating:
   # Base seed for deterministic paired-seed scheduling (used if seed_set_id not set)
   seed: 0
   # Fixed seed set id under configs/seed_sets/<id>.txt (overrides `seed` for scheduling)
-  seed_set_id: "dev_v1"
+  seed_set_id: "dev_v2"
   # Win rate threshold for promotion (0.55 = 55%)
   win_rate_threshold: 0.55
   # Use paired seeds with side swap for reduced variance

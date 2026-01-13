@@ -221,6 +221,8 @@ pub struct MctsConfig {
     pub virtual_loss_mode: VirtualLossMode,
     /// Virtual loss to apply while a leaf is pending.
     pub virtual_loss: f32,
+    /// If true, avoid selecting in-flight reserved edges when any non-pending legal edge exists.
+    pub expansion_lock: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +246,7 @@ impl Default for MctsConfig {
             max_inflight: 8,
             virtual_loss_mode: VirtualLossMode::QPenalty,
             virtual_loss: 1.0,
+            expansion_lock: false,
         }
     }
 }
@@ -266,9 +269,16 @@ pub struct SearchStats {
 pub struct SearchResult {
     pub pi: [f32; A],
     pub root_value: f32,
+    /// Search-improvement proxy:
+    /// E_{a~pi_visit}[Q(a)] - E_{a~pi_prior}[Q(a)] at the root.
+    pub delta_root_value: f32,
     pub root_priors_raw: Option<[f32; A]>,
     pub root_priors_noisy: Option<[f32; A]>,
     pub fallbacks: u32,
+    /// Number of leaf eval requests successfully submitted for this search (excludes root eval).
+    pub leaf_eval_submitted: u32,
+    /// Number of leaf eval requests that were still in-flight when the search finished (wasted).
+    pub leaf_eval_discarded: u32,
     pub stats: SearchStats,
 }
 
@@ -303,6 +313,7 @@ pub struct SearchDriver {
     completed: u32,
     sel_counter: u64,
     pending: VecDeque<PendingEvalClient>,
+    leaf_eval_submitted: u32,
 }
 
 struct PendingEval {
@@ -467,9 +478,12 @@ impl Mcts {
         SearchResult {
             pi,
             root_value,
+            delta_root_value: 0.0,
             root_priors_raw,
             root_priors_noisy,
             fallbacks: self.stats.fallbacks,
+            leaf_eval_submitted: 0,
+            leaf_eval_discarded: 0,
             stats: self.stats.clone(),
         }
     }
@@ -541,6 +555,7 @@ impl Mcts {
             completed: 0,
             sel_counter: 0,
             pending: VecDeque::new(),
+            leaf_eval_submitted: 0,
         }
     }
 
@@ -704,11 +719,30 @@ impl Mcts {
         };
         let sqrt_sum = (n_sum_eff as f32).sqrt();
 
+        // KataGo-style "expansion lock": when enabled, avoid selecting edges that already have a
+        // pending reservation (vl_n>0) as long as there exists at least one legal non-pending edge.
+        let lock_pending = self.cfg.expansion_lock && use_virtual_counts;
+        let mut has_nonpending = false;
+        if lock_pending {
+            for a in 0..A {
+                if !legal_ok(legal, a) {
+                    continue;
+                }
+                if n.vl_n[a] == 0 {
+                    has_nonpending = true;
+                    break;
+                }
+            }
+        }
+
         let mut best_score = f32::NEG_INFINITY;
         let mut best_a: u8 = 0;
 
         for a in 0..A {
             if !legal_ok(legal, a) {
+                continue;
+            }
+            if lock_pending && has_nonpending && n.vl_n[a] > 0 {
                 continue;
             }
             let q = if use_q_penalty { n.q_eff(a, true) } else { n.q(a) };
@@ -1041,6 +1075,7 @@ impl SearchDriver {
                                 continue;
                             }
                         };
+                        self.leaf_eval_submitted = self.leaf_eval_submitted.saturating_add(1);
                         self.pending.push_back(PendingEvalClient {
                             ticket,
                             leaf_node: pe.leaf_node,
@@ -1238,12 +1273,44 @@ impl SearchDriver {
 
     fn finish(&self, mcts: &Mcts) -> SearchResult {
         let (pi, root_value) = mcts.root_pi_value(self.root_id, &self.root_state, self.mode);
+        let leaf_eval_discarded = self.pending.len() as u32;
+
+        // Prior-weighted expected Q at root.
+        let legal = legal_action_mask_for_mode(&self.root_state, self.mode);
+        let root = mcts.arena.get(self.root_id);
+        let pri = self
+            .root_priors_noisy
+            .as_ref()
+            .or(self.root_priors_raw.as_ref())
+            .unwrap_or(&root.p);
+        let mut v_prior = 0.0f32;
+        let mut p_sum = 0.0f32;
+        for a in 0..A {
+            if !legal_ok(legal, a) {
+                continue;
+            }
+            let p = pri[a];
+            if !(p.is_finite()) || p <= 0.0 {
+                continue;
+            }
+            v_prior += p * root.q(a);
+            p_sum += p;
+        }
+        if p_sum > 0.0 {
+            v_prior /= p_sum;
+        } else {
+            v_prior = 0.0;
+        }
+        let delta_root_value = (root_value - v_prior).clamp(-1.0, 1.0);
         SearchResult {
             pi,
             root_value,
+            delta_root_value,
             root_priors_raw: self.root_priors_raw,
             root_priors_noisy: self.root_priors_noisy,
             fallbacks: mcts.stats.fallbacks,
+            leaf_eval_submitted: self.leaf_eval_submitted,
+            leaf_eval_discarded,
             stats: mcts.stats.clone(),
         }
     }

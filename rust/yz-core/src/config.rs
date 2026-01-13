@@ -168,6 +168,28 @@ pub struct MctsConfig {
     /// Virtual loss magnitude (used when virtual_loss_mode != "off").
     #[serde(default = "default_virtual_loss")]
     pub virtual_loss: f32,
+
+    /// KataGo-inspired parallel search knobs.
+    ///
+    /// This is intentionally optional/extendable without breaking existing configs.
+    #[serde(default)]
+    pub katago: MctsKatagoConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MctsKatagoConfig {
+    /// If true, treat in-flight reserved edges as temporarily unavailable during selection
+    /// when any non-pending legal edge exists (reduces parallel “herding” / collisions).
+    #[serde(default)]
+    pub expansion_lock: bool,
+}
+
+impl Default for MctsKatagoConfig {
+    fn default() -> Self {
+        Self {
+            expansion_lock: false,
+        }
+    }
 }
 
 fn default_dirichlet_alpha() -> f32 {
@@ -192,10 +214,15 @@ fn default_virtual_loss() -> f32 {
 pub enum TemperatureSchedule {
     /// Constant temperature `t0`.
     Constant { t0: f32 },
-    /// Step schedule: use `t0` while `turn_idx < cutoff_ply`, else use `t1`.
+    /// Step schedule: use `t0` while `turn_idx < cutoff_turn`, else use `t1`.
     ///
-    /// Note: cutoff_ply is interpreted as **scoring turns** (Mark count), not raw ply.
-    Step { t0: f32, t1: f32, cutoff_ply: u32 },
+    /// Note: cutoff_turn is interpreted as **scoring turns** (Mark count), not raw ply.
+    Step {
+        t0: f32,
+        t1: f32,
+        #[serde(rename = "cutoff_turn", alias = "cutoff_ply")]
+        cutoff_turn: u32,
+    },
 }
 
 impl Default for TemperatureSchedule {
@@ -231,6 +258,22 @@ pub struct TrainingConfig {
     pub batch_size: u32,
     /// Learning rate.
     pub learning_rate: f64,
+    /// Optimizer type (trainer interprets this string).
+    ///
+    /// Supported: "adamw" | "adam" | "sgd".
+    #[serde(default = "default_training_optimizer")]
+    pub optimizer: String,
+    /// Whether to train the candidate continuously across iterations (even on gate rejects).
+    ///
+    /// Self-play remains anchored to best until promotion.
+    #[serde(default)]
+    pub continuous_candidate_training: bool,
+    /// Whether to reset optimizer state each iteration.
+    ///
+    /// - true (default): initialize candidate from best with a fresh optimizer.
+    /// - false: resume from previous candidate checkpoint (keeps optimizer state).
+    #[serde(default = "default_training_reset_optimizer")]
+    pub reset_optimizer: bool,
     /// Weight decay (L2), applied by AdamW/SGD.
     #[serde(default)]
     pub weight_decay: f64,
@@ -252,6 +295,14 @@ pub struct TrainingConfig {
 
 fn default_training_sample_mode() -> String {
     "random_indexed".to_string()
+}
+
+fn default_training_optimizer() -> String {
+    "adamw".to_string()
+}
+
+fn default_training_reset_optimizer() -> bool {
+    true
 }
 
 /// Replay retention configuration.
@@ -306,6 +357,70 @@ pub struct GatingConfig {
     /// typically scaling by 2 because gating uses two model_id streams (best + candidate).
     #[serde(default)]
     pub threads_per_worker: Option<u32>,
+
+    /// KataGo-style gating knobs (optional).
+    ///
+    /// Used to enable sequential tests like SPRT that can stop early.
+    #[serde(default)]
+    pub katago: GatingKatagoConfig,
+}
+
+/// KataGo-style gating options.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatingKatagoConfig {
+    /// Enable win-rate SPRT (sequential probability ratio test) around `gating.win_rate_threshold`.
+    #[serde(default)]
+    pub sprt: bool,
+    /// Minimum number of games to play before SPRT can decide.
+    #[serde(default = "default_gating_katago_sprt_min_games")]
+    pub sprt_min_games: u32,
+    /// Maximum number of games to play in gating when SPRT is enabled.
+    ///
+    /// NOTE: With `paired_seed_swap=true`, you need at least `sprt_max_games/2` seeds in the seed set.
+    #[serde(default = "default_gating_katago_sprt_max_games")]
+    pub sprt_max_games: u32,
+    /// Type I error rate (false promote) target.
+    #[serde(default = "default_gating_katago_sprt_alpha")]
+    pub sprt_alpha: f64,
+    /// Type II error rate (false reject) target.
+    #[serde(default = "default_gating_katago_sprt_beta")]
+    pub sprt_beta: f64,
+    /// Indifference half-width around `win_rate_threshold`: p0 = thr - delta, p1 = thr + delta.
+    #[serde(default = "default_gating_katago_sprt_delta")]
+    pub sprt_delta: f64,
+}
+
+impl Default for GatingKatagoConfig {
+    fn default() -> Self {
+        Self {
+            sprt: false,
+            sprt_min_games: default_gating_katago_sprt_min_games(),
+            sprt_max_games: default_gating_katago_sprt_max_games(),
+            sprt_alpha: default_gating_katago_sprt_alpha(),
+            sprt_beta: default_gating_katago_sprt_beta(),
+            sprt_delta: default_gating_katago_sprt_delta(),
+        }
+    }
+}
+
+fn default_gating_katago_sprt_min_games() -> u32 {
+    40
+}
+
+fn default_gating_katago_sprt_max_games() -> u32 {
+    200
+}
+
+fn default_gating_katago_sprt_alpha() -> f64 {
+    0.05
+}
+
+fn default_gating_katago_sprt_beta() -> f64 {
+    0.05
+}
+
+fn default_gating_katago_sprt_delta() -> f64 {
+    0.03
 }
 
 fn default_gating_deterministic_chance() -> bool {
@@ -317,7 +432,7 @@ fn default_gating_win_rate_threshold() -> f64 {
 }
 
 fn default_gating_seed_set_id() -> Option<String> {
-    Some("dev_v1".to_string())
+    Some("dev_v2".to_string())
 }
 
 impl Config {
@@ -363,6 +478,7 @@ impl Default for Config {
                 temperature_schedule: TemperatureSchedule::default(),
                 virtual_loss_mode: default_virtual_loss_mode(),
                 virtual_loss: default_virtual_loss(),
+                katago: MctsKatagoConfig::default(),
             },
             selfplay: SelfplayConfig {
                 games_per_iteration: 50,
@@ -373,6 +489,9 @@ impl Default for Config {
             training: TrainingConfig {
                 batch_size: 256,
                 learning_rate: 1e-3,
+                optimizer: default_training_optimizer(),
+                continuous_candidate_training: false,
+                reset_optimizer: default_training_reset_optimizer(),
                 weight_decay: 0.0,
                 epochs: 1,
                 steps_per_iteration: None,
@@ -387,6 +506,7 @@ impl Default for Config {
                 paired_seed_swap: true,
                 deterministic_chance: default_gating_deterministic_chance(),
                 threads_per_worker: None,
+                katago: GatingKatagoConfig::default(),
             },
             replay: ReplayConfig::default(),
             controller: ControllerConfig::default(),
@@ -415,7 +535,7 @@ mod tests {
         assert_eq!(config.training.steps_per_iteration, None);
         assert_eq!(config.gating.games, 100);
         assert_eq!(config.gating.seed, 0);
-        assert_eq!(config.gating.seed_set_id.as_deref(), Some("dev_v1"));
+        assert_eq!(config.gating.seed_set_id.as_deref(), Some("dev_v2"));
         assert!(config.gating.paired_seed_swap);
         assert!(config.gating.deterministic_chance);
         assert_eq!(config.gating.threads_per_worker, None);

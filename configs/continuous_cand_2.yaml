@@ -1,11 +1,7 @@
-# Realistic 10-iteration run with virtual-loss mode = n_virtual_only.
-# Notes:
-# - Uses non-default infer bind/metrics port so it can run alongside other runs.
-
 inference:
-  bind: "unix:///tmp/yatzy_infer_nvirt_only.sock"
-  metrics_bind: "127.0.0.1:18081"
-  device: "cpu"
+  # Use unique endpoints so this run can coexist with others.
+  bind: unix:///tmp/yatzy_infer_continuous_cand_2.sock
+  device: cpu
   protocol_version: 2
   legal_mask_bitset: false
   max_batch: 32
@@ -14,12 +10,12 @@ inference:
   torch_interop_threads: 2
   debug_log: false
   print_stats: false
-
+  metrics_bind: 127.0.0.1:18083
 mcts:
   c_puct: 1.5
   budget_reroll: 400
   budget_mark: 400
-  max_inflight_per_game: 8
+  max_inflight_per_game: 2
   dirichlet_alpha: 0.3
   dirichlet_epsilon: 0.25
   temperature_schedule:
@@ -29,39 +25,45 @@ mcts:
     cutoff_turn: 10
   virtual_loss_mode: n_virtual_only
   virtual_loss: 1.0
-
+  katago:
+    expansion_lock: true
 selfplay:
-  games_per_iteration: 100
+  games_per_iteration: 150
   workers: 10
   threads_per_worker: 2
   root_sample_every_n: 10
-
 training:
   batch_size: 256
-  learning_rate: 0.001
+  learning_rate: 0.0003
+  optimizer: adamw
+  continuous_candidate_training: true
+  # Ignored in continuous mode, but kept for completeness.
+  reset_optimizer: true
   weight_decay: 0.0001
-  epochs: 10
+  epochs: 1
   steps_per_iteration: null
   sample_mode: random_indexed
   dataloader_workers: 0
-
 gating:
-  games: 100
+  games: 150
   seed: 0
-  seed_set_id: "dev_v1"
+  seed_set_id: dev_v2
   win_rate_threshold: 0.55
   paired_seed_swap: true
   deterministic_chance: true
   threads_per_worker: null
-
+  katago:
+    sprt: false
+    sprt_min_games: 40
+    sprt_max_games: 200
+    sprt_alpha: 0.05
+    sprt_beta: 0.05
+    sprt_delta: 0.03
 replay:
-  capacity_shards: 20
-
+  capacity_shards: 150
 controller:
-  total_iterations: 10
-
+  total_iterations: 300
 model:
   hidden_dim: 256
-  num_blocks: 2
-  kind: residual
-
+  num_blocks: 4
+  kind: mlp

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use yz_core::Config;
+use yz_core::config::TemperatureSchedule;
 
 pub const CONFIG_DRAFT_NAME: &str = "config.draft.yaml";
 pub const DEFAULT_CONFIG_PATH: &str = "configs/local_cpu.yaml";
@@ -10,11 +11,25 @@ pub fn default_cfg_for_new_run() -> Config {
 
     // Sane perf defaults for the local machine (TUI convenience).
     // - Use multiple OS worker processes (controller now spawns processes)
-    // - Keep per-game inflight <= 8 (user preference)
+    // - Keep per-game inflight small by default (reduces collisions and tail-latency amplification)
     // - Default to 400 sims for both mark + reroll
     cfg.mcts.budget_reroll = 400;
     cfg.mcts.budget_mark = 400;
-    cfg.mcts.max_inflight_per_game = 8;
+    cfg.mcts.max_inflight_per_game = 2;
+    cfg.mcts.virtual_loss_mode = "n_virtual_only".to_string();
+    cfg.mcts.katago.expansion_lock = true;
+    cfg.mcts.temperature_schedule = TemperatureSchedule::Step {
+        t0: 1.0,
+        t1: 0.01,
+        cutoff_turn: 10,
+    };
+
+    cfg.controller.total_iterations = Some(100);
+    cfg.training.epochs = 1;
+    cfg.model.num_blocks = 4;
+    cfg.model.kind = "mlp".to_string();
+    cfg.replay.capacity_shards = Some(150);
+    cfg.gating.seed_set_id = Some("dev_v2".to_string());
 
     // Use most cores, but leave some headroom for the Python inference server + OS.
     // On this machine `available_parallelism()` is reliable and cross-platform.

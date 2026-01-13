@@ -35,11 +35,14 @@ pub struct StepResult {
 pub struct SearchSummary {
     pub pi: [f32; yz_core::A],
     pub root_value: f32,
+    pub delta_root_value: f32,
     pub root_priors_raw: Option<[f32; yz_core::A]>,
     pub root_priors_noisy: Option<[f32; yz_core::A]>,
     pub fallbacks: u32,
     pub pending_count_max: usize,
     pub pending_collisions: u32,
+    pub leaf_eval_submitted: u32,
+    pub leaf_eval_discarded: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -99,8 +102,12 @@ impl GameTask {
     fn temperature_for_turn(&self) -> f32 {
         match self.temperature_schedule {
             TemperatureSchedule::Constant { t0 } => t0,
-            TemperatureSchedule::Step { t0, t1, cutoff_ply } => {
-                if self.turn_idx < cutoff_ply {
+            TemperatureSchedule::Step {
+                t0,
+                t1,
+                cutoff_turn,
+            } => {
+                if self.turn_idx < cutoff_turn {
                     t0
                 } else {
                     t1
@@ -195,11 +202,14 @@ impl GameTask {
                 let search = SearchSummary {
                     pi,
                     root_value: sr.root_value,
+                    delta_root_value: sr.delta_root_value,
                     root_priors_raw: sr.root_priors_raw,
                     root_priors_noisy: sr.root_priors_noisy,
                     fallbacks: sr.fallbacks,
                     pending_count_max: sr.stats.pending_count_max,
                     pending_collisions: sr.stats.pending_collisions,
+                    leaf_eval_submitted: sr.leaf_eval_submitted,
+                    leaf_eval_discarded: sr.leaf_eval_discarded,
                 };
 
                 let mut ctx = match self.mode {
@@ -298,7 +308,7 @@ mod tests {
             TemperatureSchedule::Step {
                 t0: 1.0,
                 t1: 0.0,
-                cutoff_ply: 1,
+                cutoff_turn: 1,
             },
             MctsConfig::default(),
         );
