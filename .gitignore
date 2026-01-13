@@ -60,3 +60,11 @@ runs/
 flamegraph.svg
 perf.data*
 
+
+# Ralph config (may contain API key)
+.cursor/ralph-config.json
+
+# Cursor / local agent artifacts
+.cursor/
+.ralph/
+RALPH_TASK.md

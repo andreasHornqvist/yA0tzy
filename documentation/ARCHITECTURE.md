@@ -93,7 +93,8 @@ cargo run -p yz-cli --bin yz -- start-run --run-name exp1 --config /tmp/cfg.yaml
 cargo run -p yz-cli --bin yz -- controller --run-dir runs/exp1 --print-iter-table
 #
 # Cancel from another terminal:
-# - open `yz tui`, select the run, and press `x` (or `q`) which writes runs/<id>/cancel.request
+# - open `yz tui`, select the run, and press `x` to request cancellation (writes runs/<id>/cancel.request)
+# - `q` quits the TUI; if a run is currently active, the TUI will also request cancel before exiting
 # - the controller polls for cancel.request and shuts down cleanly
 
 # Opt-in Rust↔Python inference e2e test (E6.5S6)
@@ -290,7 +291,7 @@ If infer-server fails to start, check:
 | Run manifest (E8.5.x) | `runs/<id>/run.json` (written by `yz selfplay`, updated by `python -m yatzy_az train`, and finalized by `yz iter finalize`) |
 | Live per-worker progress (scheduler + inference stats) | `runs/<id>/logs_workers/worker_<N>/progress.json` |
 | Per-worker detailed events/timings | `runs/<id>/logs_workers/worker_<N>/worker_stats.ndjson` |
-| Replay snapshot (E8.5.4) | `runs/<id>/replay_snapshot.json` (created by training; freezes shard list for resumes) |
+| Replay snapshot (E8.5.4) | `runs/<id>/replay_snapshot_iter_{iter:03}.json` (preferred; passed by controller, created by training; freezes shard list per iteration) |
 | Python replay dataset loader (E8S1) | `python/yatzy_az/replay_dataset.py` |
 | Neural network model | `python/yatzy_az/model/` |
 | Training loop | `python/yatzy_az/trainer/` |
@@ -336,7 +337,7 @@ See `documentation/prd.md` Section 14 for full roadmap.
 
 Current status: **E11 complete** (microbenches + e2e bench + profiling wrapper/docs) and **E10.5 complete** (run-local `config.yaml` snapshots + unified `logs/metrics.ndjson` emitted by selfplay/gate/train + JSON-only `yatzy_az wandb-sync` consumer). Note: per-seed gating results in `gate_report.json` are still optional and not implemented.
 
-Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 complete**: E13.2S1–E13.2S5 are all done (controller passes `--best`, auto-bootstrap `best.pt`, auto-promotion, model hot-reload, TUI preflight checks).
+Terminal UI status: **Epic E13.1 complete** (replay pruning, controller iteration loop, epochs vs steps). **Epic E13.2 complete**: E13.2S1–E13.2S5 are all done (controller passes `--best`, auto-bootstrap `best.pt`, auto-promotion, model hot-reload, TUI preflight checks). Additional observability: System (`i`) and Search (`s`) screens, plus `infer_snapshot` playback in the TUI for inference/batching diagnostics.
 
 ### Automatic promotion (E13.2S3)
 - After gating, `finalize_iteration` in `yz-controller` checks if `win_rate >= threshold`.
