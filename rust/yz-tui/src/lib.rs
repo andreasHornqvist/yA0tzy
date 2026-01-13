@@ -490,6 +490,8 @@ struct App {
     // Gating replay viewer (runs/<id>/gate_replays/).
     gate_replay_loaded_for_run: Option<String>,
     gate_replay_iter: Option<u32>,
+    gate_replay_iters: Vec<u32>,
+    gate_replay_iter_selected: usize,
     gate_replay_pairs: Vec<GateReplayPairEntry>,
     gate_replay_selected: usize,
     gate_replay_step_mode: bool,
@@ -577,6 +579,8 @@ impl App {
 
             gate_replay_loaded_for_run: None,
             gate_replay_iter: None,
+            gate_replay_iters: Vec::new(),
+            gate_replay_iter_selected: 0,
             gate_replay_pairs: Vec::new(),
             gate_replay_selected: 0,
             gate_replay_step_mode: true,
@@ -946,6 +950,8 @@ impl App {
         let Some(run_dir) = self.run_dir() else {
             self.gate_replay_loaded_for_run = None;
             self.gate_replay_iter = None;
+            self.gate_replay_iters.clear();
+            self.gate_replay_iter_selected = 0;
             self.gate_replay_pairs.clear();
             self.gate_replay_selected = 0;
             self.gate_replay_step_idx = 0;
@@ -960,6 +966,8 @@ impl App {
         if !base.exists() {
             self.gate_replay_loaded_for_run = Some(rid);
             self.gate_replay_iter = None;
+            self.gate_replay_iters.clear();
+            self.gate_replay_iter_selected = 0;
             self.gate_replay_pairs.clear();
             self.gate_replay_selected = 0;
             self.gate_replay_step_idx = 0;
@@ -969,8 +977,8 @@ impl App {
             return;
         }
 
-        // Pick the latest iter_<NNN> folder.
-        let mut best_iter: Option<u32> = None;
+        // Find available iter_<NNN> folders.
+        let mut iters: Vec<u32> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&base) {
             for ent in rd.flatten() {
                 if let Ok(ft) = ent.file_type() {
@@ -981,14 +989,18 @@ impl App {
                 let name = ent.file_name().to_string_lossy().to_string();
                 if let Some(s) = name.strip_prefix("iter_") {
                     if let Ok(i) = s.parse::<u32>() {
-                        best_iter = Some(best_iter.map(|x| x.max(i)).unwrap_or(i));
+                        iters.push(i);
                     }
                 }
             }
         }
-        let Some(iter_idx) = best_iter else {
+        iters.sort();
+        iters.dedup();
+        self.gate_replay_iters = iters;
+        if self.gate_replay_iters.is_empty() {
             self.gate_replay_loaded_for_run = Some(rid);
             self.gate_replay_iter = None;
+            self.gate_replay_iter_selected = 0;
             self.gate_replay_pairs.clear();
             self.gate_replay_selected = 0;
             self.gate_replay_step_idx = 0;
@@ -996,7 +1008,25 @@ impl App {
             self.gate_replay_swap1 = None;
             self.gate_replay_err = Some("gate_replays/ has no iter_* folders".to_string());
             return;
-        };
+        }
+
+        // Keep current iter if possible; otherwise default to latest.
+        let wanted = self.gate_replay_iter;
+        if let Some(w) = wanted {
+            if let Some(pos) = self.gate_replay_iters.iter().position(|&x| x == w) {
+                self.gate_replay_iter_selected = pos;
+            } else {
+                self.gate_replay_iter_selected = self.gate_replay_iters.len().saturating_sub(1);
+            }
+        } else {
+            self.gate_replay_iter_selected = self.gate_replay_iters.len().saturating_sub(1);
+        }
+
+        let iter_idx = self.gate_replay_iters[self.gate_replay_iter_selected];
+        self.load_gate_replays_for_iter(&base, &rid, iter_idx);
+    }
+
+    fn load_gate_replays_for_iter(&mut self, base: &Path, rid: &str, iter_idx: u32) {
         self.gate_replay_iter = Some(iter_idx);
 
         let dir = base.join(format!("iter_{iter_idx:03}"));
@@ -1041,9 +1071,30 @@ impl App {
             self.gate_replay_selected = 0;
         }
 
-        self.gate_replay_loaded_for_run = Some(rid);
+        self.gate_replay_loaded_for_run = Some(rid.to_string());
         self.gate_replay_err = None;
         self.load_gate_replay_selected();
+    }
+
+    fn change_gate_replay_iter(&mut self, delta: i32) {
+        if self.gate_replay_iters.is_empty() {
+            return;
+        }
+        let cur = self.gate_replay_iter_selected as i32;
+        let next = (cur + delta).clamp(0, (self.gate_replay_iters.len() as i32) - 1) as usize;
+        if next == self.gate_replay_iter_selected {
+            return;
+        }
+        self.gate_replay_iter_selected = next;
+        self.gate_replay_selected = 0;
+        self.gate_replay_step_idx = 0;
+        // Re-load pairs for the newly selected iteration.
+        if let Some(run_dir) = self.run_dir() {
+            let base = run_dir.join("gate_replays");
+            let rid = self.active_run_id.clone().unwrap_or_default();
+            let iter_idx = self.gate_replay_iters[self.gate_replay_iter_selected];
+            self.load_gate_replays_for_iter(&base, &rid, iter_idx);
+        }
     }
 
     fn load_gate_replay_selected(&mut self) {
@@ -1356,7 +1407,7 @@ impl App {
         self.refresh_gate_replays();
         self.screen = Screen::Replay;
         self.status =
-            "Space step | b back | s toggle step | ↑/↓ seed | r reload | Esc back | q quit"
+            "Space step | b back | s toggle step | ↑/↓ seed | PgUp/PgDn iter | r reload | Esc back | q quit"
                 .to_string();
     }
 
@@ -1918,6 +1969,10 @@ pub fn run() -> io::Result<()> {
                             app.enter_dashboard();
                         }
                         KeyCode::Char('r') => app.refresh_gate_replays(),
+                        KeyCode::PageUp => app.change_gate_replay_iter(-1),
+                        KeyCode::PageDown => app.change_gate_replay_iter(1),
+                        KeyCode::Char('[') => app.change_gate_replay_iter(-1),
+                        KeyCode::Char(']') => app.change_gate_replay_iter(1),
                         KeyCode::Up => {
                             if !app.gate_replay_pairs.is_empty() {
                                 app.gate_replay_selected =
@@ -5132,10 +5187,19 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         .gate_replay_iter
         .map(|i| format!("{i}"))
         .unwrap_or_else(|| "-".to_string());
+    let iter_pos = if app.gate_replay_iters.is_empty() {
+        "-".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            app.gate_replay_iter_selected.saturating_add(1),
+            app.gate_replay_iters.len()
+        )
+    };
     let title = Line::from(vec![
         Span::styled("Replay", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::raw(format!("run={rid}  iter={iter_s}")),
+        Span::raw(format!("run={rid}  iter={iter_s} ({iter_pos})")),
     ]);
 
     let rows = Layout::default()
@@ -5158,6 +5222,10 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         n
     )));
     hdr.push(Line::from(format!(" Step mode: {mode}  (s to toggle)")));
+    hdr.push(Line::from(Span::styled(
+        " Iteration: PgUp/PgDn or [ / ]",
+        Style::default().fg(Color::DarkGray),
+    )));
     if app.gate_replay_step_mode {
         let max0 = app.gate_replay_swap0.as_ref().map(|t| t.steps.len()).unwrap_or(0);
         let max1 = app.gate_replay_swap1.as_ref().map(|t| t.steps.len()).unwrap_or(0);
@@ -6092,6 +6160,7 @@ mod gate_replay_tests {
         let run_id = "r1";
         let run_dir = runs_dir.join(run_id);
         std::fs::create_dir_all(run_dir.join("gate_replays").join("iter_000")).unwrap();
+        std::fs::create_dir_all(run_dir.join("gate_replays").join("iter_001")).unwrap();
 
         let seed = 123u64;
         let mk_trace = |swap: bool| -> serde_json::Value {
@@ -6144,11 +6213,11 @@ mod gate_replay_tests {
 
         let p0 = run_dir
             .join("gate_replays")
-            .join("iter_000")
+            .join("iter_001")
             .join(format!("seed_{seed}_swap_0.json"));
         let p1 = run_dir
             .join("gate_replays")
-            .join("iter_000")
+            .join("iter_001")
             .join(format!("seed_{seed}_swap_1.json"));
         std::fs::write(&p0, serde_json::to_vec(&mk_trace(false)).unwrap()).unwrap();
         std::fs::write(&p1, serde_json::to_vec(&mk_trace(true)).unwrap()).unwrap();
@@ -6157,10 +6226,15 @@ mod gate_replay_tests {
         app.active_run_id = Some(run_id.to_string());
         app.refresh_gate_replays();
 
-        assert_eq!(app.gate_replay_iter, Some(0));
+        // Defaults to latest iteration folder.
+        assert_eq!(app.gate_replay_iter, Some(1));
         assert_eq!(app.gate_replay_pairs.len(), 1);
         assert_eq!(app.gate_replay_pairs[0].seed, seed);
         assert!(app.gate_replay_swap0.is_some());
         assert!(app.gate_replay_swap1.is_some());
+
+        // Can change iteration selection.
+        app.change_gate_replay_iter(-1);
+        assert_eq!(app.gate_replay_iter, Some(0));
     }
 }
