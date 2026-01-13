@@ -147,7 +147,7 @@ Make oracle diagnostics **comparable across iterations** by adding a **fixed ora
   - existing oracle accuracy (current)
   - regret vs oracle (gating games)
   - **fixed-set oracle accuracy**
-- Right: breakdown for selected iteration (by move type, turn buckets, etc.)
+- Right: breakdown for selected iteration (by move type, by move, turn buckets, etc.)
 
 #### Data contract (fixed oracle set)
 - Store deterministic oracle sets under `configs/oracle_sets/<id>.json` (or `.ndjson`)

@@ -26,6 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline};
 use ratatui::Terminal;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
 use crate::form::{EditMode, FieldId, FormState, Section, StepSize, ALL_FIELDS};
 use yz_core::config::TemperatureSchedule;
@@ -63,10 +64,14 @@ struct ReplayShardView {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GateReplayPlayerV1 {
+    #[allow(dead_code)]
     avail_mask: u16,
+    #[allow(dead_code)]
     upper_total_cap: u8,
+    #[allow(dead_code)]
     total_score: i16,
     filled_raw: [Option<i16>; yz_core::NUM_CATS],
+    #[allow(dead_code)]
     upper_raw_sum: i16,
     upper_bonus_awarded: bool,
 }
@@ -75,6 +80,7 @@ struct GateReplayPlayerV1 {
 struct GateReplayStepV1 {
     #[allow(dead_code)]
     ply: u32,
+    #[allow(dead_code)]
     turn_idx: u8,
     player_to_move_before: u8,
     rerolls_left_before: u8,
@@ -92,24 +98,35 @@ struct GateReplayStepV1 {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GateReplayTerminalV1 {
+    #[allow(dead_code)]
     cand_score: i32,
+    #[allow(dead_code)]
     best_score: i32,
+    #[allow(dead_code)]
     outcome: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GateReplayFileV1 {
+    #[allow(dead_code)]
     trace_version: u32,
+    #[allow(dead_code)]
     run_id: String,
+    #[allow(dead_code)]
     iter_idx: u32,
+    #[allow(dead_code)]
     best_model_id: u32,
+    #[allow(dead_code)]
     cand_model_id: u32,
     #[allow(dead_code)]
     episode_seed: u64,
+    #[allow(dead_code)]
     swap: bool,
     cand_seat: u8,
+    #[allow(dead_code)]
     best_seat: u8,
     steps: Vec<GateReplayStepV1>,
+    #[allow(dead_code)]
     terminal: Option<GateReplayTerminalV1>,
 }
 
@@ -138,6 +155,100 @@ enum ReplayFocus {
     Seed,
     StepMode,
     StepIdx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManageProcKind {
+    Controller,
+    SelfplayWorker,
+    GateWorker,
+    InferServer,
+}
+
+#[derive(Debug, Clone)]
+struct ManageProcRow {
+    pid: u32,
+    kind: ManageProcKind,
+    run_id: Option<String>,
+    endpoints: Vec<String>,
+    cmd: String,
+    uptime_s: Option<u64>,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManageKillStage {
+    TermSent,
+    KillSent,
+}
+
+#[derive(Debug, Clone)]
+struct ManageKillJob {
+    pid: u32,
+    stage: ManageKillStage,
+    started: Instant,
+    last_action: Instant,
+}
+
+fn manage_kind_name(k: ManageProcKind) -> &'static str {
+    match k {
+        ManageProcKind::InferServer => "infer",
+        ManageProcKind::Controller => "controller",
+        ManageProcKind::SelfplayWorker => "selfplay",
+        ManageProcKind::GateWorker => "gate",
+    }
+}
+
+fn manage_detect_kind(cmd: &str) -> Option<ManageProcKind> {
+    if cmd.contains("yatzy_az") && cmd.contains("infer-server") {
+        return Some(ManageProcKind::InferServer);
+    }
+    if cmd.contains("selfplay-worker") {
+        return Some(ManageProcKind::SelfplayWorker);
+    }
+    if cmd.contains("gate-worker") {
+        return Some(ManageProcKind::GateWorker);
+    }
+    if cmd.contains(" controller") || cmd.contains("yz-controller") {
+        return Some(ManageProcKind::Controller);
+    }
+    None
+}
+
+fn manage_tokenize_cmd(cmd: &str) -> Vec<&str> {
+    cmd.split_whitespace().collect()
+}
+
+fn manage_parse_flag_value(tokens: &[&str], flag: &str) -> Option<String> {
+    tokens
+        .iter()
+        .position(|t| *t == flag)
+        .and_then(|i| tokens.get(i + 1))
+        .map(|s| s.to_string())
+}
+
+fn manage_parse_run_id_from_run_dir(run_dir: &str) -> Option<String> {
+    let p = Path::new(run_dir);
+    // Common: runs/<id>
+    if let Some(s) = run_dir.strip_prefix("runs/") {
+        return Some(s.trim_matches('/').to_string());
+    }
+    // Absolute: .../runs/<id>
+    if let Some(pos) = run_dir.rfind("/runs/") {
+        return Some(run_dir[(pos + "/runs/".len())..].trim_matches('/').to_string());
+    }
+    // Fall back: last path component.
+    p.file_name().map(|x| x.to_string_lossy().to_string())
+}
+
+fn manage_extract_endpoints(tokens: &[&str]) -> Vec<String> {
+    let mut endpoints: Vec<String> = Vec::new();
+    for flag in ["--bind", "--metrics-bind", "--infer"] {
+        if let Some(v) = manage_parse_flag_value(tokens, flag) {
+            endpoints.push(format!("{flag}={v}"));
+        }
+    }
+    endpoints
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +620,8 @@ struct App {
     gate_replay_selected: usize,
     gate_replay_step_mode: bool,
     gate_replay_step_idx: usize,
+    /// Scroll offset (in lines) for the transcript panels. 0 = top.
+    gate_replay_scroll: usize,
     gate_replay_focus: ReplayFocus,
     gate_replay_swap0: Option<GateReplayFileV1>,
     gate_replay_swap1: Option<GateReplayFileV1>,
@@ -531,6 +644,16 @@ struct App {
     system_prev_flush_deadline_total: Option<f64>,
     system_prev_steps_sum: Option<u64>,
     system_prev_wb_sum: Option<u64>,
+
+    // Manage servers/workers (process discovery + kill flow) shown on System screen.
+    system_procs: Vec<ManageProcRow>,
+    system_proc_selected: usize,
+    system_proc_kill_confirm: bool,
+    system_proc_status: Option<String>,
+    system_proc_last_refresh: Instant,
+    system_proc_last_seen_by_pid: HashMap<u32, Instant>,
+    system_sysinfo: System,
+    system_kill_job: Option<ManageKillJob>,
 
     iter: Option<yz_controller::IterationHandle>,
 
@@ -599,6 +722,7 @@ impl App {
             gate_replay_selected: 0,
             gate_replay_step_mode: true,
             gate_replay_step_idx: 0,
+            gate_replay_scroll: 0,
             gate_replay_focus: ReplayFocus::Seed,
             gate_replay_swap0: None,
             gate_replay_swap1: None,
@@ -620,6 +744,17 @@ impl App {
             system_prev_flush_deadline_total: None,
             system_prev_steps_sum: None,
             system_prev_wb_sum: None,
+
+            system_procs: Vec::new(),
+            system_proc_selected: 0,
+            system_proc_kill_confirm: false,
+            system_proc_status: None,
+            system_proc_last_refresh: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
+            system_proc_last_seen_by_pid: HashMap::new(),
+            system_sysinfo: System::new_all(),
+            system_kill_job: None,
             iter: None,
             shutdown_requested: false,
             shutdown_exit_after: false,
@@ -1103,6 +1238,7 @@ impl App {
         self.gate_replay_iter_selected = next;
         self.gate_replay_selected = 0;
         self.gate_replay_step_idx = 0;
+        self.gate_replay_scroll = 0;
         // Re-load pairs for the newly selected iteration.
         if let Some(run_dir) = self.run_dir() {
             let base = run_dir.join("gate_replays");
@@ -1116,6 +1252,7 @@ impl App {
         self.gate_replay_swap0 = None;
         self.gate_replay_swap1 = None;
         self.gate_replay_step_idx = 0;
+        self.gate_replay_scroll = 0;
 
         let Some(sel) = self.gate_replay_pairs.get(self.gate_replay_selected).cloned() else {
             return;
@@ -1123,6 +1260,8 @@ impl App {
         if let Some(p) = sel.swap0 {
             if let Ok(bytes) = std::fs::read(&p) {
                 if let Ok(v) = serde_json::from_slice::<GateReplayFileV1>(&bytes) {
+                    #[cfg(debug_assertions)]
+                    debug_validate_gate_replay_trace(&v);
                     self.gate_replay_swap0 = Some(v);
                 }
             }
@@ -1130,6 +1269,8 @@ impl App {
         if let Some(p) = sel.swap1 {
             if let Ok(bytes) = std::fs::read(&p) {
                 if let Ok(v) = serde_json::from_slice::<GateReplayFileV1>(&bytes) {
+                    #[cfg(debug_assertions)]
+                    debug_validate_gate_replay_trace(&v);
                     self.gate_replay_swap1 = Some(v);
                 }
             }
@@ -1422,8 +1563,9 @@ impl App {
         self.refresh_gate_replays();
         self.screen = Screen::Replay;
         self.gate_replay_focus = ReplayFocus::Seed;
+        self.gate_replay_scroll = 0;
         self.status =
-            "Tab focus | ←/→ step | s toggle | ↑/↓ adjust | PgUp/PgDn iter | r reload | Esc back | q quit"
+            "Tab focus | ←/→ knob | ↑/↓ scroll | PgUp/PgDn iter | r reload | Esc back | q quit"
                 .to_string();
     }
 
@@ -1454,11 +1596,140 @@ impl App {
         self.refresh_dashboard();
         self.screen = Screen::System;
         self.status =
-            "r refresh | d perf | l learning | s search | i system | Esc back | q quit".to_string();
+            "r refresh | ↑/↓ select proc | k kill | d perf | l learning | s search | Esc back | q quit"
+                .to_string();
         // Force immediate live poll on next tick.
         self.system_last_poll = Instant::now()
             .checked_sub(Duration::from_secs(10))
             .unwrap_or_else(Instant::now);
+
+        // Force immediate process refresh too.
+        self.system_proc_last_refresh = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+        self.refresh_system_procs();
+    }
+
+    fn refresh_system_procs(&mut self) {
+        // Only poll when the system screen is active.
+        if !matches!(self.screen, Screen::System) {
+            return;
+        }
+        if self.system_proc_last_refresh.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.system_proc_last_refresh = Instant::now();
+
+        let active_run_id = self.active_run_id.clone();
+        let active_metrics_bind = self.cfg.inference.metrics_bind.clone();
+        let now = Instant::now();
+
+        // Refresh sysinfo's process view with cmdline enabled (needed for classifying workers).
+        self.system_sysinfo.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything().with_cmd(UpdateKind::Always),
+        );
+
+        let mut rows: Vec<ManageProcRow> = Vec::new();
+        for (pid, proc_) in self.system_sysinfo.processes() {
+            let pid_u32 = pid.as_u32();
+            let cmd = if !proc_.cmd().is_empty() {
+                proc_
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                // Fallback: not all platforms expose full cmdline.
+                proc_.name().to_string_lossy().to_string()
+            };
+
+            let Some(kind) = manage_detect_kind(&cmd) else {
+                continue;
+            };
+
+            let tokens = manage_tokenize_cmd(&cmd);
+            let endpoints = manage_extract_endpoints(&tokens);
+
+            let mut run_id: Option<String> = None;
+            if let Some(v) = manage_parse_flag_value(&tokens, "--run-dir") {
+                run_id = manage_parse_run_id_from_run_dir(&v);
+            } else if kind == ManageProcKind::InferServer {
+                // Best-effort: match active run by metrics_bind.
+                if let Some(v) = manage_parse_flag_value(&tokens, "--metrics-bind") {
+                    if Some(v) == Some(active_metrics_bind.clone()) {
+                        run_id = active_run_id.clone();
+                    }
+                }
+            }
+
+            let last_seen = *self
+                .system_proc_last_seen_by_pid
+                .get(&pid_u32)
+                .unwrap_or(&now);
+            self.system_proc_last_seen_by_pid.insert(pid_u32, now);
+
+            let uptime_s = Some(proc_.run_time());
+
+            rows.push(ManageProcRow {
+                pid: pid_u32,
+                kind,
+                run_id,
+                endpoints,
+                cmd,
+                uptime_s,
+                last_seen,
+            });
+        }
+
+        // Stable sort for nicer UX.
+        rows.sort_by_key(|r| (manage_kind_name(r.kind).to_string(), r.pid));
+        self.system_proc_status = None;
+
+        self.system_procs = rows;
+        if self.system_proc_selected >= self.system_procs.len() {
+            self.system_proc_selected = 0;
+        }
+    }
+
+    fn poll_system_kill_job(&mut self) {
+        if !matches!(self.screen, Screen::System) {
+            return;
+        }
+        let Some(job) = self.system_kill_job.as_mut() else {
+            return;
+        };
+
+        // Refresh process table (ensure we can see cmdline and existence).
+        self.system_sysinfo.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything().with_cmd(UpdateKind::Always),
+        );
+
+        let spid = Pid::from_u32(job.pid);
+        if self.system_sysinfo.process(spid).is_none() {
+            self.system_proc_status = Some(format!("kill pid={} done", job.pid));
+            self.system_kill_job = None;
+            // Refresh list quickly to remove it.
+            self.system_proc_last_refresh = Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
+            self.refresh_system_procs();
+            return;
+        }
+
+        // Escalation: after 1500ms from start, send SIGKILL once.
+        if job.stage == ManageKillStage::TermSent && job.started.elapsed() >= Duration::from_millis(1500) {
+            if let Some(p) = self.system_sysinfo.process(spid) {
+                let _ = p.kill_with(Signal::Kill);
+            }
+            job.stage = ManageKillStage::KillSent;
+            job.last_action = Instant::now();
+            self.system_proc_status = Some(format!("kill pid={} escalated SIGKILL", job.pid));
+        }
     }
 
     fn refresh_system_live(&mut self) {
@@ -1583,10 +1854,6 @@ impl App {
     }
 
     fn start_iteration(&mut self) {
-        if self.iter.is_some() {
-            self.status = "already running".to_string();
-            return;
-        }
         let Some(run_dir) = self.run_dir() else {
             self.status = "No run selected".to_string();
             return;
@@ -1601,97 +1868,107 @@ impl App {
 
         // Best-effort save draft before starting.
         self.save_config_draft();
+        // Also write config.yaml snapshot: external `yz controller` requires it.
+        if let Err(e) = crate::config_io::save_cfg_snapshot_atomic(&run_dir, &self.cfg) {
+            self.status = format!("cannot start (failed to write config.yaml): {e}");
+            return;
+        }
 
-        // Spawn controller in background.
-        let infer_endpoint = self.cfg.inference.bind.clone();
-        let python_exe = "python".to_string();
-        let handle =
-            yz_controller::spawn_iteration(run_dir, self.cfg.clone(), infer_endpoint, python_exe);
-        self.iter = Some(handle);
+        // Spawn controller out-of-process so quitting the TUI never stops the run.
+        // We invoke the current `yz` binary (this TUI is launched via `yz tui`).
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("start failed: cannot resolve current exe: {e}");
+                return;
+            }
+        };
+        let log_path = run_dir.join("logs").join("controller.log");
+        let stdout = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.status = format!("start failed: cannot open {log_path:?}: {e}");
+                return;
+            }
+        };
+        let stderr = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.status = format!("start failed: cannot open {log_path:?}: {e}");
+                return;
+            }
+        };
+
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("controller")
+            .arg("--run-dir")
+            .arg(&run_dir)
+            .arg("--python-exe")
+            .arg("python")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr));
+
+        match cmd.spawn() {
+            Ok(child) => {
+                self.status = format!(
+                    "controller started (pid={}) | r refresh | q quit",
+                    child.id()
+                );
+            }
+            Err(e) => {
+                self.status = format!("start failed: {e}");
+                return;
+            }
+        }
         self.enter_dashboard();
     }
 
     fn cancel_iteration_hard(&mut self) {
-        if let Some(h) = &self.iter {
-            h.cancel_hard();
-            self.shutdown_requested = true;
-            self.shutdown_exit_after = false;
-            self.status = "cancelling… waiting for shutdown".to_string();
-        } else {
-            // If the run was started outside the TUI (e.g. `yz start-run`), request cancel via
-            // run-local cancel.request so the controller can observe it.
-            let Some(run_dir) = self.run_dir() else {
-                self.status = "no active run".to_string();
-                return;
-            };
-            let run_json = run_dir.join("run.json");
-            if !run_json.exists() {
-                self.status = "no active run".to_string();
-                return;
-            }
-            match yz_logging::read_manifest(&run_json) {
-                Ok(m) => {
-                    let phase = m.controller_phase.as_deref().unwrap_or("");
-                    let running = matches!(phase, "selfplay" | "train" | "gate");
-                    if running {
-                        let tmp = run_dir.join("cancel.request.tmp");
-                        let p = run_dir.join("cancel.request");
-                        if std::fs::write(&tmp, format!("ts_ms: {}\n", yz_logging::now_ms()))
-                            .and_then(|_| std::fs::rename(&tmp, &p))
-                            .is_ok()
-                        {
-                            self.shutdown_requested = true;
-                            self.shutdown_exit_after = false;
-                            self.enter_dashboard();
-                            self.status = "cancel requested… (waiting for controller)".to_string();
-                        } else {
-                            self.status = "cancel request failed".to_string();
-                        }
-                    } else {
-                        self.status = "no active run".to_string();
-                    }
-                }
-                Err(_) => {
-                    self.status = "no active run".to_string();
-                }
-            }
+        // Explicit cancel is always out-of-process: write cancel.request and let the controller observe it.
+        let Some(run_dir) = self.run_dir() else {
+            self.status = "no active run".to_string();
+            return;
+        };
+        let run_json = run_dir.join("run.json");
+        if !run_json.exists() {
+            self.status = "no active run".to_string();
+            return;
         }
-    }
-
-    fn request_quit_or_cancel(&mut self) -> bool {
-        // Returns true if the UI should exit immediately.
-        if self.iter.is_some() {
-            // Always route to dashboard while shutting down so the user can see status.
-            self.enter_dashboard();
-            if let Some(h) = &self.iter {
-                h.cancel_hard();
-            }
-            self.shutdown_requested = true;
-            self.shutdown_exit_after = true;
-            self.status = "cancelling… waiting for shutdown".to_string();
-            false
-        } else {
-            // If the run is active but was started outside the TUI, request cancel and exit.
-            let Some(run_dir) = self.run_dir() else {
-                return true;
-            };
-            let run_json = run_dir.join("run.json");
-            if !run_json.exists() {
-                return true;
-            }
-            if let Ok(m) = yz_logging::read_manifest(&run_json) {
+        match yz_logging::read_manifest(&run_json) {
+            Ok(m) => {
                 let phase = m.controller_phase.as_deref().unwrap_or("");
                 let running = matches!(phase, "selfplay" | "train" | "gate");
                 if running {
                     let tmp = run_dir.join("cancel.request.tmp");
                     let p = run_dir.join("cancel.request");
-                    let _ = std::fs::write(&tmp, format!("ts_ms: {}\n", yz_logging::now_ms()))
-                        .and_then(|_| std::fs::rename(&tmp, &p));
+                    if std::fs::write(&tmp, format!("ts_ms: {}\n", yz_logging::now_ms()))
+                        .and_then(|_| std::fs::rename(&tmp, &p))
+                        .is_ok()
+                    {
+                        self.enter_dashboard();
+                        self.status = "cancel requested…".to_string();
+                    } else {
+                        self.status = "cancel request failed".to_string();
+                    }
+                } else {
+                    self.status = "no active run".to_string();
                 }
             }
-            true
+            Err(_) => {
+                self.status = "no active run".to_string();
+            }
         }
     }
+
 }
 
 fn config_help(form: &FormState) -> String {
@@ -1772,9 +2049,7 @@ pub fn run() -> io::Result<()> {
                 match app.screen {
                     Screen::Home => match k.code {
                         KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
+                            break;
                         }
                         KeyCode::Char('r') => app.refresh_runs(),
                         KeyCode::Char('n') => {
@@ -1907,9 +2182,7 @@ pub fn run() -> io::Result<()> {
                     },
                     Screen::Config => match k.code {
                         KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
+                            break;
                         }
                         KeyCode::Esc => {
                             app.screen = Screen::Home;
@@ -1924,9 +2197,7 @@ pub fn run() -> io::Result<()> {
                     },
                     Screen::Dashboard => match k.code {
                         KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
+                            break;
                         }
                         KeyCode::Esc => {
                             app.screen = Screen::Config;
@@ -1977,9 +2248,7 @@ pub fn run() -> io::Result<()> {
                     },
                     Screen::Replay => match k.code {
                         KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
+                            break;
                         }
                         KeyCode::Esc => {
                             app.enter_dashboard();
@@ -2004,52 +2273,12 @@ pub fn run() -> io::Result<()> {
                             };
                         }
                         KeyCode::Up => {
-                            match app.gate_replay_focus {
-                                ReplayFocus::Iter => app.change_gate_replay_iter(-1),
-                                ReplayFocus::Seed => {
-                                    if !app.gate_replay_pairs.is_empty() {
-                                        app.gate_replay_selected =
-                                            app.gate_replay_selected.saturating_sub(1);
-                                        app.load_gate_replay_selected();
-                                    }
-                                }
-                                ReplayFocus::StepMode => {
-                                    app.gate_replay_step_mode = !app.gate_replay_step_mode;
-                                    app.gate_replay_step_idx = 0;
-                                    if !app.gate_replay_step_mode {
-                                        app.gate_replay_focus = ReplayFocus::Seed;
-                                    }
-                                }
-                                ReplayFocus::StepIdx => {
-                                    if app.gate_replay_step_mode {
-                                        app.gate_replay_step_idx = app.gate_replay_step_idx.saturating_sub(1);
-                                    }
-                                }
-                            }
+                            // Scroll transcript up.
+                            app.gate_replay_scroll = app.gate_replay_scroll.saturating_sub(1);
                         }
                         KeyCode::Down => {
-                            match app.gate_replay_focus {
-                                ReplayFocus::Iter => app.change_gate_replay_iter(1),
-                                ReplayFocus::Seed => {
-                                    if !app.gate_replay_pairs.is_empty() {
-                                        app.gate_replay_selected =
-                                            (app.gate_replay_selected + 1).min(app.gate_replay_pairs.len() - 1);
-                                        app.load_gate_replay_selected();
-                                    }
-                                }
-                                ReplayFocus::StepMode => {
-                                    app.gate_replay_step_mode = !app.gate_replay_step_mode;
-                                    app.gate_replay_step_idx = 0;
-                                    if !app.gate_replay_step_mode {
-                                        app.gate_replay_focus = ReplayFocus::Seed;
-                                    }
-                                }
-                                ReplayFocus::StepIdx => {
-                                    if app.gate_replay_step_mode {
-                                        app.gate_replay_step_idx = app.gate_replay_step_idx.saturating_add(1);
-                                    }
-                                }
-                            }
+                            // Scroll transcript down (clamped at render time).
+                            app.gate_replay_scroll = app.gate_replay_scroll.saturating_add(1);
                         }
                         KeyCode::Char('s') => {
                             app.gate_replay_step_mode = !app.gate_replay_step_mode;
@@ -2060,19 +2289,74 @@ pub fn run() -> io::Result<()> {
                                 // ok
                             }
                         }
-                        KeyCode::Char(' ') | KeyCode::Right => {
+                        KeyCode::Char(' ') => {
+                            // Convenience step forward.
                             if app.gate_replay_step_mode {
                                 app.gate_replay_step_idx = app.gate_replay_step_idx.saturating_add(1);
+                                app.gate_replay_scroll = 0;
                             }
                         }
-                        KeyCode::Char('b') | KeyCode::Left => {
+                        KeyCode::Char('b') => {
+                            // Convenience step back.
                             if app.gate_replay_step_mode {
                                 app.gate_replay_step_idx = app.gate_replay_step_idx.saturating_sub(1);
+                                app.gate_replay_scroll = 0;
                             }
                         }
+                        KeyCode::Left => match app.gate_replay_focus {
+                            ReplayFocus::Iter => app.change_gate_replay_iter(-1),
+                            ReplayFocus::Seed => {
+                                if !app.gate_replay_pairs.is_empty() {
+                                    app.gate_replay_selected =
+                                        app.gate_replay_selected.saturating_sub(1);
+                                    app.load_gate_replay_selected();
+                                }
+                            }
+                            ReplayFocus::StepMode => {
+                                app.gate_replay_step_mode = !app.gate_replay_step_mode;
+                                app.gate_replay_step_idx = 0;
+                                app.gate_replay_scroll = 0;
+                                if !app.gate_replay_step_mode {
+                                    app.gate_replay_focus = ReplayFocus::Seed;
+                                }
+                            }
+                            ReplayFocus::StepIdx => {
+                                if app.gate_replay_step_mode {
+                                    app.gate_replay_step_idx =
+                                        app.gate_replay_step_idx.saturating_sub(1);
+                                    app.gate_replay_scroll = 0;
+                                }
+                            }
+                        },
+                        KeyCode::Right => match app.gate_replay_focus {
+                            ReplayFocus::Iter => app.change_gate_replay_iter(1),
+                            ReplayFocus::Seed => {
+                                if !app.gate_replay_pairs.is_empty() {
+                                    app.gate_replay_selected = (app.gate_replay_selected + 1)
+                                        .min(app.gate_replay_pairs.len() - 1);
+                                    app.load_gate_replay_selected();
+                                }
+                            }
+                            ReplayFocus::StepMode => {
+                                app.gate_replay_step_mode = !app.gate_replay_step_mode;
+                                app.gate_replay_step_idx = 0;
+                                app.gate_replay_scroll = 0;
+                                if !app.gate_replay_step_mode {
+                                    app.gate_replay_focus = ReplayFocus::Seed;
+                                }
+                            }
+                            ReplayFocus::StepIdx => {
+                                if app.gate_replay_step_mode {
+                                    app.gate_replay_step_idx =
+                                        app.gate_replay_step_idx.saturating_add(1);
+                                    app.gate_replay_scroll = 0;
+                                }
+                            }
+                        },
                         KeyCode::Home => {
                             if app.gate_replay_step_mode {
                                 app.gate_replay_step_idx = 0;
+                                app.gate_replay_scroll = 0;
                             }
                         }
                         KeyCode::End => {
@@ -2081,15 +2365,14 @@ pub fn run() -> io::Result<()> {
                                 let max1 = app.gate_replay_swap1.as_ref().map(|t| t.steps.len()).unwrap_or(0);
                                 let max = max0.max(max1);
                                 app.gate_replay_step_idx = max.saturating_sub(1);
+                                app.gate_replay_scroll = 0;
                             }
                         }
                         _ => {}
                     },
                     Screen::Search => match k.code {
                         KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
+                            break;
                         }
                         KeyCode::Esc => {
                             // Back to dashboard (keep the current tab).
@@ -2142,13 +2425,16 @@ pub fn run() -> io::Result<()> {
                     },
                     Screen::System => match k.code {
                         KeyCode::Char('q') => {
-                            if app.request_quit_or_cancel() {
-                                break;
-                            }
+                            break;
                         }
                         KeyCode::Esc => {
                             // Back to dashboard (keep the current tab).
-                            app.enter_dashboard();
+                            if app.system_proc_kill_confirm {
+                                app.system_proc_kill_confirm = false;
+                                app.system_proc_status = Some("kill cancelled".to_string());
+                            } else {
+                                app.enter_dashboard();
+                            }
                         }
                         KeyCode::Char('d') => {
                             app.dashboard_tab = DashboardTab::Performance;
@@ -2165,6 +2451,68 @@ pub fn run() -> io::Result<()> {
                                 .checked_sub(Duration::from_secs(10))
                                 .unwrap_or_else(Instant::now);
                             app.refresh_system_live();
+                            app.system_proc_last_refresh = Instant::now()
+                                .checked_sub(Duration::from_secs(10))
+                                .unwrap_or_else(Instant::now);
+                            app.refresh_system_procs();
+                        }
+                        KeyCode::Up => {
+                            if !app.system_procs.is_empty() {
+                                app.system_proc_selected = app.system_proc_selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if !app.system_procs.is_empty() {
+                                app.system_proc_selected =
+                                    (app.system_proc_selected + 1).min(app.system_procs.len() - 1);
+                            }
+                        }
+                        KeyCode::Char('k') => {
+                            if !app.system_procs.is_empty() {
+                                app.system_proc_kill_confirm = true;
+                                let pid = app.system_procs[app.system_proc_selected].pid;
+                                app.system_proc_status =
+                                    Some(format!("confirm kill pid={pid}? (y/n)"));
+                            }
+                        }
+                        KeyCode::Char('n') => {
+                            if app.system_proc_kill_confirm {
+                                app.system_proc_kill_confirm = false;
+                                app.system_proc_status = Some("kill cancelled".to_string());
+                            }
+                        }
+                        KeyCode::Char('y') => {
+                            if app.system_proc_kill_confirm && !app.system_procs.is_empty() {
+                                // Kill flow: SIGTERM, wait, then SIGKILL.
+                                let pid = app.system_procs[app.system_proc_selected].pid;
+                                app.system_proc_kill_confirm = false;
+                                let spid = Pid::from_u32(pid);
+                                app.system_sysinfo.refresh_processes_specifics(
+                                    ProcessesToUpdate::All,
+                                    true,
+                                    ProcessRefreshKind::everything().with_cmd(UpdateKind::Always),
+                                );
+                                let ok_term = app
+                                    .system_sysinfo
+                                    .process(spid)
+                                    .and_then(|p| p.kill_with(Signal::Term))
+                                    .unwrap_or(false);
+
+                                app.system_kill_job = Some(ManageKillJob {
+                                    pid,
+                                    stage: ManageKillStage::TermSent,
+                                    started: Instant::now(),
+                                    last_action: Instant::now(),
+                                });
+                                app.system_proc_status = Some(format!(
+                                    "kill pid={pid}: term_ok={} (waiting…)",
+                                    ok_term
+                                ));
+                                app.system_proc_last_refresh = Instant::now()
+                                    .checked_sub(Duration::from_secs(10))
+                                    .unwrap_or_else(Instant::now);
+                                app.refresh_system_procs();
+                            }
                         }
                         _ => {}
                     },
@@ -2216,6 +2564,8 @@ pub fn run() -> io::Result<()> {
             }
             if matches!(app.screen, Screen::System) {
                 app.refresh_system_live();
+                app.refresh_system_procs();
+                app.poll_system_kill_job();
             }
             last_tick = Instant::now();
         }
@@ -5267,7 +5617,11 @@ fn fmt_dice_inline(dice: &[u8]) -> String {
     if dice.is_empty() {
         return "-".to_string();
     }
-    dice.iter().map(|d| die_face(*d)).collect::<Vec<_>>().iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+    // Use extra spacing between dice so they're easier to scan in a terminal.
+    dice.iter()
+        .map(|d| die_face(*d).to_string())
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 fn label_for_player(p: u8, cand_seat: u8) -> &'static str {
@@ -5275,6 +5629,51 @@ fn label_for_player(p: u8, cand_seat: u8) -> &'static str {
         "Cand"
     } else {
         "Best"
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_validate_gate_replay_trace(t: &GateReplayFileV1) {
+    if t.steps.is_empty() {
+        return;
+    }
+    // Decode marks per player from the action stream, then compare to filled categories at the end.
+    let mut marks = [0usize, 0usize];
+    for s in &t.steps {
+        if (s.chosen_action_idx as usize) < yz_core::A {
+            match yz_core::index_to_action(s.chosen_action_idx) {
+                yz_core::Action::Mark(_) => {
+                    let p = s.player_to_move_before as usize;
+                    if p < 2 {
+                        marks[p] += 1;
+                    }
+                }
+                yz_core::Action::KeepMask(_) => {}
+            }
+        }
+    }
+    let last = t.steps.last().unwrap();
+    for p in 0usize..2 {
+        let filled = last.players_after[p]
+            .filled_raw
+            .iter()
+            .filter(|x| x.is_some())
+            .count();
+        // This is intentionally "soft": older/partial traces may not include fully consistent
+        // per-step player snapshots. We mainly want to detect impossible states like
+        // "more filled categories than mark actions".
+        debug_assert!(
+            filled <= marks[p],
+            "gate replay validation failed: filled > marks (p={p}, marks={}, filled={})",
+            marks[p],
+            filled
+        );
+        debug_assert!(
+            marks[p] <= yz_core::NUM_CATS,
+            "gate replay validation failed: marks > NUM_CATS (p={p}, marks={}, NUM_CATS={})",
+            marks[p],
+            yz_core::NUM_CATS
+        );
     }
 }
 
@@ -5328,19 +5727,19 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
     };
     hdr.push(mk(
         ReplayFocus::Iter,
-        format!("Iter: {iter_s} ({iter_pos})   (PgUp/PgDn or [ / ])"),
+        format!("Iter: {iter_s} ({iter_pos})   (←/→ when focused; PgUp/PgDn also works)"),
     ));
     hdr.push(mk(
         ReplayFocus::Seed,
         format!(
-            "Seed: {seed} ({}/{})   (↑/↓ when focused)",
+            "Seed: {seed} ({}/{})   (←/→ when focused)",
             app.gate_replay_selected.saturating_add(1),
             n
         ),
     ));
     hdr.push(mk(
         ReplayFocus::StepMode,
-        format!("Step mode: {mode}   (s or ↑/↓ when focused)"),
+        format!("Step mode: {mode}   (←/→ when focused; s also works)"),
     ));
     if app.gate_replay_step_mode {
         hdr.push(mk(
@@ -5354,21 +5753,21 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         )));
     }
     hdr.push(Line::from(Span::styled(
-        " Tab focus | r reload | Esc back",
+        " Tab focus | ↑/↓ scroll | r reload | Esc back",
         Style::default().fg(Color::DarkGray),
     )));
 
     let hdr_p = Paragraph::new(hdr).block(Block::default().title(title).borders(Borders::ALL));
     f.render_widget(hdr_p, rows[0]);
 
-    // Body: 4 panels
+    // Body: 4 panels (scoreboards wider)
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(16),
-            Constraint::Percentage(34),
-            Constraint::Percentage(16),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
         ])
         .split(rows[1]);
 
@@ -5380,31 +5779,21 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         }
     }
 
-    fn render_transcript(app: &App, which: u8, t: Option<&GateReplayFileV1>, h: u16) -> Vec<Line<'static>> {
-        let mut out: Vec<Line<'static>> = Vec::new();
-        out.push(Line::from(Span::styled(
-            format!("swap={which} transcript"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
+    fn render_transcript(app: &App, which: u8, t: Option<&GateReplayFileV1>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        out.push(format!("swap={which} transcript"));
         let Some(t) = t else {
-            out.push(Line::from("(missing)"));
+            out.push("(missing)".to_string());
             return out;
         };
-        out.push(Line::from(format!(
-            "run={} iter={} trace_v={}  swap={}  seats(cand={},best={})",
-            t.run_id, t.iter_idx, t.trace_version, t.swap, t.cand_seat, t.best_seat
-        )));
-        out.push(Line::from(format!(
-            "model_ids(best={},cand={})",
-            t.best_model_id, t.cand_model_id
-        )));
+        // Remove stats from the transcript header; just show who starts.
         let starts = t
             .steps
             .first()
             .map(|s| label_for_player(s.player_to_move_before, t.cand_seat))
             .unwrap_or("?");
-        out.push(Line::from(format!("{starts} starts.")));
-        out.push(Line::from(""));
+        out.push(format!("{starts} starts."));
+        out.push(String::new());
 
         let steps: &[GateReplayStepV1] = if app.gate_replay_step_mode {
             let upto = app.gate_replay_step_idx.min(t.steps.len().saturating_sub(1));
@@ -5414,31 +5803,30 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         };
 
         let mut bonus_prev = [false, false];
-        let mut last_actor: Option<u8> = None;
+        let mut turn_count = [0u32, 0u32];
+        let mut in_turn = [false, false];
 
         for s in steps {
             let action = decode_action(s.chosen_action_idx);
             let actor = s.player_to_move_before;
             let actor_name = label_for_player(actor, t.cand_seat);
 
-            // Start a new turn block at rerolls_left=2 when actor changes or previous block ended.
-            let new_turn = s.rerolls_left_before == 2 && last_actor != Some(actor);
-            if new_turn {
-                out.push(Line::from(Span::styled(
-                    format!("{actor_name}: turn {}", s.turn_idx),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                out.push(Line::from("-------"));
+            // Start-of-turn: rerolls_left==2. Compute turn numbers per-player (not using trace turn_idx).
+            if s.rerolls_left_before == 2 && !in_turn[actor as usize] {
+                in_turn[actor as usize] = true;
+                let tno = turn_count[actor as usize].saturating_add(1);
+                out.push(format!("{actor_name}: turn {tno}"));
+                out.push("─".repeat(18));
             }
 
             match action {
                 Some(yz_core::Action::KeepMask(mask)) => {
                     let kept = kept_dice_from_mask(s.dice_sorted_before, mask);
-                    out.push(Line::from(format!(
-                        " r :  {}  → k: {}",
+                    out.push(format!(
+                        " r : {} → k: {}",
                         fmt_dice_inline(&s.dice_sorted_before),
                         fmt_dice_inline(&kept)
-                    )));
+                    ));
                 }
                 Some(yz_core::Action::Mark(cat)) => {
                     let raw = yz_core::scores_for_dice(s.dice_sorted_before)[cat as usize];
@@ -5446,42 +5834,25 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
                     let bonus_now = s.players_after[pidx].upper_bonus_awarded;
                     let bonus_add = if !bonus_prev[pidx] && bonus_now { " +50" } else { "" };
                     bonus_prev[pidx] = bonus_now;
-                    out.push(Line::from(format!(
-                        " m :  {}  → {}: {}p{bonus_add}",
+                    out.push(format!(
+                        " m : {} → {}: {}p{bonus_add}",
                         fmt_dice_inline(&s.dice_sorted_before),
                         cat_name_short(cat),
                         raw
-                    )));
-                    out.push(Line::from("-------"));
-                    out.push(Line::from(""));
+                    ));
+                    out.push(String::new());
+                    // End-of-turn: a Mark ends the player's turn.
+                    in_turn[actor as usize] = false;
+                    turn_count[actor as usize] = turn_count[actor as usize].saturating_add(1);
                 }
                 None => {
-                    out.push(Line::from(format!(
+                    out.push(format!(
                         " ? :  {}  → {} ({})",
                         fmt_dice_inline(&s.dice_sorted_before),
                         s.chosen_action_str,
                         s.chosen_action_idx
-                    )));
+                    ));
                 }
-            }
-
-            last_actor = Some(actor);
-            if out.len() as u16 >= h.saturating_sub(2) {
-                out.push(Line::from(Span::styled(
-                    "… (truncated)",
-                    Style::default().fg(Color::DarkGray),
-                )));
-                break;
-            }
-        }
-
-        if !app.gate_replay_step_mode {
-            if let Some(term) = &t.terminal {
-                out.push(Line::from(""));
-                out.push(Line::from(format!(
-                    "terminal: outcome={} cand={} best={}",
-                    term.outcome, term.cand_score, term.best_score
-                )));
             }
         }
 
@@ -5509,30 +5880,96 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         };
         let s = &t.steps[idx];
 
-        for p in 0u8..=1u8 {
-            let ps = &s.players_after[p as usize];
-            let who = label_for_player(p, t.cand_seat);
-            let avail_left = ps.avail_mask.count_ones();
-            let bonus = if ps.upper_bonus_awarded { "+50" } else { "-" };
-            out.push(Line::from(format!(
-                "{who}: total={}  upper={}/63  upper_raw={}  bonus={}  avail_left={}",
-                ps.total_score, ps.upper_total_cap, ps.upper_raw_sum, bonus, avail_left
-            )));
-            for cat in 0u8..(yz_core::NUM_CATS as u8) {
-                let v = ps.filled_raw[cat as usize]
-                    .map(|x| x.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                out.push(Line::from(format!("  {:<9} {}", cat_name_short(cat), v)));
-                if out.len() as u16 >= h.saturating_sub(2) {
-                    out.push(Line::from(Span::styled(
-                        "…",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    return out;
-                }
+        // Scoreboard columns: starting player on the left.
+        let starter = t
+            .steps
+            .first()
+            .map(|s| s.player_to_move_before)
+            .unwrap_or(t.cand_seat);
+        let other = if starter == 0 { 1 } else { 0 };
+        let left_label = label_for_player(starter, t.cand_seat);
+        let right_label = label_for_player(other, t.cand_seat);
+
+        let ps_l = &s.players_after[starter as usize];
+        let ps_r = &s.players_after[other as usize];
+
+        out.push(Line::from(Span::styled(
+            format!("{:<10} {:>6} {:>6}", "Category", left_label, right_label),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let mut upper_l = 0i32;
+        let mut upper_r = 0i32;
+        for cat in 0u8..=5u8 {
+            let vl = ps_l.filled_raw[cat as usize].map(|x| x as i32);
+            let vr = ps_r.filled_raw[cat as usize].map(|x| x as i32);
+            if let Some(x) = vl {
+                upper_l += x;
             }
-            out.push(Line::from(""));
+            if let Some(x) = vr {
+                upper_r += x;
+            }
+            let sl = vl.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+            let sr = vr.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+            out.push(Line::from(format!(
+                "{:<10} {:>6} {:>6}",
+                cat_name_short(cat),
+                sl,
+                sr
+            )));
         }
+        out.push(Line::from(Span::styled(
+            "──────────────",
+            Style::default().fg(Color::DarkGray),
+        )));
+        out.push(Line::from(format!(
+            "{:<10} {:>6} {:>6}",
+            "UpperTot", upper_l, upper_r
+        )));
+        let bonus_l = if upper_l >= 63 { 50 } else { 0 };
+        let bonus_r = if upper_r >= 63 { 50 } else { 0 };
+        out.push(Line::from(format!(
+            "{:<10} {:>6} {:>6}",
+            "Bonus", bonus_l, bonus_r
+        )));
+        out.push(Line::from(""));
+
+        for cat in 6u8..=(yz_core::NUM_CATS as u8).saturating_sub(1) {
+            let vl = ps_l.filled_raw[cat as usize].map(|x| x as i32);
+            let vr = ps_r.filled_raw[cat as usize].map(|x| x as i32);
+            let sl = vl.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+            let sr = vr.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+            out.push(Line::from(format!(
+                "{:<10} {:>6} {:>6}",
+                cat_name_short(cat),
+                sl,
+                sr
+            )));
+            if out.len() as u16 >= h.saturating_sub(2) {
+                out.push(Line::from(Span::styled(
+                    "…",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                return out;
+            }
+        }
+
+        let sum_raw = |ps: &GateReplayPlayerV1| -> i32 {
+            ps.filled_raw
+                .iter()
+                .filter_map(|x| x.map(|v| v as i32))
+                .sum()
+        };
+        let total_l = sum_raw(ps_l) + bonus_l;
+        let total_r = sum_raw(ps_r) + bonus_r;
+        out.push(Line::from(Span::styled(
+            "──────────────",
+            Style::default().fg(Color::DarkGray),
+        )));
+        out.push(Line::from(format!(
+            "{:<10} {:>6} {:>6}",
+            "Total", total_l, total_r
+        )));
         out
     }
 
@@ -5542,13 +5979,31 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
     let t0 = app.gate_replay_swap0.as_ref();
     let t1 = app.gate_replay_swap1.as_ref();
 
-    let a0 = if let Some(e) = &app.gate_replay_err {
-        err_lines(e)
+    let t0_full: Vec<String> = if let Some(e) = &app.gate_replay_err {
+        vec![format!("(unavailable: {e})")]
     } else if app.gate_replay_pairs.is_empty() {
-        empty_lines.clone()
+        vec!["(no replay traces found)".to_string()]
     } else {
-        render_transcript(app, 0, t0, cols[0].height.saturating_sub(2))
+        render_transcript(app, 0, t0)
     };
+    let t1_full: Vec<String> = if let Some(e) = &app.gate_replay_err {
+        vec![format!("(unavailable: {e})")]
+    } else if app.gate_replay_pairs.is_empty() {
+        vec!["(no replay traces found)".to_string()]
+    } else {
+        render_transcript(app, 1, t1)
+    };
+
+    let view_h0 = cols[0].height.saturating_sub(2) as usize;
+    let max_start0 = t0_full.len().saturating_sub(view_h0);
+    let start0 = app.gate_replay_scroll.min(max_start0);
+    let a0: Vec<Line<'static>> = t0_full
+        .iter()
+        .skip(start0)
+        .take(view_h0)
+        .map(|s| Line::from(s.clone()))
+        .collect();
+
     let s0 = if let Some(e) = &app.gate_replay_err {
         err_lines(e)
     } else if app.gate_replay_pairs.is_empty() {
@@ -5556,13 +6011,15 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
     } else {
         render_scoreboard(app, 0, t0, cols[1].height.saturating_sub(2))
     };
-    let a1 = if let Some(e) = &app.gate_replay_err {
-        err_lines(e)
-    } else if app.gate_replay_pairs.is_empty() {
-        empty_lines.clone()
-    } else {
-        render_transcript(app, 1, t1, cols[2].height.saturating_sub(2))
-    };
+    let view_h2 = cols[2].height.saturating_sub(2) as usize;
+    let max_start2 = t1_full.len().saturating_sub(view_h2);
+    let start2 = app.gate_replay_scroll.min(max_start2);
+    let a1: Vec<Line<'static>> = t1_full
+        .iter()
+        .skip(start2)
+        .take(view_h2)
+        .map(|s| Line::from(s.clone()))
+        .collect();
     let s1 = if let Some(e) = &app.gate_replay_err {
         err_lines(e)
     } else if app.gate_replay_pairs.is_empty() {
@@ -6198,7 +6655,12 @@ fn draw_system(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let left_block = Block::default().title("System / Inference").borders(Borders::ALL);
     f.render_widget(Paragraph::new(left).block(left_block), cols[0]);
 
-    // Right: sparklines (prefer live series, fall back to playback samples).
+    // Right: sparklines (top) + manage panel (bottom).
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(22), Constraint::Min(5)].as_ref())
+        .split(cols[1]);
+
     let spark_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
@@ -6211,7 +6673,7 @@ fn draw_system(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
             ]
             .as_ref(),
         )
-        .split(cols[1]);
+        .split(right_rows[0]);
 
     let series_q = if app.system_series_queue_depth.is_empty() {
         app.infer_snapshots
@@ -6284,6 +6746,87 @@ fn draw_system(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
             .data(&series_wb),
         spark_rows[4],
     );
+
+    // Manage panel.
+    let mut manage_lines: Vec<Line> = Vec::new();
+    manage_lines.push(Line::from(Span::styled(
+        "Processes",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if let Some(s) = &app.system_proc_status {
+        manage_lines.push(Line::from(vec![
+            Span::styled("status:", Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::raw(s.clone()),
+        ]));
+    }
+    manage_lines.push(Line::from(Span::styled(
+        " pid    type        run      up    seen   endpoints",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    for (i, p) in app.system_procs.iter().enumerate() {
+        let sel = i == app.system_proc_selected;
+        let prefix = if sel { "▸" } else { " " };
+        let style = if sel {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let run = p.run_id.clone().unwrap_or_else(|| "-".to_string());
+        let eps = if p.endpoints.is_empty() {
+            "-".to_string()
+        } else {
+            p.endpoints.join(" ")
+        };
+        let up = p
+            .uptime_s
+            .map(|s| format!("{:>5}s", s))
+            .unwrap_or_else(|| "    -".to_string());
+        let seen = format!("{:>4}s", p.last_seen.elapsed().as_secs().min(9999));
+        // Keep line compact; cmd is available in kill confirm message.
+        let mut line = format!(
+            "{prefix} {:<6} {:<10} {:<8} {} {} {}",
+            p.pid,
+            manage_kind_name(p.kind),
+            run,
+            up,
+            seen,
+            eps
+        );
+        const MAX: usize = 120;
+        if line.len() > MAX {
+            line.truncate(MAX);
+            line.push('…');
+        }
+        manage_lines.push(Line::from(Span::styled(line, style)));
+    }
+
+    if app.system_proc_kill_confirm && !app.system_procs.is_empty() {
+        let p = &app.system_procs[app.system_proc_selected];
+        manage_lines.push(Line::from(""));
+        manage_lines.push(Line::from(vec![
+            Span::styled("CONFIRM", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" kill pid={} type={} ?", p.pid, manage_kind_name(p.kind))),
+        ]));
+        let mut cmd = p.cmd.clone();
+        const MAXC: usize = 160;
+        if cmd.len() > MAXC {
+            cmd.truncate(MAXC);
+            cmd.push_str("…");
+        }
+        manage_lines.push(Line::from(format!(" cmd: {cmd}")));
+        manage_lines.push(Line::from(" y: kill (TERM→KILL) | n/Esc: cancel"));
+    } else {
+        manage_lines.push(Line::from(""));
+        manage_lines.push(Line::from(Span::styled(
+            " ↑/↓ select | k kill | r refresh",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let manage_block = Block::default().title("Manage").borders(Borders::ALL);
+    f.render_widget(Paragraph::new(manage_lines).block(manage_block), right_rows[1]);
 }
 
 #[cfg(test)]
@@ -6324,6 +6867,51 @@ mod selfplay_summary_parse_tests {
         assert_eq!(v.visit_entropy_norm_p50, Some(0.42));
         assert_eq!(v.late_eval_discard_frac, Some(0.07));
         assert_eq!(v.delta_root_value_mean, Some(0.03));
+    }
+}
+
+#[cfg(test)]
+mod manage_parse_tests {
+    use super::*;
+
+    #[test]
+    fn detects_kinds() {
+        assert_eq!(
+            manage_detect_kind("uv run python -m yatzy_az infer-server --bind unix:///tmp/x"),
+            Some(ManageProcKind::InferServer)
+        );
+        assert_eq!(
+            manage_detect_kind("yz controller --run-dir runs/r1"),
+            Some(ManageProcKind::Controller)
+        );
+        assert_eq!(
+            manage_detect_kind("yz selfplay-worker --run-dir runs/r1 --infer unix:///tmp/x"),
+            Some(ManageProcKind::SelfplayWorker)
+        );
+        assert_eq!(
+            manage_detect_kind("yz gate-worker --run-dir runs/r1 --infer unix:///tmp/x"),
+            Some(ManageProcKind::GateWorker)
+        );
+    }
+
+    #[test]
+    fn parses_run_id_from_run_dir() {
+        assert_eq!(
+            manage_parse_run_id_from_run_dir("runs/abc"),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            manage_parse_run_id_from_run_dir("/tmp/foo/runs/xyz"),
+            Some("xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_endpoints() {
+        let cmd = "yz selfplay-worker --run-dir runs/r1 --infer unix:///tmp/y.sock";
+        let toks = manage_tokenize_cmd(cmd);
+        let eps = manage_extract_endpoints(&toks);
+        assert!(eps.iter().any(|s| s.contains("--infer=")));
     }
 }
 
