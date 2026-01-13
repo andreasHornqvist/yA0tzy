@@ -1,8 +1,7 @@
 ---
-
-## task: Implement TUI run extension + replay + server management + oracle diagnostics
-
+task: Implement TUI run extension + replay + server management + oracle diagnostics
 test_command: "cargo test -p yz-tui"
+---
 
 # Task: TUI Feature Suite (Implementation)
 
