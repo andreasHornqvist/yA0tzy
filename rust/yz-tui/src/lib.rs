@@ -389,6 +389,9 @@ struct App {
     active_run_id: Option<String>,
     extend_source_run_id: Option<String>,
     extend_include_replay: bool,
+    /// When extending a run, how many *additional* iterations to run beyond the source's
+    /// completed controller_iteration_idx.
+    extend_additional_iterations: u32,
     extend_return_to: Screen,
     cfg: yz_core::Config,
     form: FormState,
@@ -474,6 +477,7 @@ impl App {
             active_run_id: None,
             extend_source_run_id: None,
             extend_include_replay: false,
+            extend_additional_iterations: 1,
             extend_return_to: Screen::Home,
             cfg: crate::config_io::default_cfg_for_new_run(),
             form: FormState::default(),
@@ -587,10 +591,13 @@ impl App {
         let src = self.runs[self.selected].clone();
         self.extend_source_run_id = Some(src);
         self.extend_include_replay = false;
+        self.extend_additional_iterations = 1;
         self.extend_input.clear();
         self.extend_return_to = return_to;
         self.screen = Screen::ExtendingRun;
-        self.status = "Extend run: type new name | Space: toggle replay copy | Enter: confirm | Esc: cancel".to_string();
+        self.status =
+            "Extend run: type name | Up/Down: +iters | Space: copy replay | Enter: confirm | Esc: cancel"
+                .to_string();
     }
 
     fn begin_extend_active_run(&mut self, return_to: Screen) {
@@ -599,10 +606,13 @@ impl App {
         };
         self.extend_source_run_id = Some(src);
         self.extend_include_replay = false;
+        self.extend_additional_iterations = 1;
         self.extend_input.clear();
         self.extend_return_to = return_to;
         self.screen = Screen::ExtendingRun;
-        self.status = "Extend run: type new name | Space: toggle replay copy | Enter: confirm | Esc: cancel".to_string();
+        self.status =
+            "Extend run: type name | Up/Down: +iters | Space: copy replay | Enter: confirm | Esc: cancel"
+                .to_string();
     }
 
     fn extend_run_with_name(&mut self, name: &str) -> io::Result<String> {
@@ -672,23 +682,16 @@ impl App {
             }
         }
 
-        // Load the copied config. If the source run already completed all planned iterations,
-        // bump total_iterations so the extended run is runnable immediately (common expectation).
-        //
-        // Without this, extending a completed run will show "done (completed N/N)" and pressing
-        // 'g' won't start anything because controller_iteration_idx == total_iterations.
+        // Load the copied config and set total_iterations as *additional* iterations beyond the
+        // source's completed controller_iteration_idx (as selected in the UI).
         let mut cfg = yz_core::Config::load(&dst_cfg).unwrap_or_default();
         let cur = src_manifest.controller_iteration_idx;
-        let planned = cfg.controller.total_iterations.unwrap_or(cur.max(1));
-        let mut bumped_total: Option<u32> = None;
-        if planned <= cur {
-            let new_total = cur.saturating_add(1).max(1);
-            cfg.controller.total_iterations = Some(new_total);
-            bumped_total = Some(new_total);
-            // Keep draft (if present) consistent with the snapshot, since Config screen prefers draft.
-            if dst_draft.exists() {
-                let _ = crate::config_io::save_cfg_draft_atomic(&dst_dir, &cfg);
-            }
+        let add = self.extend_additional_iterations.max(1);
+        let new_total = cur.saturating_add(add).max(1);
+        cfg.controller.total_iterations = Some(new_total);
+        // Keep draft (if present) consistent with the snapshot, since Config screen prefers draft.
+        if dst_draft.exists() {
+            let _ = crate::config_io::save_cfg_draft_atomic(&dst_dir, &cfg);
         }
 
         // Normalize + hash into config.yaml, then write a fresh run.json that continues counting
@@ -743,11 +746,7 @@ impl App {
             gate_oracle_keepall_ignored: None,
             controller_phase: Some("idle".to_string()),
             controller_status: Some(format!(
-                "extended from {src_id} (continue at iter {}){}",
-                src_manifest.controller_iteration_idx,
-                bumped_total
-                    .map(|t| format!(", bumped total_iterations to {t}"))
-                    .unwrap_or_default()
+                "extended from {src_id} (continue at iter {cur}, total_iterations={new_total})"
             )),
             controller_last_ts_ms: Some(now),
             controller_error: None,
@@ -1593,11 +1592,27 @@ pub fn run() -> io::Result<()> {
                                 }
                             }
                         }
+                        KeyCode::Up => {
+                            app.extend_additional_iterations =
+                                app.extend_additional_iterations.saturating_add(1);
+                        }
+                        KeyCode::Down => {
+                            app.extend_additional_iterations =
+                                app.extend_additional_iterations.saturating_sub(1).max(1);
+                        }
                         KeyCode::Backspace => {
                             app.extend_input.pop();
                         }
                         KeyCode::Char(' ') => {
                             app.extend_include_replay = !app.extend_include_replay;
+                        }
+                        KeyCode::Char('+') => {
+                            app.extend_additional_iterations =
+                                app.extend_additional_iterations.saturating_add(1);
+                        }
+                        KeyCode::Char('-') => {
+                            app.extend_additional_iterations =
+                                app.extend_additional_iterations.saturating_sub(1).max(1);
                         }
                         KeyCode::Char(c) => {
                             if !c.is_control() {
@@ -3014,6 +3029,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 "  Copy replay: {}  (Space to toggle)",
                 if app.extend_include_replay { "yes" } else { "no" }
             )));
+            lines.push(Line::from(format!(
+                "  Additional iterations: {}  (Up/Down or +/-)",
+                app.extend_additional_iterations.max(1)
+            )));
             lines.push(Line::from(""));
             lines.push(Line::from("  Enter a name for the new run:"));
             lines.push(Line::from(""));
@@ -3474,12 +3493,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 } else if phase == "idle" {
                     right_lines.push(Line::from("No iteration running."));
                 } else if phase == "done" {
-                    // Common case for extended runs: we intentionally do not copy the source run's
-                    // per-iteration summaries, so the Performance table can be empty even though
-                    // controller_iteration_idx > 0.
-                    right_lines.push(Line::from(format!(
-                        "Run complete. To keep going, set controller.total_iterations > {cur_idx} in Config and press 'g'."
-                    )));
+                    right_lines.push(Line::from("Run complete."));
                 } else {
                     right_lines.push(Line::from(format!(
                         "no iteration summary for idx={cur_idx}"
