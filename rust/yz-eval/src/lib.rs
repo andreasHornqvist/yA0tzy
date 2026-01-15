@@ -13,6 +13,7 @@ use yz_infer::ClientOptions;
 use yz_mcts::{ChanceMode, InferBackend, Mcts, MctsConfig, SearchDriver};
 #[cfg(test)]
 use yz_oracle as oracle_mod;
+use yz_core::PlayerState;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct OracleDiagEvent {
@@ -28,6 +29,304 @@ pub struct OracleDiagEvent {
 
 pub trait OracleDiagSink {
     fn on_step(&mut self, ev: &OracleDiagEvent);
+}
+
+// --- Fixed oracle set (for stable per-iteration diagnostics) ---
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub struct OracleSliceStateV1 {
+    pub avail_mask: u16,
+    pub upper_total_cap: u8,
+    pub dice_sorted: [u8; 5],
+    pub rerolls_left: u8,
+}
+
+fn oracle_set_path(id: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    dir.join("../../configs/oracle_sets")
+        .join(format!("{id}.json"))
+}
+
+pub fn load_oracle_set(id: &str) -> Result<Vec<OracleSliceStateV1>, GateError> {
+    let path = oracle_set_path(id);
+    let bytes = fs::read(&path)
+        .map_err(|e| GateError::SeedSet(format!("failed to read {}: {e}", path.display())))?;
+    let v = parse_oracle_set_json(&bytes)
+        .map_err(|e| GateError::SeedSet(format!("failed to parse {}: {e}", path.display())))?;
+    if v.is_empty() {
+        return Err(GateError::SeedSet(format!(
+            "oracle set {} is empty (path={})",
+            id,
+            path.display()
+        )));
+    }
+    Ok(v)
+}
+
+pub fn parse_oracle_set_json(bytes: &[u8]) -> Result<Vec<OracleSliceStateV1>, serde_json::Error> {
+    serde_json::from_slice::<Vec<OracleSliceStateV1>>(bytes)
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OracleFixedReport {
+    pub set_id: String,
+    pub num_states: u64,
+    pub total: u64,
+    pub matched: u64,
+    pub total_mark: u64,
+    pub matched_mark: u64,
+    pub total_reroll: u64,
+    pub matched_reroll: u64,
+    pub keepall_ignored: u64,
+    /// Bucketed by rerolls_left (2/1/0).
+    pub total_by_r: [u64; 3],
+    pub matched_by_r: [u64; 3],
+
+    /// Per-action counts for the *chosen* action index (0..A-1).
+    pub action_total: Vec<u64>,
+    pub action_matched: Vec<u64>,
+
+    /// Per-action counts for how often the candidate *chose* each action (0..A-1).
+    ///
+    /// This lets us compute e.g. “how often was this action oracle-optimal, given that the
+    /// candidate chose it?” i.e. action-level precision.
+    pub chosen_total: Vec<u64>,
+
+    /// Per-turn (turn index) counts. turn_idx = 0..14 based on filled categories.
+    pub turn_total: Vec<u64>,
+    pub turn_matched: Vec<u64>,
+}
+
+impl OracleFixedReport {
+    pub fn match_rate_overall(&self) -> f64 {
+        if self.total == 0 { 0.0 } else { self.matched as f64 / self.total as f64 }
+    }
+    pub fn match_rate_mark(&self) -> f64 {
+        if self.total_mark == 0 { 0.0 } else { self.matched_mark as f64 / self.total_mark as f64 }
+    }
+    pub fn match_rate_reroll(&self) -> f64 {
+        if self.total_reroll == 0 { 0.0 } else { self.matched_reroll as f64 / self.total_reroll as f64 }
+    }
+}
+
+fn connect_one_backend(
+    endpoint: &str,
+    model_id: u32,
+    client_opts: &ClientOptions,
+) -> Result<InferBackend, GateError> {
+    if let Some(rest) = endpoint.strip_prefix("unix://") {
+        #[cfg(unix)]
+        {
+            return Ok(InferBackend::connect_uds(rest, model_id, client_opts.clone())?);
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(GateError::BadEndpoint(endpoint.to_string()));
+        }
+    }
+    if let Some(rest) = endpoint.strip_prefix("tcp://") {
+        return Ok(InferBackend::connect_tcp(rest, model_id, client_opts.clone())?);
+    }
+    Err(GateError::BadEndpoint(endpoint.to_string()))
+}
+
+fn should_ignore_oracle_action_v1(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
+    matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
+}
+
+fn oracle_action_to_core(oa: yz_oracle::Action) -> yz_core::Action {
+    match oa {
+        yz_oracle::Action::Mark { cat } => yz_core::Action::Mark(cat),
+        yz_oracle::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
+    }
+}
+
+fn canonicalize_keepmask(dice_sorted: [u8; 5], mask: u8) -> u8 {
+    debug_assert!(dice_sorted.windows(2).all(|w| w[0] <= w[1]));
+    debug_assert!(mask < 32);
+
+    // Count kept faces.
+    let mut need = [0u8; 6];
+    for i in 0..5usize {
+        let bit = 1u8 << (4 - i);
+        if (mask & bit) != 0 {
+            let face = dice_sorted[i] as usize;
+            debug_assert!((1..=6).contains(&face));
+            need[face - 1] = need[face - 1].saturating_add(1);
+        }
+    }
+
+    // Reconstruct canonical mask by keeping the rightmost occurrences for each face.
+    let mut out: u8 = 0;
+    for i in (0..5usize).rev() {
+        let bit = 1u8 << (4 - i);
+        let face = dice_sorted[i] as usize;
+        let slot = face - 1;
+        if need[slot] > 0 {
+            need[slot] -= 1;
+            out |= bit;
+        }
+    }
+    out
+}
+
+pub fn eval_fixed_oracle_set(
+    _cfg: &yz_core::Config,
+    infer_endpoint: &str,
+    cand_model_id: u32,
+    client_opts: &ClientOptions,
+    mut mcts_cfg: MctsConfig,
+    set_id: &str,
+    states: &[OracleSliceStateV1],
+    mut progress: Option<&mut dyn FnMut(u64, u64)>,
+) -> Result<OracleFixedReport, GateError> {
+    // Match gating: no Dirichlet noise in eval.
+    mcts_cfg.dirichlet_epsilon = 0.0;
+
+    let oracle = yz_oracle::oracle();
+    let backend = connect_one_backend(infer_endpoint, cand_model_id, client_opts)?;
+
+    let mut rep = OracleFixedReport {
+        set_id: set_id.to_string(),
+        num_states: states.len() as u64,
+        action_total: vec![0u64; yz_core::A],
+        action_matched: vec![0u64; yz_core::A],
+        chosen_total: vec![0u64; yz_core::A],
+        turn_total: vec![0u64; yz_core::NUM_CATS],
+        turn_matched: vec![0u64; yz_core::NUM_CATS],
+        ..OracleFixedReport::default()
+    };
+    rep.num_states = states.len() as u64;
+
+    let total_states = states.len() as u64;
+    if let Some(cb) = progress.as_deref_mut() {
+        cb(0, total_states);
+    }
+    for (idx, st) in states.iter().enumerate() {
+        // Build a canonical 1v1 state with a constant opponent. This makes the metric stable.
+        let gs = yz_core::GameState {
+            players: [
+                PlayerState {
+                    avail_mask: st.avail_mask,
+                    upper_total_cap: st.upper_total_cap,
+                    total_score: 0,
+                },
+                PlayerState {
+                    avail_mask: 0x7fff,
+                    upper_total_cap: 0,
+                    total_score: 0,
+                },
+            ],
+            dice_sorted: st.dice_sorted,
+            rerolls_left: st.rerolls_left,
+            player_to_move: 0,
+        };
+        let seed = splitmix64(
+            (st.avail_mask as u64)
+                ^ ((st.upper_total_cap as u64) << 16)
+                ^ ((st.rerolls_left as u64) << 24)
+                ^ (st.dice_sorted[0] as u64)
+                ^ ((st.dice_sorted[1] as u64) << 8)
+                ^ ((st.dice_sorted[2] as u64) << 16)
+                ^ ((st.dice_sorted[3] as u64) << 24)
+                ^ ((st.dice_sorted[4] as u64) << 32),
+        );
+        let chance_mode = ChanceMode::Rng { seed };
+
+        let mut mcts = Mcts::new(mcts_cfg).map_err(|_| GateError::InvalidConfig("bad mcts cfg"))?;
+        let mut search = mcts.begin_search_with_backend(gs, chance_mode, &backend);
+        let sr = loop {
+            // Use a modest work chunk; SearchDriver stops when budget is reached.
+            if let Some(sr) = search.tick(&mut mcts, &backend, 2048) {
+                break sr;
+            }
+        };
+        let chosen_idx = argmax_tie_lowest(&sr.pi);
+        let chosen = yz_core::index_to_action(chosen_idx);
+
+        let (oa, _ev) =
+            oracle.best_action(st.avail_mask, st.upper_total_cap, st.dice_sorted, st.rerolls_left);
+        if should_ignore_oracle_action_v1(oa, st.rerolls_left) {
+            rep.keepall_ignored += 1;
+            continue;
+        }
+        let expected = oracle_action_to_core(oa);
+        let expected_canon = match expected {
+            yz_core::Action::KeepMask(mask) => {
+                yz_core::Action::KeepMask(canonicalize_keepmask(st.dice_sorted, mask))
+            }
+            _ => expected,
+        };
+        let chosen_canon = match chosen {
+            yz_core::Action::KeepMask(mask) => {
+                yz_core::Action::KeepMask(canonicalize_keepmask(st.dice_sorted, mask))
+            }
+            _ => chosen,
+        };
+        let is_match = chosen_canon == expected_canon;
+
+        let chosen_ai = yz_core::action_to_index(chosen_canon) as usize;
+        if chosen_ai < rep.chosen_total.len() {
+            rep.chosen_total[chosen_ai] += 1;
+        }
+
+        let avail = st.avail_mask;
+        let available = avail.count_ones() as i32;
+        let filled = (yz_core::NUM_CATS as i32 - available).clamp(0, yz_core::NUM_CATS as i32);
+        let turn_idx = filled as usize;
+        if turn_idx < rep.turn_total.len() {
+            rep.turn_total[turn_idx] += 1;
+            if is_match {
+                rep.turn_matched[turn_idx] += 1;
+            }
+        }
+
+        let ai = yz_core::action_to_index(expected_canon) as usize;
+        if ai < yz_core::A && ai < rep.action_total.len() && ai < rep.action_matched.len() {
+            rep.action_total[ai] += 1;
+            if is_match {
+                rep.action_matched[ai] += 1;
+            }
+        }
+
+        rep.total += 1;
+        if is_match {
+            rep.matched += 1;
+        }
+        match chosen {
+            yz_core::Action::Mark(_) => {
+                rep.total_mark += 1;
+                if is_match {
+                    rep.matched_mark += 1;
+                }
+            }
+            yz_core::Action::KeepMask(_) => {
+                rep.total_reroll += 1;
+                if is_match {
+                    rep.matched_reroll += 1;
+                }
+            }
+        }
+        let b = match st.rerolls_left {
+            2 => 0,
+            1 => 1,
+            _ => 2,
+        };
+        rep.total_by_r[b] += 1;
+        if is_match {
+            rep.matched_by_r[b] += 1;
+        }
+
+        // Progress callback (periodic + final).
+        if let Some(cb) = progress.as_deref_mut() {
+            let done = (idx + 1) as u64;
+            if done == total_states || done.is_multiple_of(32) {
+                cb(done, total_states);
+            }
+        }
+    }
+
+    Ok(rep)
 }
 
 // --- Gating replay traces (for TUI replay viewer) ---
@@ -271,6 +570,34 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+fn state_hash_for_search_seed(s: &yz_core::GameState) -> u64 {
+    let p0 = &s.players[0];
+    let p1 = &s.players[1];
+    let mut x = 0u64;
+    x ^= p0.avail_mask as u64;
+    x ^= (p1.avail_mask as u64) << 16;
+    x ^= (p0.upper_total_cap as u64) << 32;
+    x ^= (p1.upper_total_cap as u64) << 40;
+    x ^= (p0.total_score as u64) << 48;
+    x ^= (p1.total_score as u64) << 56;
+    x ^= (s.player_to_move as u64) << 8;
+    x ^= (s.rerolls_left as u64) << 12;
+    x ^= (s.dice_sorted[0] as u64) << 1;
+    x ^= (s.dice_sorted[1] as u64) << 4;
+    x ^= (s.dice_sorted[2] as u64) << 7;
+    x ^= (s.dice_sorted[3] as u64) << 10;
+    x ^= (s.dice_sorted[4] as u64) << 13;
+    splitmix64(x)
+}
+
+fn gating_search_seed(episode_seed: u64, state: &yz_core::GameState, ply: u32) -> u64 {
+    splitmix64(
+        episode_seed
+            ^ state_hash_for_search_seed(state)
+            ^ (ply as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    )
 }
 
 #[derive(Clone)]
@@ -715,7 +1042,6 @@ fn gate_schedule_subset_with_backends(
         cand_seat: u8,
         ctx: TurnContext,
         state: yz_core::GameState,
-        chance_mode: ChanceMode,
         mcts: Mcts,
         search: Option<SearchDriver>,
         search_backend: BackendSel,
@@ -742,15 +1068,6 @@ fn gate_schedule_subset_with_backends(
                 TurnContext::new_rng(gs.episode_seed)
             };
             let state = initial_state(&mut ctx);
-            let chance_mode = if cfg.gating.deterministic_chance {
-                ChanceMode::Deterministic {
-                    episode_seed: gs.episode_seed,
-                }
-            } else {
-                ChanceMode::Rng {
-                    seed: gs.episode_seed,
-                }
-            };
 
             let cand_seat = if gs.swap { 1u8 } else { 0u8 };
             let mcts =
@@ -761,7 +1078,6 @@ fn gate_schedule_subset_with_backends(
                 cand_seat,
                 ctx,
                 state,
-                chance_mode,
                 mcts,
                 search: None,
                 search_backend: BackendSel::Best,
@@ -802,6 +1118,7 @@ fn gate_schedule_subset_with_backends(
 
         fn step(
             &mut self,
+            cfg: &yz_core::Config,
             best_backend: &InferBackend,
             cand_backend: &InferBackend,
             max_work: u32,
@@ -827,9 +1144,18 @@ fn gate_schedule_subset_with_backends(
             if self.search.is_none() {
                 let (backend, sel, _cand_turn) = self.backend_for_turn(best_backend, cand_backend);
                 self.search_backend = sel;
+                let search_mode = if cfg.gating.deterministic_chance {
+                    ChanceMode::Rng {
+                        seed: gating_search_seed(self.gs.episode_seed, &self.state, self.ply),
+                    }
+                } else {
+                    ChanceMode::Rng {
+                        seed: self.gs.episode_seed,
+                    }
+                };
                 let d = self
                     .mcts
-                    .begin_search_with_backend(self.state, self.chance_mode, backend);
+                    .begin_search_with_backend(self.state, search_mode, backend);
                 self.search = Some(d);
             }
 
@@ -1019,7 +1345,7 @@ fn gate_schedule_subset_with_backends(
             if !t.active && next_idx >= schedule.len() {
                 continue;
             }
-            let r = t.step(best_backend, cand_backend, 64, &mut oracle_sink, &mut replay_sink)?;
+            let r = t.step(cfg, best_backend, cand_backend, 64, &mut oracle_sink, &mut replay_sink)?;
             match r.status {
                 StepStatus::Progress => {
                     made_progress = true;
@@ -1651,5 +1977,53 @@ gating:
     fn win_ci95_halfpoint_smoke_bounds() {
         let (lo, hi) = win_ci95_halfpoint(10, 10, 10);
         assert!(0.0 <= lo && lo <= hi && hi <= 1.0);
+    }
+
+    #[test]
+    fn oracle_set_json_parses() {
+        let bytes = br#"[
+  {"avail_mask": 32767, "upper_total_cap": 0, "dice_sorted": [1,2,3,4,5], "rerolls_left": 2},
+  {"avail_mask": 1, "upper_total_cap": 63, "dice_sorted": [6,6,6,6,6], "rerolls_left": 0}
+]"#;
+        let v = parse_oracle_set_json(bytes).expect("parse");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].dice_sorted, [1, 2, 3, 4, 5]);
+        assert_eq!(v[1].rerolls_left, 0);
+    }
+
+    #[test]
+    fn gating_search_seed_is_reproducible_and_varies_with_state_and_ply() {
+        let mut ctx = TurnContext::new_deterministic(123);
+        let s0 = initial_state(&mut ctx);
+        let a = gating_search_seed(999, &s0, 0);
+        let b = gating_search_seed(999, &s0, 0);
+        assert_eq!(a, b);
+
+        let c = gating_search_seed(999, &s0, 1);
+        assert_ne!(a, c);
+
+        // Mutate state slightly (dice) and ensure seed changes.
+        let mut s1 = s0;
+        s1.dice_sorted = [1, 1, 1, 1, 1];
+        let d = gating_search_seed(999, &s1, 0);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn deterministic_execution_is_stable_for_same_seed_and_action() {
+        let seed = 424242u64;
+        let mut ctx0 = TurnContext::new_deterministic(seed);
+        let mut ctx1 = TurnContext::new_deterministic(seed);
+        let s0 = initial_state(&mut ctx0);
+        let s1 = initial_state(&mut ctx1);
+        assert_eq!(s0.dice_sorted, s1.dice_sorted);
+
+        // Apply a deterministic KeepMask transition on both.
+        let a = yz_core::Action::KeepMask(0); // reroll all dice
+        let n0 = apply_action(s0, a, &mut ctx0).unwrap();
+        let n1 = apply_action(s1, a, &mut ctx1).unwrap();
+        assert_eq!(n0.dice_sorted, n1.dice_sorted);
+        assert_eq!(n0.rerolls_left, n1.rerolls_left);
+        assert_eq!(n0.player_to_move, n1.player_to_move);
     }
 }
