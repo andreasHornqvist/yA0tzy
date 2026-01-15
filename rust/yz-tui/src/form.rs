@@ -89,6 +89,9 @@ pub enum FieldId {
     GatingKatagoSprtAlpha,
     GatingKatagoSprtBeta,
     GatingKatagoSprtDelta,
+    GatingFixedOracleEnabled,
+    GatingFixedOracleSetId,
+    GatingFixedOracleN,
 
     // replay
     ReplayCapacityShards,
@@ -100,6 +103,7 @@ pub enum FieldId {
     ModelHiddenDim,
     ModelNumBlocks,
     ModelKind,
+
 }
 
 #[allow(dead_code)]
@@ -160,7 +164,10 @@ impl FieldId {
             | FieldId::GatingKatagoSprtMaxGames
             | FieldId::GatingKatagoSprtAlpha
             | FieldId::GatingKatagoSprtBeta
-            | FieldId::GatingKatagoSprtDelta => Section::Pipeline,
+            | FieldId::GatingKatagoSprtDelta
+            | FieldId::GatingFixedOracleEnabled
+            | FieldId::GatingFixedOracleSetId
+            | FieldId::GatingFixedOracleN => Section::Pipeline,
 
             // Model
             FieldId::ModelHiddenDim
@@ -182,8 +189,8 @@ impl FieldId {
             FieldId::InferMaxWaitUs => "inference.max_wait_us",
             FieldId::InferTorchThreads => "inference.torch_threads",
             FieldId::InferTorchInteropThreads => "inference.torch_interop_threads",
-            FieldId::InferDebugLog => "inference.debug_log (YZ_DEBUG_LOG)",
-            FieldId::InferPrintStats => "inference.print_stats (YZ_INFER_PRINT_STATS)",
+            FieldId::InferDebugLog => "inference.debug_log",
+            FieldId::InferPrintStats => "inference.print_stats",
 
             FieldId::MctsCPuct => "mcts.c_puct",
             FieldId::MctsBudgetReroll => "mcts.budget_reroll",
@@ -206,8 +213,8 @@ impl FieldId {
             FieldId::TrainingMode => "training.mode",
             FieldId::TrainingBatchSize => "training.batch_size",
             FieldId::TrainingLearningRate => "training.learning_rate",
-            FieldId::TrainingContinuousCandidateTraining => "training.continuous_candidate_training (Space to toggle)",
-            FieldId::TrainingResetOptimizer => "training.reset_optimizer (Space to toggle)",
+            FieldId::TrainingContinuousCandidateTraining => "training.continuous_candidate_training",
+            FieldId::TrainingResetOptimizer => "training.reset_optimizer",
             FieldId::TrainingOptimizer => "training.optimizer",
             FieldId::TrainingEpochs => "training.epochs",
             FieldId::TrainingWeightDecay => "training.weight_decay",
@@ -225,6 +232,9 @@ impl FieldId {
             FieldId::GatingKatagoSprtAlpha => "gating.katago.sprt_alpha (false promote rate α)",
             FieldId::GatingKatagoSprtBeta => "gating.katago.sprt_beta (false reject rate β)",
             FieldId::GatingKatagoSprtDelta => "gating.katago.sprt_delta (± band around threshold)",
+            FieldId::GatingFixedOracleEnabled => "gating.fixed_oracle.enabled",
+            FieldId::GatingFixedOracleSetId => "gating.fixed_oracle.set_id",
+            FieldId::GatingFixedOracleN => "gating.fixed_oracle.n",
 
             FieldId::ReplayCapacityShards => "replay.capacity_shards",
 
@@ -233,6 +243,7 @@ impl FieldId {
             FieldId::ModelHiddenDim => "model.hidden_dim",
             FieldId::ModelNumBlocks => "model.num_blocks",
             FieldId::ModelKind => "model.kind",
+
         }
     }
 }
@@ -340,6 +351,9 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::GatingPairedSeedSwap,
     FieldId::GatingDeterministicChance,
     FieldId::GatingWinRateThreshold,
+    FieldId::GatingFixedOracleEnabled,
+    FieldId::GatingFixedOracleSetId,
+    FieldId::GatingFixedOracleN,
 
     // Model
     FieldId::ModelHiddenDim,

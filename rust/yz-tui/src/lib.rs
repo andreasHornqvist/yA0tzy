@@ -145,6 +145,7 @@ enum Screen {
     Config,
     Dashboard,
     Replay,
+    Oracle,
     Search,
     System,
 }
@@ -163,6 +164,7 @@ enum ManageProcKind {
     SelfplayWorker,
     GateWorker,
     InferServer,
+    OracleFixedWorker,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +198,7 @@ fn manage_kind_name(k: ManageProcKind) -> &'static str {
         ManageProcKind::Controller => "controller",
         ManageProcKind::SelfplayWorker => "selfplay",
         ManageProcKind::GateWorker => "gate",
+        ManageProcKind::OracleFixedWorker => "oracle-fixed",
     }
 }
 
@@ -208,6 +211,9 @@ fn manage_detect_kind(cmd: &str) -> Option<ManageProcKind> {
     }
     if cmd.contains("gate-worker") {
         return Some(ManageProcKind::GateWorker);
+    }
+    if cmd.contains("oracle-fixed-worker") {
+        return Some(ManageProcKind::OracleFixedWorker);
     }
     if cmd.contains(" controller") || cmd.contains("yz-controller") {
         return Some(ManageProcKind::Controller);
@@ -436,6 +442,18 @@ struct SelfplaySummaryNdjsonV1 {
     pi_eff_actions_p50: Option<f64>,
     #[serde(default)]
     pi_eff_actions_p95: Option<f64>,
+    #[serde(default)]
+    keep_mass_p50: Option<f64>,
+    #[serde(default)]
+    keep_mass_p95: Option<f64>,
+    #[serde(default)]
+    keep_eff_actions_p50: Option<f64>,
+    #[serde(default)]
+    keep_eff_actions_p95: Option<f64>,
+    #[serde(default)]
+    mark_eff_actions_p50: Option<f64>,
+    #[serde(default)]
+    mark_eff_actions_p95: Option<f64>,
 
     // Search stability + improvement.
     #[serde(default)]
@@ -535,6 +553,81 @@ struct InferSnapshotNdjsonV1 {
     would_block_frac: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct OracleFixedSummaryNdjsonV1 {
+    // Present to support forward/backward compatible NDJSON parsing.
+    #[allow(dead_code)]
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    iter_idx: Option<u32>,
+    #[serde(default)]
+    set_id: Option<String>,
+    #[serde(default)]
+    num_states: Option<u64>,
+    #[serde(default)]
+    match_rate_overall: Option<f64>,
+    #[serde(default)]
+    match_rate_mark: Option<f64>,
+    #[serde(default)]
+    match_rate_reroll: Option<f64>,
+    #[serde(default)]
+    keepall_ignored: Option<u64>,
+    #[serde(default)]
+    r2_total: Option<u64>,
+    #[serde(default)]
+    r2_matched: Option<u64>,
+    #[serde(default)]
+    r1_total: Option<u64>,
+    #[serde(default)]
+    r1_matched: Option<u64>,
+    #[serde(default)]
+    r0_total: Option<u64>,
+    #[serde(default)]
+    r0_matched: Option<u64>,
+
+    // Per-action counts (optional; newer schema).
+    #[serde(default)]
+    action_total: Option<Vec<u64>>,
+    #[serde(default)]
+    action_matched: Option<Vec<u64>>,
+    #[serde(default)]
+    chosen_total: Option<Vec<u64>>,
+    #[serde(default)]
+    turn_total: Option<Vec<u64>>,
+    #[serde(default)]
+    turn_matched: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct OracleFixedProgressFileV1 {
+    #[serde(default)]
+    #[allow(dead_code)]
+    iter_idx: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    shard_idx: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    num_shards: Option<u32>,
+    #[serde(default)]
+    done: Option<u64>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pid: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    ts_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OracleFixedProgressAgg {
+    done: u64,
+    total: u64,
+}
+
 #[derive(Debug, Clone)]
 struct SystemLiveSample {
     ts: Instant,
@@ -600,6 +693,8 @@ struct App {
     selfplay_by_iter: HashMap<u32, SelfplaySummaryNdjsonV1>,
     infer_snapshots: Vec<InferSnapshotNdjsonV1>,
     infer_last_ts_ms: u64,
+    oracle_fixed_by_iter: HashMap<u32, OracleFixedSummaryNdjsonV1>,
+    oracle_fixed_progress_by_iter: HashMap<u32, OracleFixedProgressAgg>,
 
     // Replay buffer visualization (best-effort, cheap: small JSON snapshots + meta filenames).
     replay_loaded_for_run: Option<String>,
@@ -666,6 +761,13 @@ struct App {
     naming_input: String,
     /// Input buffer for naming an extended run.
     extend_input: String,
+
+    // Oracle screen state
+    oracle_selected_iter: u32,
+    oracle_follow: bool,
+    oracle_actions_scroll: usize,
+    oracle_actions_len: usize,
+    oracle_actions_height: usize,
 }
 
 impl App {
@@ -704,6 +806,8 @@ impl App {
             selfplay_by_iter: HashMap::new(),
             infer_snapshots: Vec::new(),
             infer_last_ts_ms: 0,
+            oracle_fixed_by_iter: HashMap::new(),
+            oracle_fixed_progress_by_iter: HashMap::new(),
 
             replay_loaded_for_run: None,
             replay_last_poll: Instant::now(),
@@ -760,6 +864,12 @@ impl App {
             shutdown_exit_after: false,
             naming_input: String::new(),
             extend_input: String::new(),
+
+            oracle_selected_iter: 0,
+            oracle_follow: true,
+            oracle_actions_scroll: 0,
+            oracle_actions_len: 0,
+            oracle_actions_height: 0,
         }
     }
 
@@ -1002,6 +1112,7 @@ impl App {
         if let Some(run_dir) = self.run_dir() {
             let (cfg, msg) = crate::config_io::load_cfg_for_run(&run_dir);
             self.cfg = cfg;
+            ensure_fixed_oracle_defaults(&mut self.cfg);
             self.form = FormState::default();
             if let Some(msg) = msg {
                 self.form.last_validation_error = None;
@@ -1424,6 +1535,8 @@ impl App {
             self.selfplay_by_iter.clear();
             self.infer_snapshots.clear();
             self.infer_last_ts_ms = 0;
+            self.oracle_fixed_by_iter.clear();
+            self.oracle_fixed_progress_by_iter.clear();
 
             // Reset replay buffer cache when switching runs.
             self.replay_loaded_for_run = None;
@@ -1534,7 +1647,67 @@ impl App {
                         self.infer_snapshots.drain(0..drain);
                     }
                 }
+                "oracle_fixed_summary_v1" => {
+                    let Ok(os) = serde_json::from_value::<OracleFixedSummaryNdjsonV1>(v) else {
+                        continue;
+                    };
+                    let Some(i) = os.iter_idx else {
+                        continue;
+                    };
+                    self.oracle_fixed_by_iter.insert(i, os);
+                }
                 _ => {}
+            }
+        }
+
+        // Also refresh fixed-oracle progress (best-effort).
+        self.refresh_oracle_fixed_progress(run_dir);
+    }
+
+    fn refresh_oracle_fixed_progress(&mut self, run_dir: &Path) {
+        self.oracle_fixed_progress_by_iter.clear();
+        let base = run_dir.join("oracle_fixed");
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("iter_") {
+                continue;
+            }
+            let Some(iter_idx) = name
+                .strip_prefix("iter_")
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(files) = std::fs::read_dir(&p) else {
+                continue;
+            };
+            let mut agg = OracleFixedProgressAgg::default();
+            for f in files.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let fname = fp.file_name().unwrap_or_default().to_string_lossy();
+                if !fname.starts_with("progress_") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&fp) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_slice::<OracleFixedProgressFileV1>(&bytes) else {
+                    continue;
+                };
+                agg.done += v.done.unwrap_or(0);
+                agg.total += v.total.unwrap_or(0);
+            }
+            if agg.total > 0 {
+                self.oracle_fixed_progress_by_iter.insert(iter_idx, agg);
             }
         }
     }
@@ -1551,7 +1724,7 @@ impl App {
             self.status = "cancelling… waiting for shutdown | R refresh".to_string();
         } else {
             self.status =
-                "r replay | R refresh | l toggle learning/perf | d perf | s search | i system | e extend | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
+                "r replay | o oracle | R refresh | l toggle learning/perf | d perf | s search | i system | e extend | x cancel | ↑/↓ scroll | PgUp/PgDn | Home/End | Esc back | q quit"
                     .to_string();
         }
     }
@@ -1585,6 +1758,26 @@ impl App {
         }
         self.status =
             "r refresh | d perf | l learning | i system | s search | ↑/↓ select | PgUp/PgDn | Home/End | Esc back | q quit"
+                .to_string();
+    }
+
+    fn enter_oracle(&mut self) {
+        if self.active_run_id.is_none() {
+            return;
+        }
+        self.refresh_dashboard();
+        self.screen = Screen::Oracle;
+        self.oracle_follow = true;
+        self.oracle_actions_scroll = 0;
+        if let Some(m) = &self.dashboard_manifest {
+            self.oracle_selected_iter = m.controller_iteration_idx;
+        } else if let Some(k) = self.oracle_fixed_by_iter.keys().max().copied() {
+            self.oracle_selected_iter = k;
+        } else {
+            self.oracle_selected_iter = 0;
+        }
+        self.status =
+            "←/→ iter | ↑/↓ scroll | PgUp/PgDn | End follow | R refresh | Esc back | q quit"
                 .to_string();
     }
 
@@ -2038,7 +2231,7 @@ pub fn run() -> io::Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| draw(f, &app))?;
+        terminal.draw(|f| draw(f, &mut app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -2136,6 +2329,7 @@ pub fn run() -> io::Result<()> {
                                     if let Some(run_dir) = app.run_dir() {
                                         let (cfg, msg) = crate::config_io::load_cfg_for_run(&run_dir);
                                         app.cfg = cfg;
+                                        ensure_fixed_oracle_defaults(&mut app.cfg);
                                         app.form = FormState::default();
                                         if let Some(msg) = msg {
                                             app.status = msg;
@@ -2218,6 +2412,7 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::Char('s') => app.enter_search(),
                         KeyCode::Char('i') => app.enter_system(),
+                        KeyCode::Char('o') => app.enter_oracle(),
                         KeyCode::Char('r') => app.enter_replay(),
                         KeyCode::Char('R') => app.refresh_dashboard(),
                         KeyCode::Char('x') => app.cancel_iteration_hard(),
@@ -2516,6 +2711,59 @@ pub fn run() -> io::Result<()> {
                         }
                         _ => {}
                     },
+                    Screen::Oracle => match k.code {
+                        KeyCode::Char('q') => {
+                            break;
+                        }
+                        KeyCode::Esc => {
+                            app.enter_dashboard();
+                        }
+                        KeyCode::Char('R') | KeyCode::Char('r') => app.refresh_dashboard(),
+                        KeyCode::Left => {
+                            app.oracle_follow = false;
+                            app.oracle_selected_iter = app.oracle_selected_iter.saturating_sub(1);
+                            app.oracle_actions_scroll = 0;
+                        }
+                        KeyCode::Right => {
+                            app.oracle_follow = false;
+                            app.oracle_selected_iter = app.oracle_selected_iter.saturating_add(1);
+                            app.oracle_actions_scroll = 0;
+                        }
+                        KeyCode::Up => {
+                            app.oracle_actions_scroll =
+                                app.oracle_actions_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            let max_scroll = app
+                                .oracle_actions_len
+                                .saturating_sub(app.oracle_actions_height);
+                            app.oracle_actions_scroll =
+                                (app.oracle_actions_scroll + 1).min(max_scroll);
+                        }
+                        KeyCode::PageUp => {
+                            let step = app.oracle_actions_height.max(1);
+                            app.oracle_actions_scroll =
+                                app.oracle_actions_scroll.saturating_sub(step);
+                        }
+                        KeyCode::PageDown => {
+                            let step = app.oracle_actions_height.max(1);
+                            let max_scroll = app
+                                .oracle_actions_len
+                                .saturating_sub(app.oracle_actions_height);
+                            app.oracle_actions_scroll =
+                                (app.oracle_actions_scroll + step).min(max_scroll);
+                        }
+                        KeyCode::End => {
+                            app.oracle_follow = true;
+                            if let Some(m) = &app.dashboard_manifest {
+                                app.oracle_selected_iter = m.controller_iteration_idx;
+                            } else if let Some(k) = app.oracle_fixed_by_iter.keys().max().copied() {
+                                app.oracle_selected_iter = k;
+                            }
+                            app.oracle_actions_scroll = 0;
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -2777,7 +3025,53 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
         out
     }
 
+    // list_oracle_sets moved to a shared helper (see `ensure_fixed_oracle_defaults`).
+
     match field {
+        FieldId::GatingFixedOracleEnabled => {
+            app.cfg.gating.fixed_oracle.enabled = !app.cfg.gating.fixed_oracle.enabled;
+            // Sensible defaults on enable.
+            if app.cfg.gating.fixed_oracle.enabled {
+                ensure_fixed_oracle_defaults(&mut app.cfg);
+            }
+        }
+        FieldId::GatingFixedOracleSetId => {
+            // Space-cycle over available oracle set ids (pick-list).
+            let sets = list_oracle_sets();
+            if sets.is_empty() {
+                // No sets found. Keep current value; validation will guide the user.
+                return;
+            } else {
+                let cur = app
+                    .cfg
+                    .gating
+                    .fixed_oracle
+                    .set_id
+                    .clone()
+                    .unwrap_or_default();
+                let idx = sets.iter().position(|s| *s == cur);
+                let next_idx = match idx {
+                    None => 0,
+                    Some(i) => (i + 1) % sets.len(),
+                };
+                app.cfg.gating.fixed_oracle.set_id = Some(sets[next_idx].clone());
+            }
+        }
+        FieldId::GatingFixedOracleN => {
+            // Cycle through common sizes + None (meaning "all").
+            let opts: [Option<u32>; 6] = [
+                Some(256),
+                Some(512),
+                Some(1024),
+                Some(2048),
+                Some(4096),
+                None,
+            ];
+            let cur = app.cfg.gating.fixed_oracle.n;
+            let idx = opts.iter().position(|x| *x == cur).unwrap_or(0);
+            let next = (idx + 1) % opts.len();
+            app.cfg.gating.fixed_oracle.n = opts[next];
+        }
         FieldId::GatingSeedSetId => {
             // Space-cycle over available seed set ids: None -> first -> ... -> None.
             let sets = list_seed_sets();
@@ -2896,6 +3190,44 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
         app.form.last_validation_error = Some(e);
     } else {
         app.form.last_validation_error = None;
+    }
+}
+
+fn list_oracle_sets() -> Vec<String> {
+    use std::path::PathBuf;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/oracle_sets");
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+const DEFAULT_ORACLE_SET_ID: &str = "fixed_balanced_v2";
+
+fn ensure_fixed_oracle_defaults(cfg: &mut yz_core::Config) {
+    // Always make set_id explicit if possible (even when disabled), to avoid the
+    // “blank but later auto-picked” UX.
+    if cfg.gating.fixed_oracle.set_id.as_deref().unwrap_or("").trim().is_empty() {
+        let sets = list_oracle_sets();
+        if sets.iter().any(|s| s == DEFAULT_ORACLE_SET_ID) {
+            cfg.gating.fixed_oracle.set_id = Some(DEFAULT_ORACLE_SET_ID.to_string());
+        } else if let Some(first) = sets.first().cloned() {
+            cfg.gating.fixed_oracle.set_id = Some(first);
+        }
+    }
+    // Keep a sensible default for N when enabled.
+    if cfg.gating.fixed_oracle.enabled && cfg.gating.fixed_oracle.n.is_none() {
+        cfg.gating.fixed_oracle.n = Some(4096);
     }
 }
 
@@ -3266,6 +3598,31 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 _ => Err("model.kind must be residual|mlp".to_string()),
             }
         }
+
+        FieldId::GatingFixedOracleEnabled => {
+            let b = match buf.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => true,
+                "false" | "0" | "no" | "n" => false,
+                _ => {
+                    return Err("gating.fixed_oracle.enabled must be true|false".to_string());
+                }
+            };
+            cfg.gating.fixed_oracle.enabled = b;
+            Ok(())
+        }
+        FieldId::GatingFixedOracleSetId => {
+            let s = buf.trim();
+            cfg.gating.fixed_oracle.set_id = if s.is_empty() { None } else { Some(s.to_string()) };
+            Ok(())
+        }
+        FieldId::GatingFixedOracleN => {
+            cfg.gating.fixed_oracle.n = if buf.trim().is_empty() {
+                None
+            } else {
+                Some(buf.parse::<u32>().map_err(|_| "invalid u32".to_string())?)
+            };
+            Ok(())
+        }
     }
 }
 
@@ -3370,6 +3727,15 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::ModelHiddenDim => cfg.model.hidden_dim.to_string(),
         FieldId::ModelNumBlocks => cfg.model.num_blocks.to_string(),
         FieldId::ModelKind => cfg.model.kind.clone(),
+
+        FieldId::GatingFixedOracleEnabled => cfg.gating.fixed_oracle.enabled.to_string(),
+        FieldId::GatingFixedOracleSetId => cfg.gating.fixed_oracle.set_id.clone().unwrap_or_default(),
+        FieldId::GatingFixedOracleN => cfg
+            .gating
+            .fixed_oracle
+            .n
+            .map(|x| x.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -3690,7 +4056,7 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
     app.form.last_validation_error = None;
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
@@ -3875,7 +4241,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     const W_GG: usize = 11; // "GatingGames" is 11 chars
                     const W_WR: usize = 6; // "WinRate" is 6 chars
                     const W_SCORE: usize = 11; // " 123.4/ 567.8"
-                    const W_ORA: usize = 6; // "Oracle"
+                    const W_ORA: usize = 14; // "0.00/0.00/0.00"
                     left.push(Line::from(Span::styled(
                         format!(
                             "  {iter:>W_ITER$}   {dec:>W_DEC$}   {gg:>W_GG$}   {wr:>W_WR$}   {sc:>W_SCORE$}   {ora:>W_ORA$}   {loss}",
@@ -3884,7 +4250,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             gg = "GatingGames",
                             wr = "WinRate",
                             sc = "Score(c/b)",
-                            ora = "Oracle",
+                            ora = "Oracle t/r/m",
                             loss = "Loss (t/p/v)",
                             W_ITER = W_ITER,
                             W_DEC = W_DEC,
@@ -3924,11 +4290,20 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                                 (Some(c), Some(b)) => format!("{c:>5.1}/{b:>5.1}"),
                                 _ => "-".to_string(),
                             };
-                            let oracle = it
-                                .oracle
-                                .match_rate_overall
-                                .map(|x| format!("{x:.3}"))
-                                .unwrap_or_else(|| "-".to_string());
+                            let oracle = match (
+                                it.oracle.match_rate_overall,
+                                it.oracle.match_rate_reroll,
+                                it.oracle.match_rate_mark,
+                            ) {
+                                (None, None, None) => "-".to_string(),
+                                (a, b, c) => {
+                                    let f = |x: Option<f64>| -> String {
+                                        x.map(|v| format!("{v:.2}"))
+                                            .unwrap_or_else(|| "--".to_string())
+                                    };
+                                    format!("{}/{}/{}", f(a), f(b), f(c))
+                                }
+                            };
                             let lt = it
                                 .train
                                 .last_loss_total
@@ -4006,6 +4381,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             if let Some(m) = &app.dashboard_manifest {
                 let phase = m.controller_phase.as_deref().unwrap_or("?");
                 let status = m.controller_status.as_deref().unwrap_or("");
+                let draining_oracle = status.contains("draining fixed-oracle");
                 let is_cancelled = status == "cancelled"
                     || m.controller_error.as_deref() == Some("cancelled");
                 // Set phase title for block
@@ -4016,6 +4392,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     "idle" => "Phase: Idle".to_string(),
                     "error" if is_cancelled => "Phase: Cancelled".to_string(),
                     "error" => "Phase: Error".to_string(),
+                    "done" if draining_oracle => "Phase: Done (draining fixed-oracle)".to_string(),
                     other => format!("Phase: {other}"),
                 };
                 // Show status/error message, but avoid duplicating "cancelled"
@@ -4275,6 +4652,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
         Screen::Replay => {
             draw_gate_replay(f, app, chunks[0]);
+        }
+        Screen::Oracle => {
+            draw_oracle(f, app, chunks[0]);
         }
         Screen::Search => {
             draw_search(f, app, chunks[0]);
@@ -4881,6 +5261,19 @@ fn draw_dashboard_learning(f: &mut ratatui::Frame, app: &App, area: ratatui::lay
                 if let Some(v) = ss.pending_collisions_per_move {
                     detail.push(Line::from(format!("pending_coll: {v:.3}/move")));
                 }
+                if ss.keep_mass_p50.is_some() || ss.keep_mass_p95.is_some() {
+                    let p50 = ss.keep_mass_p50.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0;
+                    let p95 = ss.keep_mass_p95.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0;
+                    detail.push(Line::from(format!(
+                        "keep_mass_visit: p50={p50:.0}% p95={p95:.0}%"
+                    )));
+                }
+                if ss.keep_eff_actions_p50.is_some() || ss.mark_eff_actions_p50.is_some() {
+                    let k = ss.keep_eff_actions_p50.unwrap_or(0.0);
+                    let m = ss.mark_eff_actions_p50.unwrap_or(0.0);
+                    detail.push(Line::from(format!("effA_keep_p50: {k:.1}")));
+                    detail.push(Line::from(format!("effA_mark_p50: {m:.1}")));
+                }
             }
             if let Some(ls) = app.learn_by_iter.get(&active_idx) {
                 if let Some(v) = ls.samples_s_mean {
@@ -5101,6 +5494,14 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
         {
             return false;
         }
+        // Fixed-oracle: only show details when enabled.
+        if matches!(
+            f,
+            FieldId::GatingFixedOracleSetId | FieldId::GatingFixedOracleN
+        ) && !cfg.gating.fixed_oracle.enabled
+        {
+            return false;
+        }
         true
     }
 
@@ -5154,6 +5555,9 @@ fn render_config_lines(app: &App, view_height: usize) -> Vec<Line<'static>> {
                     FieldId::GatingPairedSeedSwap,
                     FieldId::GatingDeterministicChance,
                     FieldId::GatingWinRateThreshold,
+                    FieldId::GatingFixedOracleEnabled,
+                    FieldId::GatingFixedOracleSetId,
+                    FieldId::GatingFixedOracleN,
                 ] {
                     if is_visible(&app.cfg, f) {
                         rows.push(Row::Field(f));
@@ -5613,6 +6017,26 @@ fn cat_name_short(cat: u8) -> &'static str {
     }
 }
 
+fn fmt_keepmask_short(mask: u8) -> String {
+    let mut pos: Vec<u8> = Vec::new();
+    for i in 0..5u8 {
+        let bit = 1u8 << (4 - i);
+        if (mask & bit) != 0 {
+            pos.push(i + 1);
+        }
+    }
+    if pos.is_empty() {
+        "keep -".to_string()
+    } else {
+        let p = pos
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("keep {p}")
+    }
+}
+
 fn fmt_dice_inline(dice: &[u8]) -> String {
     if dice.is_empty() {
         return "-".to_string();
@@ -6032,6 +6456,334 @@ fn draw_gate_replay(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
     f.render_widget(Paragraph::new(s0).block(Block::default().borders(Borders::ALL)), cols[1]);
     f.render_widget(Paragraph::new(a1).block(Block::default().borders(Borders::ALL)), cols[2]);
     f.render_widget(Paragraph::new(s1).block(Block::default().borders(Borders::ALL)), cols[3]);
+}
+
+fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let rid = app.active_run_id.as_deref().unwrap_or("<no run>");
+    let title = Line::from(vec![
+        Span::styled("Oracle", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(rid.to_string()),
+    ]);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+        .split(area);
+
+    let top_line = Line::from(vec![
+        Span::styled("Oracle", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(rid.to_string()),
+        Span::raw(format!("  iter {}", app.oracle_selected_iter)),
+    ]);
+    let top = Paragraph::new(vec![
+        top_line,
+        Line::from("←/→ change iter | ↑/↓ scroll actions | End follow | R refresh"),
+    ])
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(top, rows[0]);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ]
+            .as_ref(),
+        )
+        .split(rows[1]);
+
+    let Some(m) = app.dashboard_manifest.as_ref() else {
+        let p = Paragraph::new(vec![
+            title,
+            Line::from(""),
+            Line::from("(run.json not loaded yet)"),
+            Line::from(""),
+            Line::from("Tip: run at least one iteration, then press R to refresh."),
+        ])
+        .block(Block::default().borders(Borders::ALL));
+        f.render_widget(p, rows[1]);
+        return;
+    };
+
+    // Left: iteration table.
+    let mut left: Vec<Line> = Vec::new();
+    let header = format!(
+        "  {:>4} {:>6} {:>6} {:>6} {:>6} {:>7}",
+        "iter", "gate", "fixed", "mark", "reroll", "keepall"
+    );
+    left.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    for it in &m.iterations {
+        let gate = match (
+            it.oracle.match_rate_overall,
+            it.oracle.match_rate_reroll,
+            it.oracle.match_rate_mark,
+        ) {
+            (None, None, None) => None,
+            (a, b, c) => {
+                let f = |x: Option<f64>| -> String {
+                    x.map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "--".to_string())
+                };
+                Some(format!("{}/{}/{}", f(a), f(b), f(c)))
+            }
+        };
+        let fixed_row = app.oracle_fixed_by_iter.get(&it.idx);
+        let fixed = fixed_row.and_then(|x| x.match_rate_overall);
+        let fixed_mark = fixed_row.and_then(|x| x.match_rate_mark);
+        let fixed_reroll = fixed_row.and_then(|x| x.match_rate_reroll);
+        let keepall = fixed_row.and_then(|x| x.keepall_ignored);
+
+        let marker = if it.idx == app.oracle_selected_iter { "▸" } else { " " };
+        left.push(Line::from(format!(
+            "{marker} {:>4} {:>6} {:>6} {:>6} {:>6} {:>7}",
+            it.idx,
+            gate.unwrap_or_else(|| "-".to_string()),
+            fixed.map(|x| format!("{:.3}", x)).unwrap_or_else(|| "-".to_string()),
+            fixed_mark.map(|x| format!("{:.3}", x)).unwrap_or_else(|| "-".to_string()),
+            fixed_reroll
+                .map(|x| format!("{:.3}", x))
+                .unwrap_or_else(|| "-".to_string()),
+            keepall.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string()),
+        )));
+    }
+
+    let left_block = Block::default().title("Iterations").borders(Borders::ALL);
+    f.render_widget(Paragraph::new(left).block(left_block), cols[0]);
+
+    // Middle: aggregates for selected iteration.
+    let mut mid: Vec<Line> = Vec::new();
+    mid.push(Line::from(Span::styled(
+        format!("iter {}", app.oracle_selected_iter),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    mid.push(Line::from(""));
+
+    let mut actions: Vec<Line> = Vec::new();
+
+    if let Some(v) = app.oracle_fixed_by_iter.get(&app.oracle_selected_iter) {
+        let set_id = v.set_id.clone().unwrap_or_else(|| "-".to_string());
+        let ns = v.num_states.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+        mid.push(Line::from(format!("fixed_set: {set_id}  n={ns}")));
+        mid.push(Line::from(""));
+
+        let fmt = |x: Option<f64>| x.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "-".to_string());
+        mid.push(Line::from(format!("overall: {}", fmt(v.match_rate_overall))));
+        mid.push(Line::from(""));
+
+        // Group aggregates with both:
+        // - acc   = matched / oracle_optimal_total (recall-like)
+        // - alloc = matched / chosen_total        (precision-like)
+        let sum_group = |idxs: std::ops::Range<usize>| -> (u64, u64, u64) {
+            let mut o = 0u64;
+            let mut m = 0u64;
+            let mut c = 0u64;
+            if let (Some(ot), Some(mt), Some(ct)) =
+                (v.action_total.as_ref(), v.action_matched.as_ref(), v.chosen_total.as_ref())
+            {
+                for i in idxs {
+                    o += ot.get(i).copied().unwrap_or(0);
+                    m += mt.get(i).copied().unwrap_or(0);
+                    c += ct.get(i).copied().unwrap_or(0);
+                }
+            }
+            (m, o, c)
+        };
+        let (m_keep, o_keep, c_keep) = sum_group(0..32);
+        let (m_mark, o_mark, c_mark) = sum_group(32..yz_core::A as usize);
+        let fmt_acc_alloc = |m: u64, o: u64, c: u64| -> String {
+            let acc = if o > 0 { (m as f64) / (o as f64) } else { 0.0 };
+            let alloc_s = if c > 0 {
+                format!("{:.3} ({}/{})", (m as f64) / (c as f64), m, c)
+            } else {
+                "- (0/0)".to_string()
+            };
+            format!("{:.3} ({}/{})  {}", acc, m, o, alloc_s)
+        };
+        mid.push(Line::from(Span::styled(
+            "mark acc(m/o)  alloc(m/c)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        mid.push(Line::from(format!("mark: {}", fmt_acc_alloc(m_mark, o_mark, c_mark))));
+        mid.push(Line::from(format!("keep: {}", fmt_acc_alloc(m_keep, o_keep, c_keep))));
+        mid.push(Line::from(""));
+
+        let rate = |m: Option<u64>, t: Option<u64>| -> String {
+            match (m, t) {
+                (Some(m), Some(t)) if t > 0 => format!("{:.3} ({}/{})", m as f64 / t as f64, m, t),
+                (Some(_), Some(0)) => "-".to_string(),
+                _ => "-".to_string(),
+            }
+        };
+        mid.push(Line::from(Span::styled(
+            "by roll stage",
+            Style::default().fg(Color::DarkGray),
+        )));
+        mid.push(Line::from(format!(
+            " roll 1: {}",
+            rate(v.r2_matched, v.r2_total)
+        )));
+        mid.push(Line::from(format!(
+            " roll 2: {}",
+            rate(v.r1_matched, v.r1_total)
+        )));
+        mid.push(Line::from(format!(
+            " mark:  {}",
+            rate(v.r0_matched, v.r0_total)
+        )));
+
+        // Per-turn accuracy distribution.
+        if let (Some(tt), Some(tm)) = (v.turn_total.as_ref(), v.turn_matched.as_ref()) {
+            if tt.len() == tm.len() && !tt.is_empty() {
+                mid.push(Line::from(""));
+                mid.push(Line::from(Span::styled(
+                    "by turn",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, &t) in tt.iter().enumerate() {
+                    if t == 0 {
+                        continue;
+                    }
+                    let m = tm.get(i).copied().unwrap_or(0);
+                    let r = (m as f64) / (t as f64);
+                    mid.push(Line::from(format!(
+                        " turn {:>2}: {:.3} ({}/{})",
+                        i + 1,
+                        r,
+                        m,
+                        t
+                    )));
+                }
+            }
+        }
+
+        // Actions (oracle-optimal totals + match rate).
+        if let (Some(tot), Some(mat)) = (v.action_total.as_ref(), v.action_matched.as_ref()) {
+            if tot.len() == mat.len() && !tot.is_empty() {
+                let chosen = v.chosen_total.as_ref();
+
+                fn fmt_rate_line(name: String, m: u64, t: u64, chosen: Option<u64>) -> Line<'static> {
+                    let r1 = if t > 0 { (m as f64) / (t as f64) } else { 0.0 };
+                    let (r2s, frac2) = match chosen {
+                        Some(c) if c > 0 => {
+                            let r2 = (m as f64) / (c as f64);
+                            (format!("{r2:.3}"), format!("({m}/{c})"))
+                        }
+                        _ => ("-".to_string(), "(0/0)".to_string()),
+                    };
+                    Line::from(format!(
+                        "{name:<16} {r1:.3} ({m}/{t}) {r2s} {frac2}"
+                    ))
+                }
+
+                let mut keep_items: Vec<(usize, u64, u64)> = Vec::new();
+                let mut mark_items: Vec<(usize, u64, u64)> = Vec::new();
+                for (i, &t) in tot.iter().enumerate() {
+                    if t == 0 {
+                        continue;
+                    }
+                    let m = mat.get(i).copied().unwrap_or(0);
+                    if i < 32 {
+                        keep_items.push((i, t, m));
+                    } else {
+                        mark_items.push((i, t, m));
+                    }
+                }
+                keep_items.sort_by_key(|(i, _, _)| *i);
+                mark_items.sort_by_key(|(i, _, _)| *i);
+
+                actions.push(Line::from(Span::styled(
+                    "mark",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                actions.push(Line::from(Span::styled(
+                    format!(
+                        "{:<16} {:>5} {:>12} {:>5} {:>12}",
+                        "action", "acc", "(m/o)", "alloc", "(m/c)"
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, t, m) in mark_items {
+                    let cat = (i - 32) as u8;
+                    let name = format!("mark {}", cat_name_short(cat));
+                    let c = chosen.and_then(|v| v.get(i).copied()).unwrap_or(0);
+                    actions.push(fmt_rate_line(name, m, t, Some(c)));
+                }
+                actions.push(Line::from(""));
+                actions.push(Line::from(Span::styled(
+                    "keep",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                actions.push(Line::from(Span::styled(
+                    format!(
+                        "{:<16} {:>5} {:>12} {:>5} {:>12}",
+                        "action", "acc", "(m/o)", "alloc", "(m/c)"
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, t, m) in keep_items {
+                    let name = fmt_keepmask_short(i as u8);
+                    let c = chosen.and_then(|v| v.get(i).copied()).unwrap_or(0);
+                    actions.push(fmt_rate_line(name, m, t, Some(c)));
+                }
+            }
+        }
+    } else {
+        if let Some(p) = app.oracle_fixed_progress_by_iter.get(&app.oracle_selected_iter) {
+            let pct = if p.total > 0 {
+                (100.0 * (p.done as f64) / (p.total as f64)).min(100.0)
+            } else {
+                0.0
+            };
+            mid.push(Line::from(format!(
+                "fixed_oracle: running {}/{} ({pct:.1}%)",
+                p.done, p.total
+            )));
+            mid.push(Line::from(""));
+            mid.push(Line::from(Span::styled(
+                "Tip: this is aggregated from per-shard progress files under runs/<id>/oracle_fixed/.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            mid.push(Line::from("fixed_oracle: not started / no progress yet"));
+            mid.push(Line::from(""));
+            mid.push(Line::from(Span::styled(
+                "Tip: fixed oracle eval is async; it may arrive later.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if actions.is_empty() {
+        actions.push(Line::from("(no actions yet)"));
+    }
+
+    let mid_block = Block::default().title("Aggregates").borders(Borders::ALL);
+    f.render_widget(Paragraph::new(mid).block(mid_block), cols[1]);
+
+    let actions_block = Block::default().title("Actions").borders(Borders::ALL);
+    let view_height = cols[2].height.saturating_sub(2) as usize;
+    app.oracle_actions_len = actions.len();
+    app.oracle_actions_height = view_height.max(1);
+    let max_scroll = app
+        .oracle_actions_len
+        .saturating_sub(app.oracle_actions_height);
+    if app.oracle_actions_scroll > max_scroll {
+        app.oracle_actions_scroll = max_scroll;
+    }
+    f.render_widget(
+        Paragraph::new(actions)
+            .block(actions_block)
+            .scroll((app.oracle_actions_scroll as u16, 0)),
+        cols[2],
+    );
 }
 
 fn draw_search(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -6891,6 +7643,10 @@ mod manage_parse_tests {
         assert_eq!(
             manage_detect_kind("yz gate-worker --run-dir runs/r1 --infer unix:///tmp/x"),
             Some(ManageProcKind::GateWorker)
+        );
+        assert_eq!(
+            manage_detect_kind("yz oracle-fixed-worker --run-dir runs/r1 --infer unix:///tmp/x"),
+            Some(ManageProcKind::OracleFixedWorker)
         );
     }
 

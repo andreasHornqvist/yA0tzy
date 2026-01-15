@@ -180,5 +180,28 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    // gating.fixed_oracle
+    if cfg.gating.fixed_oracle.enabled {
+        let id = cfg
+            .gating
+            .fixed_oracle
+            .set_id
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            return Err(
+                "gating.fixed_oracle.set_id must be set when gating.fixed_oracle.enabled=true"
+                    .to_string(),
+            );
+        }
+        if let Some(n) = cfg.gating.fixed_oracle.n {
+            if n < 1 {
+                return Err("gating.fixed_oracle.n must be >= 1 when set".to_string());
+            }
+        }
+    }
+
     Ok(())
 }

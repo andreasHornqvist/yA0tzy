@@ -60,7 +60,9 @@ training:
   # Mini-batch size for gradient updates
   batch_size: 256
   # Learning rate
-  learning_rate: 0.001
+  learning_rate: 0.0001
+  # Whether to train candidate continuously across iterations (even on gate rejects)
+  continuous_candidate_training: true
   # Weight decay (L2 regularization) - 0 disables
   weight_decay: 0.0001
   # Number of epochs per training iteration
@@ -80,6 +82,12 @@ gating:
   paired_seed_swap: true
   # Use deterministic event-keyed chance stream for reproducible evals
   deterministic_chance: true
+
+  # Optional: fixed-set oracle diagnostics (async; disabled by default)
+  fixed_oracle:
+    enabled: false
+    set_id: fixed_balanced_v2
+    n: null
 
 # Neural network model architecture settings
 model:
