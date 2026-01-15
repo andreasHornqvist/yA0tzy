@@ -106,12 +106,13 @@ pub enum ChanceMode {
     Deterministic { episode_seed: u64 },
 }
 
-// --- KeepMask symmetry canonicalization (self-play only) ---------------------
+// --- KeepMask symmetry canonicalization (all modes) --------------------------
 //
 // Motivation: KeepMask actions are position masks over `dice_sorted`. When dice contain duplicates,
 // multiple masks are semantically equivalent (keep the same multiset) but occupy different action
 // indices. This inflates branching and injects policy-target noise. We prune redundant KeepMasks
-// only in self-play (ChanceMode::Rng), preserving eval/gating behavior and the oracle action space.
+// for all modes to keep self-play and eval/gating behavior identical while retaining the same
+// action space id (oracle_keepmask_v1).
 
 const KEEP_MASK_ACTIONS_MASK: u64 = (1u64 << 32) - 1; // actions 0..31
 const ALL_ACTIONS_MASK: u64 = (1u64 << 47) - 1; // actions 0..46
@@ -186,16 +187,14 @@ fn allowed_canonical_keepmask_bits(dice_sorted: [u8; 5]) -> u32 {
     *m.get(&dice_key(dice_sorted)).unwrap_or(&0)
 }
 
-/// Legal action mask, with KeepMask symmetry pruning in self-play mode only.
+/// Legal action mask, with KeepMask symmetry pruning applied when rerolls_left>0.
 pub fn legal_action_mask_for_mode(state: &GameState, mode: ChanceMode) -> LegalMask {
+    let _ = mode;
     let base = yz_core::legal_action_mask(
         state.players[state.player_to_move as usize].avail_mask,
         state.rerolls_left,
     );
     if state.rerolls_left == 0 {
-        return base;
-    }
-    if !matches!(mode, ChanceMode::Rng { .. }) {
         return base;
     }
     let allowed = allowed_canonical_keepmask_bits(state.dice_sorted) as u64;

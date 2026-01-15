@@ -248,10 +248,7 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
 
     let mut ctx = yz_core::TurnContext::new_deterministic(999);
     let root = yz_core::initial_state(&mut ctx);
-    let legal = yz_core::legal_action_mask(
-        root.players[root.player_to_move as usize].avail_mask,
-        root.rerolls_left,
-    );
+    let legal = crate::legal_action_mask_for_mode(&root, ChanceMode::Deterministic { episode_seed: 42 });
 
     let mut m1 = Mcts::new(cfg).unwrap();
     let r1 = m1.run_search(
@@ -291,10 +288,8 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
 
     let mut ctx = yz_core::TurnContext::new_deterministic(42);
     let root = yz_core::initial_state(&mut ctx);
-    let legal = yz_core::legal_action_mask(
-        root.players[root.player_to_move as usize].avail_mask,
-        root.rerolls_left,
-    );
+    let legal =
+        crate::legal_action_mask_for_mode(&root, ChanceMode::Deterministic { episode_seed: 42 });
 
     let mut m = Mcts::new(cfg).unwrap();
     let r = m.run_search(
@@ -461,7 +456,7 @@ fn keepmask_canonicalization_no_duplicates_keeps_all_masks_in_rng() {
 }
 
 #[test]
-fn keepmask_canonicalization_duplicates_prunes_equivalents_in_rng_only() {
+fn keepmask_canonicalization_duplicates_prunes_equivalents_in_rng_and_deterministic() {
     let s = GameState {
         players: [
             PlayerState {
@@ -487,9 +482,9 @@ fn keepmask_canonicalization_duplicates_prunes_equivalents_in_rng_only() {
     assert!(((legal_rng >> 8) & 1) != 0);
     assert!(((legal_rng >> 16) & 1) == 0);
 
-    // Deterministic mode leaves legality unchanged (both are legal).
+    // Deterministic mode matches RNG mode (canonical keepmasks only).
     let legal_det =
         crate::legal_action_mask_for_mode(&s, ChanceMode::Deterministic { episode_seed: 1 });
     assert!(((legal_det >> 8) & 1) != 0);
-    assert!(((legal_det >> 16) & 1) != 0);
+    assert!(((legal_det >> 16) & 1) == 0);
 }
