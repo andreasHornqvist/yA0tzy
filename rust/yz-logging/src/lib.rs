@@ -586,6 +586,17 @@ pub struct SelfplayWorkerSummaryV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visit_entropy_norm_hist: Option<HistogramV1>, // [0,1]
 
+    /// In reroll phase (rerolls_left>0), fraction of visit-pi mass allocated to KeepMask actions.
+    /// Optional for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_mass_hist: Option<HistogramV1>, // [0,1]
+    /// Effective action count (EffA) for KeepMask subset (rerolls_left>0), after renormalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_eff_actions_hist: Option<HistogramV1>,
+    /// Effective action count (EffA) for Mark subset (rerolls_left>0), after renormalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark_eff_actions_hist: Option<HistogramV1>,
+
     // Search outcomes.
     pub root_value_sum: f64,
     pub root_value_sumsq: f64,
@@ -661,6 +672,20 @@ pub struct MetricsSelfplaySummaryV1 {
     pub pi_eff_actions_p50: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pi_eff_actions_p95: Option<f64>,
+
+    // Keep vs mark allocation within reroll phase (rerolls_left>0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_mass_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_mass_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_eff_actions_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_eff_actions_p95: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_eff_actions_p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_eff_actions_p95: Option<f64>,
 
     // Search quality.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -766,6 +791,45 @@ pub struct MetricsGateSummaryV1 {
     pub oracle_match_rate_mark: f64,
     pub oracle_match_rate_reroll: f64,
     pub oracle_keepall_ignored: u64,
+}
+
+/// Fixed-set oracle diagnostics summary (async; may arrive after gating/promotion).
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsOracleFixedSummaryV1 {
+    pub event: &'static str, // "oracle_fixed_summary_v1"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub iter_idx: u32,
+    pub set_id: String,
+    pub num_states: u64,
+
+    pub match_rate_overall: f64,
+    pub match_rate_mark: f64,
+    pub match_rate_reroll: f64,
+    pub keepall_ignored: u64,
+
+    // Buckets by rerolls_left (2/1/0). Each is (total, matched).
+    pub r2_total: u64,
+    pub r2_matched: u64,
+    pub r1_total: u64,
+    pub r1_matched: u64,
+    pub r0_total: u64,
+    pub r0_matched: u64,
+
+    /// Per-action counts for the chosen action index (0..A-1).
+    ///
+    /// Stored as vectors for schema stability across languages; expected length is 47 (oracle_keepmask_v1).
+    pub action_total: Vec<u64>,
+    pub action_matched: Vec<u64>,
+    pub chosen_total: Vec<u64>,
+
+    /// Per-turn counts (turn index 0..14).
+    pub turn_total: Vec<u64>,
+    pub turn_matched: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

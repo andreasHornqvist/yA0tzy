@@ -285,6 +285,210 @@ fn shutdown_server(metrics_bind: &str) -> Result<(), ControllerError> {
     Ok(())
 }
 
+fn spawn_oracle_fixed_worker_shard(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    infer_endpoint: &str,
+    iter_idx: u32,
+    shard_idx: u32,
+    num_shards: u32,
+) -> Result<Option<Child>, ControllerError> {
+    // Prefer new location: gating.fixed_oracle.* ; fall back to legacy cfg.oracle.*.
+    let (enabled, set_id) = if cfg.gating.fixed_oracle.enabled {
+        (true, cfg.gating.fixed_oracle.set_id.as_deref())
+    } else {
+        (
+            cfg.oracle.as_ref().map(|o| o.fixed_set_enabled).unwrap_or(false),
+            cfg.oracle.as_ref().and_then(|o| o.fixed_set_id.as_deref()),
+        )
+    };
+    if !enabled {
+        return Ok(None);
+    }
+    let Some(set_id) = set_id else {
+        return Ok(None);
+    };
+
+    // Spawn `yz oracle-fixed-worker` (internal command) asynchronously.
+    let exe = yz_worker_exe_from_run_dir(run_dir);
+    let log_path = run_dir
+        .join("logs")
+        .join(format!(
+            "oracle_fixed_iter_{iter_idx:03}_shard_{shard_idx:03}.log"
+        ));
+    let _ = std::fs::create_dir_all(run_dir.join("logs"));
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(ControllerError::Fs)?;
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(ControllerError::Fs)?;
+
+    let mut cmd = Command::new(&exe);
+    if cfg.inference.debug_log {
+        cmd.env("YZ_DEBUG_LOG", "1");
+    }
+    cmd.arg("oracle-fixed-worker");
+    cmd.arg("--run-dir").arg(run_dir);
+    cmd.arg("--infer").arg(infer_endpoint);
+    cmd.arg("--cand-id").arg("1");
+    cmd.arg("--iter-idx").arg(iter_idx.to_string());
+    cmd.arg("--set-id").arg(set_id);
+    cmd.arg("--shard-idx").arg(shard_idx.to_string());
+    cmd.arg("--num-shards").arg(num_shards.to_string());
+    cmd.stdout(Stdio::from(stdout));
+    cmd.stderr(Stdio::from(stderr));
+    let child = cmd.spawn().map_err(ControllerError::Fs)?;
+    Ok(Some(child))
+}
+
+#[derive(Debug)]
+struct OracleFixedJob {
+    iter_idx: u32,
+    num_shards: u32,
+    children: Vec<Child>,
+}
+
+fn reap_children(children: &mut Vec<Child>) {
+    let mut i = 0usize;
+    while i < children.len() {
+        let done = match children[i].try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => false,
+        };
+        if done {
+            children.swap_remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn kill_children(children: &mut Vec<Child>) {
+    for mut c in children.drain(..) {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+fn try_finalize_oracle_fixed_job(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    job: &OracleFixedJob,
+) -> Result<(), ControllerError> {
+    use std::fs;
+    let dir = run_dir
+        .join("oracle_fixed")
+        .join(format!("iter_{:03}", job.iter_idx));
+    let mut combined: Option<yz_eval::OracleFixedReport> = None;
+    for shard_idx in 0..job.num_shards {
+        let p = dir.join(format!("shard_{shard_idx:03}.json"));
+        let Ok(bytes) = fs::read(&p) else {
+            continue;
+        };
+        let Ok(rep) = serde_json::from_slice::<yz_eval::OracleFixedReport>(&bytes) else {
+            continue;
+        };
+        combined = Some(if let Some(mut c) = combined {
+            // Combine by summing counters.
+            c.num_states += rep.num_states;
+            c.total += rep.total;
+            c.matched += rep.matched;
+            c.total_mark += rep.total_mark;
+            c.matched_mark += rep.matched_mark;
+            c.total_reroll += rep.total_reroll;
+            c.matched_reroll += rep.matched_reroll;
+            c.keepall_ignored += rep.keepall_ignored;
+            for i in 0..3 {
+                c.total_by_r[i] += rep.total_by_r[i];
+                c.matched_by_r[i] += rep.matched_by_r[i];
+            }
+            if c.action_total.len() == rep.action_total.len() {
+                for i in 0..c.action_total.len() {
+                    c.action_total[i] += rep.action_total[i];
+                    c.action_matched[i] += rep.action_matched[i];
+                }
+            }
+            if c.chosen_total.len() == rep.chosen_total.len() {
+                for i in 0..c.chosen_total.len() {
+                    c.chosen_total[i] += rep.chosen_total[i];
+                }
+            }
+            if c.turn_total.len() == rep.turn_total.len() {
+                for i in 0..c.turn_total.len() {
+                    c.turn_total[i] += rep.turn_total[i];
+                    c.turn_matched[i] += rep.turn_matched[i];
+                }
+            }
+            c
+        } else {
+            rep
+        });
+    }
+
+    let Some(rep) = combined else {
+        return Ok(());
+    };
+    if let Some(n) = cfg.gating.fixed_oracle.n {
+        if rep.num_states < n as u64 {
+            eprintln!(
+                "[oracle-fixed] warning: iter {} expected n={} but aggregated num_states={}",
+                job.iter_idx, n, rep.num_states
+            );
+        }
+    }
+
+    let run_json = run_dir.join("run.json");
+    let m = yz_logging::read_manifest(&run_json).ok();
+    let metrics_path = run_dir.join("logs").join("metrics.ndjson");
+    if let Ok(mut metrics) = yz_logging::NdjsonWriter::open_append_with_flush(&metrics_path, 1) {
+        let ev = yz_logging::MetricsOracleFixedSummaryV1 {
+            event: "oracle_fixed_summary_v1",
+            ts_ms: yz_logging::now_ms(),
+            v: yz_logging::VersionInfoV1 {
+                protocol_version: m.as_ref().map(|m| m.protocol_version).unwrap_or(2),
+                feature_schema_id: m.as_ref().map(|m| m.feature_schema_id).unwrap_or(1),
+                action_space_id: "oracle_keepmask_v1",
+                ruleset_id: "swedish_scandinavian_v1",
+            },
+            run_id: m
+                .as_ref()
+                .map(|m| m.run_id.clone())
+                .unwrap_or_else(|| run_dir.file_name().unwrap_or_default().to_string_lossy().to_string()),
+            git_hash: m.as_ref().and_then(|m| m.git_hash.clone()),
+            config_snapshot: m.as_ref().and_then(|m| m.config_snapshot.clone()),
+            iter_idx: job.iter_idx,
+            set_id: rep.set_id.clone(),
+            num_states: rep.num_states,
+            match_rate_overall: rep.match_rate_overall(),
+            match_rate_mark: rep.match_rate_mark(),
+            match_rate_reroll: rep.match_rate_reroll(),
+            keepall_ignored: rep.keepall_ignored,
+            r2_total: rep.total_by_r[0],
+            r2_matched: rep.matched_by_r[0],
+            r1_total: rep.total_by_r[1],
+            r1_matched: rep.matched_by_r[1],
+            r0_total: rep.total_by_r[2],
+            r0_matched: rep.matched_by_r[2],
+            action_total: rep.action_total.clone(),
+            action_matched: rep.action_matched.clone(),
+            chosen_total: rep.chosen_total.clone(),
+            turn_total: rep.turn_total.clone(),
+            turn_matched: rep.turn_matched.clone(),
+        };
+        let _ = metrics.write_event(&ev);
+        let _ = metrics.flush();
+    }
+    // Best-effort: validate config still matches.
+    let _ = cfg;
+    Ok(())
+}
+
 fn build_infer_server_command(
     run_dir: &Path,
     cfg: &yz_core::Config,
@@ -364,10 +568,11 @@ fn build_infer_server_command(
     }
 }
 
-fn ensure_infer_server(
+fn ensure_infer_server_with_log(
     run_dir: &Path,
     cfg: &yz_core::Config,
     python_exe: &str,
+    log_name: &str,
 ) -> Result<Option<InferServerChild>, ControllerError> {
     // If reachable, decide reuse vs restart. We restart if:
     // - server is an older capabilities version (pre-v2, no config fields)
@@ -407,7 +612,7 @@ fn ensure_infer_server(
     }
 
     // Capture server logs to run-local file for debugging.
-    let log_path = run_dir.join("logs").join("infer_server.log");
+    let log_path = run_dir.join("logs").join(log_name);
     let stdout = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -445,6 +650,65 @@ fn ensure_infer_server(
         "infer-server did not become ready (metrics_bind={}); log tail:\n{}",
         cfg.inference.metrics_bind, tail
     )))
+}
+
+fn ensure_infer_server(
+    run_dir: &Path,
+    cfg: &yz_core::Config,
+    python_exe: &str,
+) -> Result<Option<InferServerChild>, ControllerError> {
+    ensure_infer_server_with_log(run_dir, cfg, python_exe, "infer_server.log")
+}
+
+fn derive_oracle_inference_bind(bind: &str) -> String {
+    if let Some(rest) = bind.strip_prefix("unix://") {
+        let p = Path::new(rest);
+        let parent = p.parent().unwrap_or_else(|| Path::new(""));
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("yatzy_infer");
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("sock");
+        let name = format!("{stem}_oracle.{ext}");
+        let newp = if parent.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            parent.join(name)
+        };
+        return format!("unix://{}", newp.to_string_lossy());
+    }
+    if let Some(rest) = bind.strip_prefix("tcp://") {
+        if let Some(pos) = rest.rfind(':') {
+            let host = &rest[..pos];
+            if let Ok(port) = rest[pos + 1..].parse::<u16>() {
+                return format!("tcp://{host}:{}", port.saturating_add(1));
+            }
+        }
+    }
+    // Fallback: append suffix.
+    format!("{bind}_oracle")
+}
+
+fn derive_oracle_metrics_bind(bind: &str) -> String {
+    if let Some(pos) = bind.rfind(':') {
+        let host = &bind[..pos];
+        if let Ok(port) = bind[pos + 1..].parse::<u16>() {
+            return format!("{host}:{}", port.saturating_add(1));
+        }
+    }
+    format!("{bind}_oracle")
+}
+
+fn derive_oracle_cfg(cfg: &yz_core::Config) -> yz_core::Config {
+    let mut o = cfg.clone();
+    o.inference.bind = derive_oracle_inference_bind(&cfg.inference.bind);
+    o.inference.metrics_bind = derive_oracle_metrics_bind(&cfg.inference.metrics_bind);
+    let shrink = |v: Option<u32>| -> Option<u32> {
+        Some(match v {
+            Some(n) => (n / 2).max(1),
+            None => 1,
+        })
+    };
+    o.inference.torch_threads = shrink(cfg.inference.torch_threads);
+    o.inference.torch_interop_threads = shrink(cfg.inference.torch_interop_threads);
+    o
 }
 
 fn update_manifest_atomic(
@@ -755,6 +1019,8 @@ pub fn run_selfplay_then_gate(
     ctrl.set_phase(Phase::Gate, "starting gate")?;
     // E13.2S4: Hot-reload best + candidate models before gating.
     manifest.model_reloads += reload_models_for_gating(run_dir, &cfg)?;
+    // Optional fixed-set oracle diagnostics are spawned by the multi-iteration controller loop
+    // (`spawn_iteration`) so they can be tracked and cleaned up properly.
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
     // IMPORTANT: run_gate writes progress + final gate metrics into run.json using its own manifest.
     // Refresh the in-memory manifest before finalize_iteration to avoid clobbering gate results.
@@ -806,6 +1072,8 @@ pub fn run_iteration(
     refresh_train_stats_from_run_json(run_dir, &mut manifest, iter_idx)?;
     // E13.2S4: Hot-reload best + candidate models before gating.
     manifest.model_reloads += reload_models_for_gating(run_dir, &cfg)?;
+    // Optional fixed-set oracle diagnostics are spawned by the multi-iteration controller loop
+    // (`spawn_iteration`) so they can be tracked and cleaned up properly.
     run_gate(run_dir, &cfg, infer_endpoint, &ctrl, iter_idx)?;
     // Refresh manifest after run_gate to avoid overwriting gate fields when finalizing.
     manifest = yz_logging::read_manifest(run_dir.join("run.json"))?;
@@ -883,17 +1151,116 @@ pub fn spawn_iteration(
                 infer_srv,
             };
 
+        // Optional: separate infer server for fixed-oracle eval.
+        let mut oracle_infer_endpoint: Option<String> = None;
+        let mut oracle_metrics_bind: Option<String> = None;
+        let mut _oracle_shutdown_guard: Option<ShutdownGuard> = None;
+        let fixed_oracle_enabled = if cfg.gating.fixed_oracle.enabled {
+            cfg.gating.fixed_oracle.set_id.as_deref().is_some()
+        } else {
+            cfg.oracle
+                .as_ref()
+                .map(|o| o.fixed_set_enabled && o.fixed_set_id.is_some())
+                .unwrap_or(false)
+        };
+        if fixed_oracle_enabled {
+            let o_cfg = derive_oracle_cfg(&cfg);
+            let oracle_srv = ensure_infer_server_with_log(
+                &run_dir,
+                &o_cfg,
+                &python_exe,
+                "infer_oracle_server.log",
+            )?;
+            oracle_infer_endpoint = Some(o_cfg.inference.bind.clone());
+            oracle_metrics_bind = Some(o_cfg.inference.metrics_bind.clone());
+            _oracle_shutdown_guard = Some(ShutdownGuard {
+                metrics_bind: o_cfg.inference.metrics_bind.clone(),
+                infer_srv: oracle_srv,
+            });
+        }
+
+            // Track async oracle-fixed jobs so they don't outlive the run.
+            // We allow parallelism *within* an iteration (shards), but only one iteration's
+            // fixed-oracle eval at a time (barrier before starting next iteration's oracle eval).
+            let mut oracle_fixed_job: Option<OracleFixedJob> = None;
+            let mut oracle_fixed_pending: std::collections::VecDeque<u32> =
+                std::collections::VecDeque::new();
+            let shutdown_oracle_infer = |bind: Option<&String>| {
+                if let Some(b) = bind {
+                    let _ = shutdown_server(b);
+                }
+            };
+
+            let oracle_fixed_shards = |full_speed: bool| -> u32 {
+                if full_speed {
+                    cfg.selfplay.workers.max(1)
+                } else {
+                    (cfg.selfplay.workers.max(1) / 4).max(1)
+                }
+            };
+            let start_oracle_fixed_job =
+                |iter_idx: u32, num_shards: u32| -> Option<OracleFixedJob> {
+                let infer_ep = oracle_infer_endpoint
+                    .as_deref()
+                    .unwrap_or(infer_endpoint.as_str())
+                    .to_string();
+                let mut children: Vec<Child> = Vec::new();
+                for shard_idx in 0..num_shards {
+                    if let Ok(Some(child)) = spawn_oracle_fixed_worker_shard(
+                        &run_dir,
+                        &cfg,
+                        &infer_ep,
+                        iter_idx,
+                        shard_idx,
+                        num_shards,
+                    ) {
+                        children.push(child);
+                    }
+                }
+                if children.is_empty() {
+                    None
+                } else {
+                    Some(OracleFixedJob {
+                        iter_idx,
+                        num_shards,
+                        children,
+                    })
+                }
+            };
+
             // E13.2S2: Ensure best.pt exists (bootstrap via model-init if missing).
             ensure_best_pt(&run_dir, &cfg, &python_exe)?;
 
             if ctrl.cancelled() {
                 let _ = ctrl.set_phase(Phase::Selfplay, "shutting down...");
+                if let Some(mut j) = oracle_fixed_job.take() {
+                    kill_children(&mut j.children);
+                }
+                shutdown_oracle_infer(oracle_metrics_bind.as_ref());
                 return Err(ControllerError::Cancelled);
             }
 
             while manifest.controller_iteration_idx < total_iters {
+                if let Some(j) = oracle_fixed_job.as_mut() {
+                    reap_children(&mut j.children);
+                    if j.children.is_empty() {
+                        // All shards finished: aggregate and emit summary event.
+                        let _ = try_finalize_oracle_fixed_job(&run_dir, &cfg, j);
+                        oracle_fixed_job = None;
+                    }
+                }
+                if oracle_fixed_job.is_none() {
+                    if let Some(next_iter) = oracle_fixed_pending.pop_front() {
+                        oracle_fixed_job =
+                            start_oracle_fixed_job(next_iter, oracle_fixed_shards(false));
+                    }
+                }
                 if ctrl.cancelled() {
                     let _ = ctrl.set_phase(Phase::Selfplay, "shutting down...");
+                    if let Some(mut j) = oracle_fixed_job.take() {
+                        kill_children(&mut j.children);
+                    }
+                    shutdown_oracle_infer(oracle_metrics_bind.as_ref());
                     return Err(ControllerError::Cancelled);
                 }
 
@@ -940,6 +1307,10 @@ pub fn spawn_iteration(
                 run_train_subprocess(&run_dir, &cfg, &python_exe, &ctrl, iter_idx)?;
                 if ctrl.cancelled() {
                     let _ = ctrl.set_phase(Phase::Train, "shutting down...");
+                    if let Some(mut j) = oracle_fixed_job.take() {
+                        kill_children(&mut j.children);
+                    }
+                    shutdown_oracle_infer(oracle_metrics_bind.as_ref());
                     return Err(ControllerError::Cancelled);
                 }
                 // After training completes, pull the latest train stats from run.json (trainer updates it).
@@ -957,6 +1328,23 @@ pub fn spawn_iteration(
 
                 // E13.2S4: Hot-reload best + candidate models before gating.
                 manifest.model_reloads += reload_models_for_gating(&run_dir, &cfg)?;
+                if let Some(metrics_bind) = oracle_metrics_bind.as_deref() {
+                    let run_dir_abs = run_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| run_dir.to_path_buf());
+                    let cand_path = run_dir_abs.join("models").join("candidate.pt");
+                    if cand_path.exists() {
+                        let _ = reload_model(metrics_bind, "cand", &cand_path);
+                    }
+                }
+                // Optional fixed-set oracle diagnostics (async; should not delay gating/promotion).
+                // Spawn shards for the *current* iteration if no oracle-fixed job is active;
+                // otherwise enqueue so we run it after the current oracle job completes.
+                if oracle_fixed_job.is_none() {
+                    oracle_fixed_job = start_oracle_fixed_job(iter_idx, oracle_fixed_shards(false));
+                } else if !oracle_fixed_pending.contains(&iter_idx) {
+                    oracle_fixed_pending.push_back(iter_idx);
+                }
                 run_gate(&run_dir, &cfg, &infer_endpoint, &ctrl, iter_idx)?;
 
                 // Refresh manifest after run_gate to avoid overwriting gate results in finalize_iteration.
@@ -968,7 +1356,51 @@ pub fn spawn_iteration(
             }
 
             // Update in-memory AND on-disk phase to stay in sync.
+            let mut draining = oracle_fixed_job.is_some() || !oracle_fixed_pending.is_empty();
             manifest.controller_phase = Some(Phase::Done.as_str().to_string());
+            manifest.controller_status = Some(if draining {
+                format!(
+                    "done (completed {}/{}) | draining fixed-oracle…",
+                    manifest.controller_iteration_idx, total_iters
+                )
+            } else {
+                format!(
+                    "done (completed {}/{})",
+                    manifest.controller_iteration_idx, total_iters
+                )
+            });
+            manifest.controller_last_ts_ms = Some(yz_logging::now_ms());
+            yz_logging::write_manifest_atomic(run_dir.join("run.json"), &manifest)?;
+
+            // After training/gating is complete, keep draining fixed-oracle backlog and
+            // ramp to full selfplay capacity.
+            while draining {
+                if let Some(j) = oracle_fixed_job.as_mut() {
+                    reap_children(&mut j.children);
+                    if j.children.is_empty() {
+                        let _ = try_finalize_oracle_fixed_job(&run_dir, &cfg, j);
+                        oracle_fixed_job = None;
+                    }
+                }
+                if oracle_fixed_job.is_none() {
+                    if let Some(next_iter) = oracle_fixed_pending.pop_front() {
+                        oracle_fixed_job =
+                            start_oracle_fixed_job(next_iter, oracle_fixed_shards(true));
+                    }
+                }
+                if ctrl.cancelled() {
+                    if let Some(mut j) = oracle_fixed_job.take() {
+                        kill_children(&mut j.children);
+                    }
+                    shutdown_oracle_infer(oracle_metrics_bind.as_ref());
+                    return Err(ControllerError::Cancelled);
+                }
+                draining = oracle_fixed_job.is_some() || !oracle_fixed_pending.is_empty();
+                if draining {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+
             manifest.controller_status = Some(format!(
                 "done (completed {}/{})",
                 manifest.controller_iteration_idx, total_iters
@@ -1490,6 +1922,12 @@ fn emit_selfplay_summary_metrics(
     let mut visit_entropy_norm_hist: Option<yz_logging::HistogramV1> = summaries
         .iter()
         .find_map(|s| s.visit_entropy_norm_hist.clone());
+    let mut keep_mass_hist: Option<yz_logging::HistogramV1> =
+        summaries.iter().find_map(|s| s.keep_mass_hist.clone());
+    let mut keep_eff_actions_hist: Option<yz_logging::HistogramV1> =
+        summaries.iter().find_map(|s| s.keep_eff_actions_hist.clone());
+    let mut mark_eff_actions_hist: Option<yz_logging::HistogramV1> =
+        summaries.iter().find_map(|s| s.mark_eff_actions_hist.clone());
     let mut pending_count_max_hist = summaries[0].pending_count_max_hist.clone();
     let mut prior_kl_hist = summaries[0].prior_kl_hist.clone();
     let mut noise_kl_hist = summaries[0].noise_kl_hist.clone();
@@ -1529,6 +1967,27 @@ fn emit_selfplay_summary_metrics(
                 dst.merge_inplace(h);
             } else {
                 visit_entropy_norm_hist = Some(h.clone());
+            }
+        }
+        if let Some(h) = &s.keep_mass_hist {
+            if let Some(dst) = keep_mass_hist.as_mut() {
+                dst.merge_inplace(h);
+            } else {
+                keep_mass_hist = Some(h.clone());
+            }
+        }
+        if let Some(h) = &s.keep_eff_actions_hist {
+            if let Some(dst) = keep_eff_actions_hist.as_mut() {
+                dst.merge_inplace(h);
+            } else {
+                keep_eff_actions_hist = Some(h.clone());
+            }
+        }
+        if let Some(h) = &s.mark_eff_actions_hist {
+            if let Some(dst) = mark_eff_actions_hist.as_mut() {
+                dst.merge_inplace(h);
+            } else {
+                mark_eff_actions_hist = Some(h.clone());
             }
         }
         pending_count_max_hist.merge_inplace(&s.pending_count_max_hist);
@@ -1593,6 +2052,12 @@ fn emit_selfplay_summary_metrics(
     let visit_entropy_norm_p50 = visit_entropy_norm_hist
         .as_ref()
         .and_then(|h| h.quantile_estimate(0.50));
+    let keep_mass_p50 = keep_mass_hist.as_ref().and_then(|h| h.quantile_estimate(0.50));
+    let keep_mass_p95 = keep_mass_hist.as_ref().and_then(|h| h.quantile_estimate(0.95));
+    let keep_eff_actions_p50 = keep_eff_actions_hist.as_ref().and_then(|h| h.quantile_estimate(0.50));
+    let keep_eff_actions_p95 = keep_eff_actions_hist.as_ref().and_then(|h| h.quantile_estimate(0.95));
+    let mark_eff_actions_p50 = mark_eff_actions_hist.as_ref().and_then(|h| h.quantile_estimate(0.50));
+    let mark_eff_actions_p95 = mark_eff_actions_hist.as_ref().and_then(|h| h.quantile_estimate(0.95));
     let late_eval_discard_frac = if leaf_eval_submitted_sum > 0 {
         Some((leaf_eval_discarded_sum as f64) / (leaf_eval_submitted_sum as f64))
     } else {
@@ -1652,6 +2117,12 @@ fn emit_selfplay_summary_metrics(
             pi_max_p_p95: pi_max_p_hist.quantile_estimate(0.95),
             pi_eff_actions_p50: pi_eff_actions_hist.quantile_estimate(0.50),
             pi_eff_actions_p95: pi_eff_actions_hist.quantile_estimate(0.95),
+            keep_mass_p50,
+            keep_mass_p95,
+            keep_eff_actions_p50,
+            keep_eff_actions_p95,
+            mark_eff_actions_p50,
+            mark_eff_actions_p95,
             visit_entropy_norm_p50,
             late_eval_discard_frac,
             delta_root_value_mean,

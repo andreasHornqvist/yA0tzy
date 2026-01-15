@@ -41,6 +41,32 @@ pub struct Config {
     /// Neural network model architecture settings.
     #[serde(default)]
     pub model: ModelConfig,
+
+    /// Backward-compat: legacy oracle config (moved to `gating.fixed_oracle`).
+    ///
+    /// Prefer using `gating.fixed_oracle` in new configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<OracleConfig>,
+}
+
+/// Backward-compat: legacy oracle diagnostics configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OracleConfig {
+    /// If true, compute fixed-set oracle diagnostics each iteration.
+    ///
+    /// Disabled by default because it can add non-trivial overhead.
+    #[serde(default)]
+    pub fixed_set_enabled: bool,
+    /// Fixed oracle set id under `configs/oracle_sets/<id>.json`.
+    ///
+    /// Only used if `fixed_set_enabled=true`.
+    #[serde(default)]
+    pub fixed_set_id: Option<String>,
+    /// Optional override for how many states from the set to evaluate.
+    ///
+    /// If None, use the full file.
+    #[serde(default)]
+    pub fixed_set_n: Option<u32>,
 }
 
 /// Neural network model architecture configuration.
@@ -363,6 +389,24 @@ pub struct GatingConfig {
     /// Used to enable sequential tests like SPRT that can stop early.
     #[serde(default)]
     pub katago: GatingKatagoConfig,
+
+    /// Optional fixed-set oracle diagnostics (async; does not block gating/promotion).
+    #[serde(default)]
+    pub fixed_oracle: FixedOracleConfig,
+}
+
+/// Fixed-set oracle diagnostics configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct FixedOracleConfig {
+    /// If true, run fixed-set oracle diagnostics each iteration.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fixed oracle set id under `configs/oracle_sets/<id>.json`.
+    #[serde(default)]
+    pub set_id: Option<String>,
+    /// Optional override for how many states from the set to evaluate (None = all).
+    #[serde(default)]
+    pub n: Option<u32>,
 }
 
 /// KataGo-style gating options.
@@ -488,9 +532,9 @@ impl Default for Config {
             },
             training: TrainingConfig {
                 batch_size: 256,
-                learning_rate: 1e-3,
+                learning_rate: 1e-4,
                 optimizer: default_training_optimizer(),
-                continuous_candidate_training: false,
+                continuous_candidate_training: true,
                 reset_optimizer: default_training_reset_optimizer(),
                 weight_decay: 0.0,
                 epochs: 1,
@@ -507,10 +551,12 @@ impl Default for Config {
                 deterministic_chance: default_gating_deterministic_chance(),
                 threads_per_worker: None,
                 katago: GatingKatagoConfig::default(),
+                fixed_oracle: FixedOracleConfig::default(),
             },
             replay: ReplayConfig::default(),
             controller: ControllerConfig::default(),
             model: ModelConfig::default(),
+            oracle: None,
         }
     }
 }

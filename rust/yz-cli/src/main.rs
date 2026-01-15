@@ -112,6 +112,7 @@ USAGE:
 COMMANDS:
     oracle expected     Print oracle expected score (~248.44)
     oracle sim          Run oracle solitaire simulation
+    oracle-set-gen      Generate a deterministic fixed oracle state set (random-but-stratified)
     start-run           Create a run from a config file and start it (foreground by default)
     extend-run          Fork an existing run into a new run (copy config + optionally replay)
     controller          Run a run-dir (runs/<id>) in the foreground and print iteration summaries
@@ -120,6 +121,7 @@ COMMANDS:
     gate                Gate candidate vs best model (paired seed + side swap)
     gate-worker         Internal: run one gating worker process (spawned by controller)
     oracle-eval         Evaluate models against oracle baseline
+    oracle-fixed-worker Internal: fixed-set oracle diagnostics worker (spawned by controller)
     bench               Run Criterion micro-benchmarks (wrapper around cargo bench)
     tui                 Terminal UI (Ratatui) for configuring + monitoring runs
     profile             Run with profiler hooks enabled
@@ -130,6 +132,879 @@ OPTIONS:
 
 For more information, see the PRD or run `yz <COMMAND> --help`.
 "#
+    );
+}
+
+fn cmd_oracle_set_gen(args: &[String]) {
+    let mut id: Option<String> = None;
+    let mut n: u32 = 4096;
+    let mut seed: u64 = 0x5EED_0BAD_CAFE_BEEF;
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz oracle-set-gen
+
+USAGE:
+    yz oracle-set-gen --id ID [--n N] [--seed SEED] [--out PATH]
+
+OPTIONS:
+    --id ID         Set id (output is configs/oracle_sets/<id>.json by default) (required)
+    --n N           Number of states to generate (default: 4096)
+    --seed SEED     RNG seed u64 (default: 0x5EED_0BAD_CAFE_BEEF)
+    --out PATH      Output path (default: configs/oracle_sets/<id>.json)
+"#
+                );
+                return;
+            }
+            "--id" => {
+                id = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--n" => {
+                n = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(n);
+                i += 2;
+            }
+            "--seed" => {
+                seed = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(seed);
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(args.get(i + 1).cloned().unwrap_or_default()));
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz oracle-set-gen`: {other}");
+                eprintln!("Run `yz oracle-set-gen --help` for usage.");
+                process::exit(1);
+            }
+        }
+    }
+
+    let id = id.unwrap_or_else(|| {
+        eprintln!("Missing --id");
+        process::exit(1);
+    });
+    if id.trim().is_empty() {
+        eprintln!("--id must be non-empty");
+        process::exit(1);
+    }
+    let out_path = out_path.unwrap_or_else(|| PathBuf::from(format!("configs/oracle_sets/{id}.json")));
+
+    // Random-but-stratified generation.
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn next_u64(rng: &mut u64) -> u64 {
+        *rng = splitmix64(*rng);
+        *rng
+    }
+    fn next_u32(rng: &mut u64) -> u32 {
+        (next_u64(rng) >> 32) as u32
+    }
+    fn next_usize(rng: &mut u64, m: usize) -> usize {
+        if m == 0 {
+            0
+        } else {
+            (next_u32(rng) as usize) % m
+        }
+    }
+    fn pick_range_u8(rng: &mut u64, lo: u8, hi: u8) -> u8 {
+        if lo >= hi {
+            return lo;
+        }
+        let span = (hi - lo + 1) as u32;
+        lo + ((next_u32(rng) % span) as u8)
+    }
+    let mut rng = seed;
+
+    // Buckets: turns (filled categories), rounds (upper_total_cap), and roll stage (rerolls_left).
+    let roll_buckets: [u8; 3] = [2, 1, 0];
+    let turn_buckets: [(u8, u8); 3] = [(0, 4), (5, 9), (10, 14)];
+    let upper_buckets: [(u8, u8); 3] = [(0, 20), (21, 42), (43, 63)];
+
+    use std::collections::HashSet;
+    let mut seen: HashSet<yz_eval::OracleSliceStateV1> = HashSet::new();
+    let mut out: Vec<yz_eval::OracleSliceStateV1> = Vec::with_capacity(n as usize);
+
+    let oracle = yz_oracle::oracle();
+
+    #[derive(Clone, Copy)]
+    struct ActionSpec {
+        action: yz_core::Action,
+        allowed_rolls: &'static [u8],
+    }
+    const ROLLS_KEEP: &[u8] = &[2, 1];
+    const ROLLS_MARK: &[u8] = &[2, 1, 0];
+
+    let mut actions: Vec<ActionSpec> = Vec::new();
+    for idx in 0..(yz_core::A as u8) {
+        let action = yz_core::index_to_action(idx);
+        if matches!(action, yz_core::Action::KeepMask(31)) {
+            // Skip keep-all (ignored in eval when rerolls_left>0).
+            continue;
+        }
+        let allowed_rolls = match action {
+            yz_core::Action::KeepMask(_) => ROLLS_KEEP,
+            yz_core::Action::Mark(_) => ROLLS_MARK,
+        };
+        actions.push(ActionSpec { action, allowed_rolls });
+    }
+
+    let action_count = actions.len().max(1) as u32;
+    let base = n / action_count;
+    let mut rem = n - base * action_count;
+
+    fn upper_max_from_avail_mask(avail_mask: u16) -> u8 {
+        let mut sum: u16 = 0;
+        for cat in 0u8..=5u8 {
+            let bit = yz_core::avail_bit_for_cat(cat);
+            if (avail_mask & bit) == 0 {
+                sum = sum.saturating_add(5 * (cat as u16 + 1));
+            }
+        }
+        sum.min(63) as u8
+    }
+
+    fn build_avail_mask(
+        rng: &mut u64,
+        available: u8,
+        must_cat: Option<u8>,
+    ) -> Option<u16> {
+        if available == 0 || available > yz_core::NUM_CATS as u8 {
+            return None;
+        }
+        let mut cats: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        if let Some(cat) = must_cat {
+            if (cat as usize) < cats.len() {
+                let pos = cats.iter().position(|c| *c == cat).unwrap_or(0);
+                cats.swap(0, pos);
+            }
+        }
+        for j in 1..(available as usize) {
+            let k = j + next_usize(rng, 15 - j);
+            cats.swap(j, k);
+        }
+        let mut avail_mask: u16 = 0;
+        for &cat in cats.iter().take(available as usize) {
+            avail_mask |= yz_core::avail_bit_for_cat(cat);
+        }
+        if let Some(cat) = must_cat {
+            if (avail_mask & yz_core::avail_bit_for_cat(cat)) == 0 {
+                return None;
+            }
+        }
+        Some(avail_mask)
+    }
+
+    fn should_ignore_oracle_action(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
+        matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
+    }
+
+    fn canonicalize_keepmask(dice_sorted: [u8; 5], mask: u8) -> u8 {
+        debug_assert!(dice_sorted.windows(2).all(|w| w[0] <= w[1]));
+        debug_assert!(mask < 32);
+
+        let mut need = [0u8; 6];
+        for i in 0..5usize {
+            let bit = 1u8 << (4 - i);
+            if (mask & bit) != 0 {
+                let face = dice_sorted[i] as usize;
+                debug_assert!((1..=6).contains(&face));
+                need[face - 1] = need[face - 1].saturating_add(1);
+            }
+        }
+
+        let mut out: u8 = 0;
+        for i in (0..5usize).rev() {
+            let bit = 1u8 << (4 - i);
+            let face = dice_sorted[i] as usize;
+            let slot = face - 1;
+            if need[slot] > 0 {
+                need[slot] -= 1;
+                out |= bit;
+            }
+        }
+        out
+    }
+
+    let mut action_counts: Vec<u32> = vec![0; actions.len()];
+    let mut roll_counts: [u32; 3] = [0, 0, 0];
+    let mut turn_counts: [u32; 3] = [0, 0, 0];
+    let mut upper_counts: [u32; 3] = [0, 0, 0];
+
+    let mark_actions = actions
+        .iter()
+        .filter(|a| matches!(a.action, yz_core::Action::Mark(_)))
+        .count() as u32;
+    let _keep_actions = action_count.saturating_sub(mark_actions);
+    let mark_target = (n as u64 * (mark_actions as u64) / (action_count as u64)) as u32;
+    let _keep_target = n.saturating_sub(mark_target);
+
+    // Roll-stage targets: keep r1/r2 balanced and keep r0 lower to respect mark/keep ratio.
+    let r0_target = (mark_target / 2).max(1);
+    let r1_target = (n.saturating_sub(r0_target)) / 2;
+    let r2_target = n.saturating_sub(r0_target).saturating_sub(r1_target);
+    let roll_targets: [u32; 3] = [r2_target, r1_target, r0_target]; // order matches roll_buckets [2,1,0]
+
+    let base_turn = n / 3;
+    let mut rem_turn = n - base_turn * 3;
+    let mut turn_targets = [base_turn; 3];
+    for t in &mut turn_targets {
+        if rem_turn == 0 {
+            break;
+        }
+        *t += 1;
+        rem_turn -= 1;
+    }
+
+    let base_upper = n / 3;
+    let mut rem_upper = n - base_upper * 3;
+    let mut upper_targets = [base_upper; 3];
+    for t in &mut upper_targets {
+        if rem_upper == 0 {
+            break;
+        }
+        *t += 1;
+        rem_upper -= 1;
+    }
+
+    fn pick_bucket_idx(rng: &mut u64, counts: &[u32], targets: &[u32], candidates: &[usize]) -> usize {
+        let deficit: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| counts[i] < targets[i])
+            .collect();
+        if deficit.is_empty() {
+            let j = next_usize(rng, candidates.len());
+            return candidates[j];
+        }
+        let j = next_usize(rng, deficit.len());
+        deficit[j]
+    }
+
+    for (ai, a) in actions.iter().enumerate() {
+        let target = base + if rem > 0 { rem -= 1; 1 } else { 0 };
+        if target == 0 {
+            continue;
+        }
+        let mut attempts = 0u32;
+        while action_counts[ai] < target {
+            attempts += 1;
+            if attempts > 1_500_000 {
+                eprintln!(
+                    "oracle-set-gen: too many attempts for action {} (added={}/{})",
+                    ai, action_counts[ai], target
+                );
+                process::exit(2);
+            }
+            let relax = attempts > 800_000;
+            let roll_candidates: Vec<usize> = a
+                .allowed_rolls
+                .iter()
+                .filter_map(|r| roll_buckets.iter().position(|x| x == r))
+                .collect();
+            if roll_candidates.is_empty() {
+                continue;
+            }
+            let r_idx = pick_bucket_idx(&mut rng, &roll_counts, &roll_targets, &roll_candidates);
+            let rerolls_left = roll_buckets[r_idx];
+
+            let turn_candidates: Vec<usize> = (0..turn_buckets.len()).collect();
+            let t_idx = pick_bucket_idx(&mut rng, &turn_counts, &turn_targets, &turn_candidates);
+            let turn_bucket = turn_buckets[t_idx];
+
+            let upper_candidates: Vec<usize> = (0..upper_buckets.len()).collect();
+            let u_idx = pick_bucket_idx(&mut rng, &upper_counts, &upper_targets, &upper_candidates);
+            let upper_bucket = upper_buckets[u_idx];
+
+            let filled = if relax {
+                pick_range_u8(&mut rng, 0, (yz_core::NUM_CATS as u8).saturating_sub(1))
+            } else {
+                pick_range_u8(&mut rng, turn_bucket.0, turn_bucket.1)
+            };
+            if filled >= yz_core::NUM_CATS as u8 {
+                continue;
+            }
+            let available = (yz_core::NUM_CATS as u8).saturating_sub(filled);
+            if available == 0 {
+                continue;
+            }
+            let must_cat = match a.action {
+                yz_core::Action::Mark(cat) => Some(cat),
+                _ => None,
+            };
+            let Some(avail_mask) = build_avail_mask(&mut rng, available, must_cat) else {
+                continue;
+            };
+            let upper_max = upper_max_from_avail_mask(avail_mask);
+            let upper_total_cap = if relax {
+                pick_range_u8(&mut rng, 0, upper_max)
+            } else {
+                let u_lo = upper_bucket.0;
+                let u_hi = upper_bucket.1.min(upper_max);
+                if u_hi < u_lo {
+                    continue;
+                }
+                pick_range_u8(&mut rng, u_lo, u_hi)
+            };
+
+            let mut dice = [0u8; 5];
+            for d in &mut dice {
+                *d = 1 + (next_u32(&mut rng) % 6) as u8;
+            }
+            dice.sort();
+
+            let st = yz_eval::OracleSliceStateV1 {
+                avail_mask,
+                upper_total_cap,
+                dice_sorted: dice,
+                rerolls_left,
+            };
+            if seen.contains(&st) {
+                continue;
+            }
+            let (oa, _ev) =
+                oracle.best_action(st.avail_mask, st.upper_total_cap, st.dice_sorted, st.rerolls_left);
+            if should_ignore_oracle_action(oa, st.rerolls_left) {
+                continue;
+            }
+            let expected = match oa {
+                yz_oracle::Action::Mark { cat } => yz_core::Action::Mark(cat),
+                yz_oracle::Action::KeepMask { mask } => {
+                    yz_core::Action::KeepMask(canonicalize_keepmask(st.dice_sorted, mask))
+                }
+            };
+            if expected != a.action {
+                continue;
+            }
+            if seen.insert(st) {
+                out.push(st);
+                action_counts[ai] += 1;
+                roll_counts[r_idx] += 1;
+                let tb = if filled <= turn_buckets[0].1 {
+                    0
+                } else if filled <= turn_buckets[1].1 {
+                    1
+                } else {
+                    2
+                };
+                turn_counts[tb] += 1;
+                let ub = if upper_total_cap <= upper_buckets[0].1 {
+                    0
+                } else if upper_total_cap <= upper_buckets[1].1 {
+                    1
+                } else {
+                    2
+                };
+                upper_counts[ub] += 1;
+            }
+        }
+    }
+
+    if out.len() != n as usize {
+        eprintln!(
+            "oracle-set-gen: generated {} states but expected {}",
+            out.len(),
+            n
+        );
+        process::exit(2);
+    }
+
+    // Stable output order: sort by a deterministic key.
+    out.sort_by_key(|s| {
+        let mut k: u64 = s.avail_mask as u64;
+        k ^= (s.upper_total_cap as u64) << 16;
+        k ^= (s.rerolls_left as u64) << 24;
+        k ^= (s.dice_sorted[0] as u64) << 32;
+        k ^= (s.dice_sorted[1] as u64) << 40;
+        k ^= (s.dice_sorted[2] as u64) << 48;
+        k ^= (s.dice_sorted[3] as u64) << 56;
+        k
+    });
+
+    let bytes = serde_json::to_vec_pretty(&out).unwrap();
+    if let Some(parent) = out_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = out_path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).unwrap_or_else(|e| {
+        eprintln!("Failed to write {}: {e}", tmp.display());
+        process::exit(1);
+    });
+    std::fs::rename(&tmp, &out_path).unwrap_or_else(|e| {
+        eprintln!("Failed to rename {}: {e}", out_path.display());
+        process::exit(1);
+    });
+    println!("wrote {} states to {}", out.len(), out_path.display());
+}
+
+fn cmd_oracle_fixed_worker(args: &[String]) {
+    let mut run_dir: Option<String> = None;
+    let mut infer: Option<String> = None;
+    let mut cand_id: Option<u32> = None;
+    let mut iter_idx: Option<u32> = None;
+    let mut set_id: Option<String> = None;
+    let mut shard_idx: u32 = 0;
+    let mut num_shards: u32 = 1;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    r#"yz oracle-fixed-worker
+
+USAGE:
+    yz oracle-fixed-worker --run-dir DIR --infer ENDPOINT --cand-id ID --iter-idx N --set-id SET [--shard-idx I --num-shards K]
+"#
+                );
+                return;
+            }
+            "--run-dir" => {
+                run_dir = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--infer" => {
+                infer = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--cand-id" => {
+                cand_id = args.get(i + 1).and_then(|s| s.parse::<u32>().ok());
+                i += 2;
+            }
+            "--iter-idx" => {
+                iter_idx = args.get(i + 1).and_then(|s| s.parse::<u32>().ok());
+                i += 2;
+            }
+            "--set-id" => {
+                set_id = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--shard-idx" => {
+                shard_idx = args.get(i + 1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                i += 2;
+            }
+            "--num-shards" => {
+                num_shards = args.get(i + 1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown option for `yz oracle-fixed-worker`: {other}");
+                process::exit(1);
+            }
+        }
+    }
+
+    let run_dir = PathBuf::from(run_dir.unwrap_or_else(|| {
+        eprintln!("Missing --run-dir");
+        process::exit(1);
+    }));
+    let infer = infer.unwrap_or_else(|| {
+        eprintln!("Missing --infer");
+        process::exit(1);
+    });
+    let cand_id = cand_id.unwrap_or_else(|| {
+        eprintln!("Missing --cand-id");
+        process::exit(1);
+    });
+    let iter_idx = iter_idx.unwrap_or_else(|| {
+        eprintln!("Missing --iter-idx");
+        process::exit(1);
+    });
+    let set_id = set_id.unwrap_or_else(|| {
+        eprintln!("Missing --set-id");
+        process::exit(1);
+    });
+    if num_shards < 1 {
+        eprintln!("--num-shards must be >= 1");
+        process::exit(1);
+    }
+    if shard_idx >= num_shards {
+        eprintln!("--shard-idx must be in [0, --num-shards)");
+        process::exit(1);
+    }
+
+    let cancel_file = run_dir.join("cancel.request");
+    if cancel_file.exists() {
+        return;
+    }
+
+    let cfg_path = run_dir.join("config.yaml");
+    let cfg = yz_core::Config::load(&cfg_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config.yaml: {e}");
+        process::exit(1);
+    });
+    // Prefer new location: gating.fixed_oracle.* ; fall back to legacy cfg.oracle.*.
+    let enabled = cfg.gating.fixed_oracle.enabled
+        || cfg.oracle.as_ref().map(|o| o.fixed_set_enabled).unwrap_or(false);
+    let cfg_set_id = if cfg.gating.fixed_oracle.enabled {
+        cfg.gating.fixed_oracle.set_id.as_deref()
+    } else {
+        cfg.oracle.as_ref().and_then(|o| o.fixed_set_id.as_deref())
+    };
+    if !(enabled && cfg_set_id == Some(set_id.as_str())) {
+        // Disabled or mismatched set id → no-op.
+        return;
+    }
+
+    let mut states = yz_eval::load_oracle_set(&set_id).unwrap_or_else(|e| {
+        eprintln!("Failed to load oracle set: {e}");
+        process::exit(1);
+    });
+
+    // Apply fixed-oracle N before sharding so progress/aggregation are accurate.
+    let set_len = states.len();
+    let max_n = cfg
+        .gating
+        .fixed_oracle
+        .n
+        .map(|x| x as usize)
+        .unwrap_or(states.len())
+        .min(states.len());
+    if let Some(n) = cfg.gating.fixed_oracle.n {
+        if (n as usize) > set_len {
+            eprintln!(
+                "[oracle-fixed-worker] warning: fixed_oracle.n={} > set size {}; using {}",
+                n, set_len, max_n
+            );
+        }
+    }
+
+    fn state_hash(st: &yz_eval::OracleSliceStateV1) -> u64 {
+        let mut k: u64 = st.avail_mask as u64;
+        k ^= (st.upper_total_cap as u64) << 16;
+        k ^= (st.rerolls_left as u64) << 24;
+        k ^= (st.dice_sorted[0] as u64) << 32;
+        k ^= (st.dice_sorted[1] as u64) << 40;
+        k ^= (st.dice_sorted[2] as u64) << 48;
+        k ^= (st.dice_sorted[3] as u64) << 56;
+        k
+    }
+
+    fn turn_bucket_from_avail(avail_mask: u16) -> u8 {
+        let available = avail_mask.count_ones() as i32;
+        let filled = (yz_core::NUM_CATS as i32 - available).clamp(0, yz_core::NUM_CATS as i32);
+        if filled <= 4 {
+            0
+        } else if filled <= 9 {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn upper_bucket_from_cap(upper_total_cap: u8) -> u8 {
+        if upper_total_cap <= 20 {
+            0
+        } else if upper_total_cap <= 42 {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn roll_bucket_from_rerolls(r: u8) -> u8 {
+        match r {
+            2 => 0,
+            1 => 1,
+            _ => 2,
+        }
+    }
+
+    fn should_ignore_oracle_action(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
+        matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Meta {
+        st: yz_eval::OracleSliceStateV1,
+        action_idx: u8,
+        roll_bucket: u8,
+        turn_bucket: u8,
+        upper_bucket: u8,
+        hash: u64,
+    }
+
+    if max_n < states.len() {
+        use std::collections::BTreeMap;
+
+        let oracle = yz_oracle::oracle();
+        let mut metas: Vec<Meta> = Vec::with_capacity(states.len());
+        for st in &states {
+            let (oa, _ev) =
+                oracle.best_action(st.avail_mask, st.upper_total_cap, st.dice_sorted, st.rerolls_left);
+            if should_ignore_oracle_action(oa, st.rerolls_left) {
+                continue;
+            }
+            let expected = match oa {
+                yz_oracle::Action::Mark { cat } => yz_core::Action::Mark(cat),
+                yz_oracle::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
+            };
+            let action_idx = yz_core::action_to_index(expected);
+            metas.push(Meta {
+                st: *st,
+                action_idx,
+                roll_bucket: roll_bucket_from_rerolls(st.rerolls_left),
+                turn_bucket: turn_bucket_from_avail(st.avail_mask),
+                upper_bucket: upper_bucket_from_cap(st.upper_total_cap),
+                hash: state_hash(st),
+            });
+        }
+
+        let mut by_action: Vec<Vec<Meta>> = vec![Vec::new(); yz_core::A];
+        for m in metas {
+            by_action[m.action_idx as usize].push(m);
+        }
+        let mut action_indices: Vec<usize> = by_action
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if v.is_empty() { None } else { Some(i) })
+            .collect();
+        action_indices.sort_unstable();
+
+        let action_count = action_indices.len().max(1);
+        let base = max_n / action_count;
+        let mut rem = max_n - base * action_count;
+
+        let mut selected: Vec<Meta> = Vec::with_capacity(max_n);
+        let mut remaining: Vec<Meta> = Vec::new();
+
+        for &ai in &action_indices {
+            let target = base + if rem > 0 { rem -= 1; 1 } else { 0 };
+            if target == 0 {
+                continue;
+            }
+            let mut buckets: BTreeMap<(u8, u8, u8), Vec<Meta>> = BTreeMap::new();
+            for m in &by_action[ai] {
+                buckets
+                    .entry((m.roll_bucket, m.turn_bucket, m.upper_bucket))
+                    .or_default()
+                    .push(*m);
+            }
+            for b in buckets.values_mut() {
+                b.sort_by_key(|m| m.hash);
+            }
+
+            let keys: Vec<(u8, u8, u8)> = buckets.keys().copied().collect();
+            let bcount = keys.len().max(1);
+            let base_b = target / bcount;
+            let mut rem_b = target - base_b * bcount;
+            let mut selected_action = 0usize;
+            let mut leftover_action: Vec<Meta> = Vec::new();
+
+            for key in keys {
+                let take = base_b + if rem_b > 0 { rem_b -= 1; 1 } else { 0 };
+                let bucket = buckets.get_mut(&key).unwrap();
+                let n_take = take.min(bucket.len());
+                selected.extend(bucket.drain(0..n_take));
+                selected_action += n_take;
+                leftover_action.extend(bucket.drain(..));
+            }
+
+            if selected_action < target {
+                leftover_action.sort_by_key(|m| m.hash);
+                let need = target - selected_action;
+                let n_take = need.min(leftover_action.len());
+                selected.extend(leftover_action.drain(0..n_take));
+            }
+            remaining.extend(leftover_action);
+        }
+
+        if selected.len() < max_n {
+            remaining.sort_by_key(|m| m.hash);
+            let need = max_n - selected.len();
+            selected.extend(remaining.into_iter().take(need));
+        }
+
+        if selected.len() < max_n {
+            eprintln!(
+                "[oracle-fixed-worker] warning: requested n={} but only selected {} states",
+                max_n,
+                selected.len()
+            );
+        }
+        selected.sort_by_key(|m| m.hash);
+        states = selected.into_iter().map(|m| m.st).collect();
+    } else {
+        states.sort_by_key(state_hash);
+    }
+
+    // Shard states deterministically by index mod num_shards.
+    let shard_states: Vec<yz_eval::OracleSliceStateV1> = states
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| (*i as u32) % num_shards == shard_idx)
+        .map(|(_, s)| *s)
+        .collect();
+
+    // Match gate-worker client + MCTS settings (no dirichlet).
+    let client_opts = yz_infer::ClientOptions {
+        max_inflight_total: 64,
+        max_outbound_queue: 256,
+        request_id_start: 1,
+        protocol_version: cfg.inference.protocol_version,
+        legal_mask_bitset: cfg.inference.legal_mask_bitset && cfg.inference.protocol_version == 2,
+    };
+    let mcts_cfg = yz_mcts::MctsConfig {
+        c_puct: cfg.mcts.c_puct,
+        simulations_mark: cfg.mcts.budget_mark.max(1),
+        simulations_reroll: cfg.mcts.budget_reroll.max(1),
+        dirichlet_alpha: cfg.mcts.dirichlet_alpha,
+        dirichlet_epsilon: 0.0,
+        max_inflight: cfg.mcts.max_inflight_per_game.max(1) as usize,
+        virtual_loss_mode: match cfg.mcts.virtual_loss_mode.as_str() {
+            "q_penalty" => yz_mcts::VirtualLossMode::QPenalty,
+            "n_virtual_only" => yz_mcts::VirtualLossMode::NVirtualOnly,
+            "off" => yz_mcts::VirtualLossMode::Off,
+            _ => yz_mcts::VirtualLossMode::QPenalty,
+        },
+        virtual_loss: cfg.mcts.virtual_loss.max(0.0),
+        expansion_lock: cfg.mcts.katago.expansion_lock,
+    };
+
+    if cancel_file.exists() {
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+    eprintln!(
+        "[oracle-fixed-worker] start run_dir={} iter_idx={} set_id={} shard={}/{} n={} assigned={} mcts=mark:{} reroll:{} endpoint={}",
+        run_dir.display(),
+        iter_idx,
+        set_id,
+        shard_idx,
+        num_shards,
+        cfg.gating
+            .fixed_oracle
+            .n
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "all".to_string()),
+        shard_states.len(),
+        cfg.mcts.budget_mark,
+        cfg.mcts.budget_reroll,
+        infer
+    );
+
+    // Progress + report files (per-shard, per-iteration).
+    let out_dir = run_dir
+        .join("oracle_fixed")
+        .join(format!("iter_{iter_idx:03}"));
+    let _ = std::fs::create_dir_all(&out_dir);
+    let progress_path = out_dir.join(format!("progress_{shard_idx:03}.json"));
+    let report_path = out_dir.join(format!("shard_{shard_idx:03}.json"));
+
+    #[derive(serde::Serialize)]
+    struct OracleFixedProgressV1 {
+        iter_idx: u32,
+        shard_idx: u32,
+        num_shards: u32,
+        done: u64,
+        total: u64,
+        pid: u32,
+        ts_ms: u64,
+    }
+    fn write_progress_atomic(path: &PathBuf, p: &OracleFixedProgressV1) {
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(p) {
+            let _ = std::fs::write(&tmp, &bytes);
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+    write_progress_atomic(
+        &progress_path,
+        &OracleFixedProgressV1 {
+            iter_idx,
+            shard_idx,
+            num_shards,
+            done: 0,
+            total: shard_states.len() as u64,
+            pid: std::process::id(),
+            ts_ms: yz_logging::now_ms(),
+        },
+    );
+
+    let mut last_progress_write = std::time::Instant::now();
+    let mut progress_cb = |done: u64, total: u64| {
+        let should_write = done == total || last_progress_write.elapsed().as_millis() >= 500;
+        if should_write {
+            write_progress_atomic(
+                &progress_path,
+                &OracleFixedProgressV1 {
+                    iter_idx,
+                    shard_idx,
+                    num_shards,
+                    done,
+                    total,
+                    pid: std::process::id(),
+                    ts_ms: yz_logging::now_ms(),
+                },
+            );
+            last_progress_write = std::time::Instant::now();
+        }
+    };
+
+    let rep = yz_eval::eval_fixed_oracle_set(
+        &cfg,
+        &infer,
+        cand_id,
+        &client_opts,
+        mcts_cfg,
+        &set_id,
+        &shard_states,
+        Some(&mut progress_cb),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("oracle-fixed-worker failed: {e}");
+        process::exit(1);
+    });
+
+    if cancel_file.exists() {
+        return;
+    }
+
+    // Final progress snapshot + write shard report (controller aggregates and emits NDJSON).
+    write_progress_atomic(
+        &progress_path,
+        &OracleFixedProgressV1 {
+            iter_idx,
+            shard_idx,
+            num_shards,
+            done: rep.total,
+            total: shard_states.len() as u64,
+            pid: std::process::id(),
+            ts_ms: yz_logging::now_ms(),
+        },
+    );
+    let bytes = serde_json::to_vec_pretty(&rep).unwrap();
+    let tmp = report_path.with_extension("json.tmp");
+    let _ = std::fs::write(&tmp, &bytes);
+    let _ = std::fs::rename(&tmp, &report_path);
+
+    eprintln!(
+        "[oracle-fixed-worker] done iter_idx={} set_id={} shard={}/{} total={} overall={:.4} mark={:.4} reroll={:.4} elapsed={:.2}s",
+        iter_idx,
+        set_id,
+        shard_idx,
+        num_shards,
+        rep.total,
+        rep.match_rate_overall(),
+        rep.match_rate_mark(),
+        rep.match_rate_reroll(),
+        t0.elapsed().as_secs_f64()
     );
 }
 
@@ -892,6 +1767,9 @@ OPTIONS:
         pi_max_p_hist: yz_logging::HistogramV1,
         pi_eff_actions_hist: yz_logging::HistogramV1,
         visit_entropy_norm_hist: yz_logging::HistogramV1,
+        keep_mass_hist: yz_logging::HistogramV1,
+        keep_eff_actions_hist: yz_logging::HistogramV1,
+        mark_eff_actions_hist: yz_logging::HistogramV1,
 
         // Search scalars.
         root_value_sum: f64,
@@ -1022,6 +1900,9 @@ OPTIONS:
                 pi_max_p_hist: yz_logging::HistogramV1::new(0.0, 1.0, HIST_BINS),
                 pi_eff_actions_hist: yz_logging::HistogramV1::new(0.0, yz_core::A as f64, HIST_BINS),
                 visit_entropy_norm_hist: yz_logging::HistogramV1::new(0.0, 1.0, HIST_BINS),
+                keep_mass_hist: yz_logging::HistogramV1::new(0.0, 1.0, HIST_BINS),
+                keep_eff_actions_hist: yz_logging::HistogramV1::new(0.0, 32.0, HIST_BINS),
+                mark_eff_actions_hist: yz_logging::HistogramV1::new(0.0, 32.0, HIST_BINS),
                 root_value_sum: 0.0,
                 root_value_sumsq: 0.0,
                 root_value_n: 0,
@@ -1080,6 +1961,9 @@ OPTIONS:
                 pi_max_p_hist: self.pi_max_p_hist,
                 pi_eff_actions_hist: self.pi_eff_actions_hist,
                 visit_entropy_norm_hist: Some(self.visit_entropy_norm_hist),
+                keep_mass_hist: Some(self.keep_mass_hist),
+                keep_eff_actions_hist: Some(self.keep_eff_actions_hist),
+                mark_eff_actions_hist: Some(self.mark_eff_actions_hist),
                 root_value_sum: self.root_value_sum,
                 root_value_sumsq: self.root_value_sumsq,
                 root_value_n: self.root_value_n,
@@ -1119,6 +2003,45 @@ OPTIONS:
             self.pi_entropy_hist.add(ent);
             self.pi_max_p_hist.add(max_p);
             self.pi_eff_actions_hist.add(eff);
+
+            // Keep vs mark distribution within reroll phase.
+            if exec.rerolls_left > 0 {
+                let mut keep_mass = 0.0f64;
+                let mut mark_mass = 0.0f64;
+                for i in 0..yz_core::A {
+                    let p = exec.search.pi[i] as f64;
+                    if !(p.is_finite()) || p <= 0.0 {
+                        continue;
+                    }
+                    if i < 32 {
+                        keep_mass += p;
+                    } else {
+                        mark_mass += p;
+                    }
+                }
+                let tot = (keep_mass + mark_mass).max(1e-12);
+                keep_mass = (keep_mass / tot).clamp(0.0, 1.0);
+                self.keep_mass_hist.add(keep_mass);
+
+                // EffA on renormalized subsets.
+                let eff_subset = |lo: usize, hi: usize, mass: f64| -> f64 {
+                    if mass <= 0.0 {
+                        return 0.0;
+                    }
+                    let mut sumsq = 0.0f64;
+                    for i in lo..hi {
+                        let p = (exec.search.pi[i] as f64) / mass;
+                        if p.is_finite() && p > 0.0 {
+                            sumsq += p * p;
+                        }
+                    }
+                    if sumsq > 0.0 { 1.0 / sumsq } else { 0.0 }
+                };
+                let eff_keep = eff_subset(0, 32, keep_mass);
+                let eff_mark = eff_subset(32, yz_core::A, 1.0 - keep_mass);
+                self.keep_eff_actions_hist.add(eff_keep);
+                self.mark_eff_actions_hist.add(eff_mark);
+            }
 
             // Normalized root visit entropy: H(pi_visit) / log(n_legal) (clamped to [0,1]).
             let n_legal = exec
@@ -3128,6 +4051,9 @@ fn main() {
                 }
             }
         }
+        "oracle-set-gen" => {
+            cmd_oracle_set_gen(&args[2..]);
+        }
         "start-run" => {
             cmd_start_run(&args[2..]);
         }
@@ -3168,6 +4094,9 @@ fn main() {
         "oracle-eval" => {
             println!("Oracle evaluation (not yet implemented)");
             println!("Usage: yz oracle-eval --config cfg.yaml --best ... --cand ...");
+        }
+        "oracle-fixed-worker" => {
+            cmd_oracle_fixed_worker(&args[2..]);
         }
         "bench" => {
             cmd_bench(&args[2..]);
