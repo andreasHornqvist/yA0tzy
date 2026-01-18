@@ -7,6 +7,44 @@
 pub const NUM_CATS: usize = 15;
 pub const A: usize = 32 + NUM_CATS; // 47
 
+/// Canonicalize a KeepMask action for a given sorted dice configuration.
+///
+/// When dice contain duplicates, multiple different masks can represent the same kept multiset.
+/// This helper maps any keepmask to a canonical representative by keeping the rightmost
+/// occurrences for each face.
+///
+/// # Preconditions
+/// - `dice_sorted` must be sorted non-decreasing.
+/// - `mask` must be in `0..=31`.
+pub fn canonicalize_keepmask(dice_sorted: [u8; 5], mask: u8) -> u8 {
+    debug_assert!(dice_sorted.windows(2).all(|w| w[0] <= w[1]));
+    debug_assert!(mask < 32);
+
+    // Count kept faces.
+    let mut need = [0u8; 6];
+    for i in 0..5usize {
+        let bit = 1u8 << (4 - i);
+        if (mask & bit) != 0 {
+            let face = dice_sorted[i] as usize;
+            debug_assert!((1..=6).contains(&face));
+            need[face - 1] = need[face - 1].saturating_add(1);
+        }
+    }
+
+    // Reconstruct canonical mask by keeping the rightmost occurrences for each face.
+    let mut out: u8 = 0;
+    for i in (0..5usize).rev() {
+        let bit = 1u8 << (4 - i);
+        let face = dice_sorted[i] as usize;
+        let slot = face - 1;
+        if need[slot] > 0 {
+            need[slot] -= 1;
+            out |= bit;
+        }
+    }
+    out
+}
+
 /// Oracle-compatible action representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

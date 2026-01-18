@@ -19,8 +19,8 @@ pub mod state;
 mod state_tests;
 
 pub use action::{
-    action_to_index, avail_bit_for_cat, index_to_action, is_mark_index, mark_cat_from_index,
-    Action, A, NUM_CATS,
+    action_to_index, avail_bit_for_cat, canonicalize_keepmask, index_to_action, is_mark_index,
+    mark_cat_from_index, Action, A, NUM_CATS,
 };
 pub use chance::{apply_keepmask, roll5, EventKey};
 pub use config::{Config, ConfigError};
