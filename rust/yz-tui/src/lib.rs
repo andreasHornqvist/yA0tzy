@@ -600,6 +600,54 @@ struct OracleFixedSummaryNdjsonV1 {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+struct GateOracleSummaryNdjsonV1 {
+    // Present to support forward/backward compatible NDJSON parsing.
+    #[allow(dead_code)]
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    iter_idx: Option<u32>,
+    #[serde(default)]
+    match_rate_overall: Option<f64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    match_rate_mark: Option<f64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    match_rate_reroll: Option<f64>,
+    #[serde(default)]
+    keepall_ignored: Option<u64>,
+    #[serde(default)]
+    r2_total: Option<u64>,
+    #[serde(default)]
+    r2_matched: Option<u64>,
+    #[serde(default)]
+    r1_total: Option<u64>,
+    #[serde(default)]
+    r1_matched: Option<u64>,
+    #[serde(default)]
+    r0_total: Option<u64>,
+    #[serde(default)]
+    r0_matched: Option<u64>,
+
+    #[serde(default)]
+    action_total: Option<Vec<u64>>,
+    #[serde(default)]
+    action_matched: Option<Vec<u64>>,
+    #[serde(default)]
+    chosen_total: Option<Vec<u64>>,
+    #[serde(default)]
+    turn_total: Option<Vec<u64>>,
+    #[serde(default)]
+    turn_matched: Option<Vec<u64>>,
+
+    #[serde(default)]
+    gate_games: Option<u32>,
+    #[serde(default)]
+    steps_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct OracleFixedProgressFileV1 {
     #[serde(default)]
     #[allow(dead_code)]
@@ -626,6 +674,12 @@ struct OracleFixedProgressFileV1 {
 struct OracleFixedProgressAgg {
     done: u64,
     total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleViewSrc {
+    FixedOracle,
+    GateOracle,
 }
 
 #[derive(Debug, Clone)]
@@ -695,6 +749,8 @@ struct App {
     infer_last_ts_ms: u64,
     oracle_fixed_by_iter: HashMap<u32, OracleFixedSummaryNdjsonV1>,
     oracle_fixed_progress_by_iter: HashMap<u32, OracleFixedProgressAgg>,
+    gate_oracle_by_iter: HashMap<u32, GateOracleSummaryNdjsonV1>,
+    oracle_view_src: OracleViewSrc,
 
     // Replay buffer visualization (best-effort, cheap: small JSON snapshots + meta filenames).
     replay_loaded_for_run: Option<String>,
@@ -808,6 +864,8 @@ impl App {
             infer_last_ts_ms: 0,
             oracle_fixed_by_iter: HashMap::new(),
             oracle_fixed_progress_by_iter: HashMap::new(),
+            gate_oracle_by_iter: HashMap::new(),
+            oracle_view_src: OracleViewSrc::FixedOracle,
 
             replay_loaded_for_run: None,
             replay_last_poll: Instant::now(),
@@ -1537,6 +1595,8 @@ impl App {
             self.infer_last_ts_ms = 0;
             self.oracle_fixed_by_iter.clear();
             self.oracle_fixed_progress_by_iter.clear();
+            self.gate_oracle_by_iter.clear();
+            self.oracle_view_src = OracleViewSrc::FixedOracle;
 
             // Reset replay buffer cache when switching runs.
             self.replay_loaded_for_run = None;
@@ -1655,6 +1715,15 @@ impl App {
                         continue;
                     };
                     self.oracle_fixed_by_iter.insert(i, os);
+                }
+                "gate_oracle_summary_v1" => {
+                    let Ok(gs) = serde_json::from_value::<GateOracleSummaryNdjsonV1>(v) else {
+                        continue;
+                    };
+                    let Some(i) = gs.iter_idx else {
+                        continue;
+                    };
+                    self.gate_oracle_by_iter.insert(i, gs);
                 }
                 _ => {}
             }
@@ -2719,14 +2788,61 @@ pub fn run() -> io::Result<()> {
                             app.enter_dashboard();
                         }
                         KeyCode::Char('R') | KeyCode::Char('r') => app.refresh_dashboard(),
+                        KeyCode::Tab => {
+                            app.oracle_view_src = match app.oracle_view_src {
+                                OracleViewSrc::FixedOracle => OracleViewSrc::GateOracle,
+                                OracleViewSrc::GateOracle => OracleViewSrc::FixedOracle,
+                            };
+                            app.oracle_actions_scroll = 0;
+                        }
                         KeyCode::Left => {
                             app.oracle_follow = false;
-                            app.oracle_selected_iter = app.oracle_selected_iter.saturating_sub(1);
+                            if let Some(m) = &app.dashboard_manifest {
+                                if !m.iterations.is_empty() {
+                                    let mut idxs: Vec<u32> =
+                                        m.iterations.iter().map(|it| it.idx).collect();
+                                    idxs.sort_unstable();
+                                    idxs.dedup();
+                                    let pos = idxs
+                                        .iter()
+                                        .position(|&x| x == app.oracle_selected_iter)
+                                        .unwrap_or(0);
+                                    if pos > 0 {
+                                        app.oracle_selected_iter = idxs[pos - 1];
+                                    } else {
+                                        app.oracle_selected_iter = idxs[0];
+                                    }
+                                } else {
+                                    app.oracle_selected_iter = app.oracle_selected_iter.saturating_sub(1);
+                                }
+                            } else {
+                                app.oracle_selected_iter = app.oracle_selected_iter.saturating_sub(1);
+                            }
                             app.oracle_actions_scroll = 0;
                         }
                         KeyCode::Right => {
                             app.oracle_follow = false;
-                            app.oracle_selected_iter = app.oracle_selected_iter.saturating_add(1);
+                            if let Some(m) = &app.dashboard_manifest {
+                                if !m.iterations.is_empty() {
+                                    let mut idxs: Vec<u32> =
+                                        m.iterations.iter().map(|it| it.idx).collect();
+                                    idxs.sort_unstable();
+                                    idxs.dedup();
+                                    let pos = idxs
+                                        .iter()
+                                        .position(|&x| x == app.oracle_selected_iter)
+                                        .unwrap_or(0);
+                                    if pos + 1 < idxs.len() {
+                                        app.oracle_selected_iter = idxs[pos + 1];
+                                    } else {
+                                        app.oracle_selected_iter = *idxs.last().unwrap_or(&app.oracle_selected_iter);
+                                    }
+                                } else {
+                                    app.oracle_selected_iter = app.oracle_selected_iter.saturating_add(1);
+                                }
+                            } else {
+                                app.oracle_selected_iter = app.oracle_selected_iter.saturating_add(1);
+                            }
                             app.oracle_actions_scroll = 0;
                         }
                         KeyCode::Up => {
@@ -6468,7 +6584,7 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+        .constraints([Constraint::Length(5), Constraint::Min(0)].as_ref())
         .split(area);
 
     let top_line = Line::from(vec![
@@ -6476,10 +6592,20 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         Span::raw("  "),
         Span::raw(rid.to_string()),
         Span::raw(format!("  iter {}", app.oracle_selected_iter)),
+        Span::raw("  view ".to_string()),
+        Span::styled(
+            match app.oracle_view_src {
+                OracleViewSrc::FixedOracle => "fixed_oracle",
+                OracleViewSrc::GateOracle => "gate_oracle",
+            },
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ]);
     let top = Paragraph::new(vec![
         top_line,
-        Line::from("←/→ change iter | ↑/↓ scroll actions | End follow | R refresh"),
+        Line::from("Keys: ←/→ iter | ↑/↓ actions | End follow | R refresh | Tab view | Esc back"),
+        Line::from("Legend: acc=m/o, alloc=m/c  (m=matched, o=oracle_optimal_total, c=chosen_total)"),
+        Line::from("Legend: t/k/m = total/keep/mark  (keep=keepmask decisions in roll phases)"),
     ])
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(top, rows[0]);
@@ -6509,50 +6635,82 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         return;
     };
 
-    // Left: iteration table.
+    // Left: iteration table (auto-scrolls to keep selected iter visible).
     let mut left: Vec<Line> = Vec::new();
-    let header = format!(
-        "  {:>4} {:>6} {:>6} {:>6} {:>6} {:>7}",
-        "iter", "gate", "fixed", "mark", "reroll", "keepall"
-    );
+    const W_ITER: usize = 4;
+    const W_TRM: usize = 24; // e.g. header "fixed_oracle (acc t/k/m)"
+    const W_KEEPALL: usize = 7;
+
+    let fmt_trm = |a: Option<f64>, b: Option<f64>, c: Option<f64>| -> String {
+        if a.is_none() && b.is_none() && c.is_none() {
+            return "-".to_string();
+        }
+        let f = |x: Option<f64>| -> String {
+            x.map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "--".to_string())
+        };
+        format!("{}/{}/{}", f(a), f(b), f(c))
+    };
+
     left.push(Line::from(Span::styled(
-        header,
+        format!(
+            "  {:>W_ITER$} {:>W_TRM$} {:>W_TRM$} {:>W_KEEPALL$}",
+            "iter",
+            "gate_oracle (acc t/k/m)",
+            "fixed_oracle (acc t/k/m)",
+            "keepall",
+            W_ITER = W_ITER,
+            W_TRM = W_TRM,
+            W_KEEPALL = W_KEEPALL
+        ),
         Style::default().fg(Color::DarkGray),
     )));
 
+    let mut iter_rows: Vec<Line> = Vec::new();
     for it in &m.iterations {
-        let gate = match (
+        let gate = fmt_trm(
             it.oracle.match_rate_overall,
             it.oracle.match_rate_reroll,
             it.oracle.match_rate_mark,
-        ) {
-            (None, None, None) => None,
-            (a, b, c) => {
-                let f = |x: Option<f64>| -> String {
-                    x.map(|v| format!("{v:.2}"))
-                        .unwrap_or_else(|| "--".to_string())
-                };
-                Some(format!("{}/{}/{}", f(a), f(b), f(c)))
-            }
-        };
+        );
         let fixed_row = app.oracle_fixed_by_iter.get(&it.idx);
-        let fixed = fixed_row.and_then(|x| x.match_rate_overall);
-        let fixed_mark = fixed_row.and_then(|x| x.match_rate_mark);
-        let fixed_reroll = fixed_row.and_then(|x| x.match_rate_reroll);
-        let keepall = fixed_row.and_then(|x| x.keepall_ignored);
+        let fixed = fixed_row
+            .map(|x| fmt_trm(x.match_rate_overall, x.match_rate_reroll, x.match_rate_mark))
+            .unwrap_or_else(|| "-".to_string());
+        let keepall = fixed_row
+            .and_then(|x| x.keepall_ignored)
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "-".to_string());
 
         let marker = if it.idx == app.oracle_selected_iter { "▸" } else { " " };
-        left.push(Line::from(format!(
-            "{marker} {:>4} {:>6} {:>6} {:>6} {:>6} {:>7}",
+        iter_rows.push(Line::from(format!(
+            "{marker} {:>W_ITER$} {:>W_TRM$} {:>W_TRM$} {:>W_KEEPALL$}",
             it.idx,
-            gate.unwrap_or_else(|| "-".to_string()),
-            fixed.map(|x| format!("{:.3}", x)).unwrap_or_else(|| "-".to_string()),
-            fixed_mark.map(|x| format!("{:.3}", x)).unwrap_or_else(|| "-".to_string()),
-            fixed_reroll
-                .map(|x| format!("{:.3}", x))
-                .unwrap_or_else(|| "-".to_string()),
-            keepall.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string()),
+            gate,
+            fixed,
+            keepall,
+            W_ITER = W_ITER,
+            W_TRM = W_TRM,
+            W_KEEPALL = W_KEEPALL
         )));
+    }
+
+    let view_h = cols[0].height.saturating_sub(2) as usize; // inside borders
+    let view_rows = view_h.saturating_sub(left.len()).max(1);
+    let max_start = iter_rows.len().saturating_sub(view_rows);
+    let sel_pos = m
+        .iterations
+        .iter()
+        .position(|it| it.idx == app.oracle_selected_iter)
+        .unwrap_or(0);
+    let start = if sel_pos < view_rows {
+        0
+    } else {
+        sel_pos.saturating_sub(view_rows * 2 / 3)
+    }
+    .min(max_start);
+    for line in iter_rows.into_iter().skip(start).take(view_rows) {
+        left.push(line);
     }
 
     let left_block = Block::default().title("Iterations").borders(Borders::ALL);
@@ -6568,14 +6726,120 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
 
     let mut actions: Vec<Line> = Vec::new();
 
-    if let Some(v) = app.oracle_fixed_by_iter.get(&app.oracle_selected_iter) {
-        let set_id = v.set_id.clone().unwrap_or_else(|| "-".to_string());
-        let ns = v.num_states.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
-        mid.push(Line::from(format!("fixed_set: {set_id}  n={ns}")));
+    enum Src<'a> {
+        Fixed(&'a OracleFixedSummaryNdjsonV1),
+        Gate(&'a GateOracleSummaryNdjsonV1),
+    }
+    let src: Option<Src<'_>> = match app.oracle_view_src {
+        OracleViewSrc::FixedOracle => app
+            .oracle_fixed_by_iter
+            .get(&app.oracle_selected_iter)
+            .map(Src::Fixed),
+        OracleViewSrc::GateOracle => app
+            .gate_oracle_by_iter
+            .get(&app.oracle_selected_iter)
+            .map(Src::Gate),
+    };
+
+    if let Some(src) = src {
+        let (
+            header_line,
+            match_rate_overall,
+            keepall_ignored,
+            r2_total,
+            r2_matched,
+            r1_total,
+            r1_matched,
+            r0_total,
+            r0_matched,
+            action_total,
+            action_matched,
+            chosen_total,
+            turn_total,
+            turn_matched,
+        game_count,
+        ): (
+            String,
+            Option<f64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<&Vec<u64>>,
+            Option<&Vec<u64>>,
+            Option<&Vec<u64>>,
+            Option<&Vec<u64>>,
+            Option<&Vec<u64>>,
+            Option<u64>,
+        ) = match src {
+            Src::Fixed(v) => {
+                let set_id = v.set_id.clone().unwrap_or_else(|| "-".to_string());
+                let ns = v.num_states.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+                (
+                    format!("fixed_set: {set_id}  n={ns}"),
+                    v.match_rate_overall,
+                    v.keepall_ignored,
+                    v.r2_total,
+                    v.r2_matched,
+                    v.r1_total,
+                    v.r1_matched,
+                    v.r0_total,
+                    v.r0_matched,
+                    v.action_total.as_ref(),
+                    v.action_matched.as_ref(),
+                    v.chosen_total.as_ref(),
+                    v.turn_total.as_ref(),
+                    v.turn_matched.as_ref(),
+                    None, // fixed oracle doesn't have game count
+                )
+            }
+            Src::Gate(v) => (
+                format!(
+                    "gate_oracle: games={}  actions={}",
+                    v.gate_games.unwrap_or(0),
+                    v.steps_total.unwrap_or(0)
+                ),
+                v.match_rate_overall,
+                v.keepall_ignored,
+                v.r2_total,
+                v.r2_matched,
+                v.r1_total,
+                v.r1_matched,
+                v.r0_total,
+                v.r0_matched,
+                v.action_total.as_ref(),
+                v.action_matched.as_ref(),
+                v.chosen_total.as_ref(),
+                v.turn_total.as_ref(),
+                v.turn_matched.as_ref(),
+                v.gate_games.map(|g| g as u64),
+            ),
+        };
+
+        mid.push(Line::from(header_line));
         mid.push(Line::from(""));
 
-        let fmt = |x: Option<f64>| x.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "-".to_string());
-        mid.push(Line::from(format!("overall: {}", fmt(v.match_rate_overall))));
+        let overall_from_stage_counts = || -> Option<(u64, u64)> {
+            let (m2, t2) = (r2_matched?, r2_total?);
+            let (m1, t1) = (r1_matched?, r1_total?);
+            let (m0, t0) = (r0_matched?, r0_total?);
+            Some((m2 + m1 + m0, t2 + t1 + t0))
+        };
+        mid.push(Line::from(Span::styled(
+            "overall, acc (m/o)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if let Some((m, o)) = overall_from_stage_counts() {
+            let r = if o > 0 { (m as f64) / (o as f64) } else { 0.0 };
+            mid.push(Line::from(format!("{:.3} ({}/{})", r, m, o)));
+        } else if let Some(r) = match_rate_overall {
+            mid.push(Line::from(format!("{:.3}", r)));
+        } else {
+            mid.push(Line::from("-"));
+        }
         mid.push(Line::from(""));
 
         // Group aggregates with both:
@@ -6585,9 +6849,7 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             let mut o = 0u64;
             let mut m = 0u64;
             let mut c = 0u64;
-            if let (Some(ot), Some(mt), Some(ct)) =
-                (v.action_total.as_ref(), v.action_matched.as_ref(), v.chosen_total.as_ref())
-            {
+            if let (Some(ot), Some(mt), Some(ct)) = (action_total, action_matched, chosen_total) {
                 for i in idxs {
                     o += ot.get(i).copied().unwrap_or(0);
                     m += mt.get(i).copied().unwrap_or(0);
@@ -6598,21 +6860,41 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         };
         let (m_keep, o_keep, c_keep) = sum_group(0..32);
         let (m_mark, o_mark, c_mark) = sum_group(32..yz_core::A as usize);
-        let fmt_acc_alloc = |m: u64, o: u64, c: u64| -> String {
-            let acc = if o > 0 { (m as f64) / (o as f64) } else { 0.0 };
-            let alloc_s = if c > 0 {
-                format!("{:.3} ({}/{})", (m as f64) / (c as f64), m, c)
+        let fmt_acc_cell = |m: u64, o: u64| -> String {
+            let acc_s = if o > 0 {
+                format!("{:.3}", (m as f64) / (o as f64))
+            } else {
+                "0.000".to_string()
+            };
+            format!("{acc_s} ({m}/{o})")
+        };
+        let fmt_alloc_cell = |m: u64, c: u64| -> String {
+            if c > 0 {
+                let alloc_s = format!("{:.3}", (m as f64) / (c as f64));
+                format!("{alloc_s} ({m}/{c})")
             } else {
                 "- (0/0)".to_string()
-            };
-            format!("{:.3} ({}/{})  {}", acc, m, o, alloc_s)
+            }
         };
         mid.push(Line::from(Span::styled(
-            "mark acc(m/o)  alloc(m/c)",
+            format!("{:<11} {:>16} {:>16}", "action type", "acc (m/o)", "alloc (m/c)"),
             Style::default().fg(Color::DarkGray),
         )));
-        mid.push(Line::from(format!("mark: {}", fmt_acc_alloc(m_mark, o_mark, c_mark))));
-        mid.push(Line::from(format!("keep: {}", fmt_acc_alloc(m_keep, o_keep, c_keep))));
+        let mark_acc = fmt_acc_cell(m_mark, o_mark);
+        let mark_alloc = fmt_alloc_cell(m_mark, c_mark);
+        let keep_acc = fmt_acc_cell(m_keep, o_keep);
+        let keep_alloc = fmt_alloc_cell(m_keep, c_keep);
+        mid.push(Line::from(format!(
+            "{:<11} {:>16} {:>16}",
+            "mark", mark_acc, mark_alloc
+        )));
+        mid.push(Line::from(format!(
+            "{:<11} {:>16} {:>16}",
+            "keep", keep_acc, keep_alloc
+        )));
+        if let Some(x) = keepall_ignored {
+            mid.push(Line::from(format!("keepall_ignored: {x}")));
+        }
         mid.push(Line::from(""));
 
         let rate = |m: Option<u64>, t: Option<u64>| -> String {
@@ -6623,64 +6905,74 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             }
         };
         mid.push(Line::from(Span::styled(
-            "by roll stage",
+            "by stage, acc (m/o)",
             Style::default().fg(Color::DarkGray),
         )));
         mid.push(Line::from(format!(
-            " roll 1: {}",
-            rate(v.r2_matched, v.r2_total)
+            " keep1: {}",
+            rate(r2_matched, r2_total)
         )));
         mid.push(Line::from(format!(
-            " roll 2: {}",
-            rate(v.r1_matched, v.r1_total)
+            " keep2: {}",
+            rate(r1_matched, r1_total)
         )));
         mid.push(Line::from(format!(
             " mark:  {}",
-            rate(v.r0_matched, v.r0_total)
+            rate(r0_matched, r0_total)
         )));
 
         // Per-turn accuracy distribution.
-        if let (Some(tt), Some(tm)) = (v.turn_total.as_ref(), v.turn_matched.as_ref()) {
+        if let (Some(tt), Some(tm)) = (turn_total, turn_matched) {
             if tt.len() == tm.len() && !tt.is_empty() {
                 mid.push(Line::from(""));
-                mid.push(Line::from(Span::styled(
-                    "by turn",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                // Header: show avg #actions column only if we have game_count
+                let header = if game_count.is_some() {
+                    format!("{:<9} {:>14} {:>8}", "by turn", "acc (m/o)", "avg #act")
+                } else {
+                    format!("{:<9} {:>14}", "by turn", "acc (m/o)")
+                };
+                mid.push(Line::from(Span::styled(header, Style::default().fg(Color::DarkGray))));
                 for (i, &t) in tt.iter().enumerate() {
                     if t == 0 {
                         continue;
                     }
                     let m = tm.get(i).copied().unwrap_or(0);
-                    let r = (m as f64) / (t as f64);
-                    mid.push(Line::from(format!(
-                        " turn {:>2}: {:.3} ({}/{})",
-                        i + 1,
-                        r,
-                        m,
-                        t
-                    )));
+                    let acc = (m as f64) / (t as f64);
+                    let acc_cell = format!("{:.3} ({}/{})", acc, m, t);
+                    let line = if let Some(gc) = game_count {
+                        // avg #actions = total actions at this turn / number of games
+                        // Each game plays all 15 turns, so gc is the denominator
+                        let avg_act = if gc > 0 { (t as f64) / (gc as f64) } else { 0.0 };
+                        format!(" turn {:>2}: {:>14} {:>8.2}", i + 1, acc_cell, avg_act)
+                    } else {
+                        format!(" turn {:>2}: {:>14}", i + 1, acc_cell)
+                    };
+                    mid.push(Line::from(line));
                 }
             }
         }
 
         // Actions (oracle-optimal totals + match rate).
-        if let (Some(tot), Some(mat)) = (v.action_total.as_ref(), v.action_matched.as_ref()) {
+        if let (Some(tot), Some(mat)) = (action_total, action_matched) {
             if tot.len() == mat.len() && !tot.is_empty() {
-                let chosen = v.chosen_total.as_ref();
+                let chosen = chosen_total;
 
-                fn fmt_rate_line(name: String, m: u64, t: u64, chosen: Option<u64>) -> Line<'static> {
-                    let r1 = if t > 0 { (m as f64) / (t as f64) } else { 0.0 };
-                    let (r2s, frac2) = match chosen {
-                        Some(c) if c > 0 => {
-                            let r2 = (m as f64) / (c as f64);
-                            (format!("{r2:.3}"), format!("({m}/{c})"))
-                        }
-                        _ => ("-".to_string(), "(0/0)".to_string()),
+                fn fmt_rate_line(
+                    name: String,
+                    m: u64,
+                    o: u64,
+                    chosen: Option<u64>,
+                ) -> Line<'static> {
+                    let acc_cell = if o > 0 {
+                        format!("{:.3} ({}/{})", (m as f64) / (o as f64), m, o)
+                    } else {
+                        "0.000 (0/0)".to_string()
                     };
-                    Line::from(format!(
-                        "{name:<16} {r1:.3} ({m}/{t}) {r2s} {frac2}"
-                    ))
+                    let alloc_cell = match chosen {
+                        Some(c) if c > 0 => format!("{:.3} ({}/{})", (m as f64) / (c as f64), m, c),
+                        _ => "- (0/0)".to_string(),
+                    };
+                    Line::from(format!("{:<16} {:>16} {:>16}", name, acc_cell, alloc_cell))
                 }
 
                 let mut keep_items: Vec<(usize, u64, u64)> = Vec::new();
@@ -6705,8 +6997,8 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
                 )));
                 actions.push(Line::from(Span::styled(
                     format!(
-                        "{:<16} {:>5} {:>12} {:>5} {:>12}",
-                        "action", "acc", "(m/o)", "alloc", "(m/c)"
+                        "{:<16} {:>16} {:>16}",
+                        "action", "acc (m/o)", "alloc (m/c)"
                     ),
                     Style::default().fg(Color::DarkGray),
                 )));
@@ -6723,8 +7015,8 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
                 )));
                 actions.push(Line::from(Span::styled(
                     format!(
-                        "{:<16} {:>5} {:>12} {:>5} {:>12}",
-                        "action", "acc", "(m/o)", "alloc", "(m/c)"
+                        "{:<16} {:>16} {:>16}",
+                        "action", "acc (m/o)", "alloc (m/c)"
                     ),
                     Style::default().fg(Color::DarkGray),
                 )));
@@ -6736,26 +7028,39 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             }
         }
     } else {
-        if let Some(p) = app.oracle_fixed_progress_by_iter.get(&app.oracle_selected_iter) {
-            let pct = if p.total > 0 {
-                (100.0 * (p.done as f64) / (p.total as f64)).min(100.0)
-            } else {
-                0.0
-            };
-            mid.push(Line::from(format!(
-                "fixed_oracle: running {}/{} ({pct:.1}%)",
-                p.done, p.total
-            )));
+        let mut shown_progress = false;
+        if matches!(app.oracle_view_src, OracleViewSrc::FixedOracle) {
+            if let Some(p) = app.oracle_fixed_progress_by_iter.get(&app.oracle_selected_iter) {
+                let pct = if p.total > 0 {
+                    (100.0 * (p.done as f64) / (p.total as f64)).min(100.0)
+                } else {
+                    0.0
+                };
+                mid.push(Line::from(format!(
+                    "fixed_oracle: running {}/{} ({pct:.1}%)",
+                    p.done, p.total
+                )));
+                mid.push(Line::from(""));
+                mid.push(Line::from(Span::styled(
+                    "Tip: this is aggregated from per-shard progress files under runs/<id>/oracle_fixed/.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                shown_progress = true;
+            }
+        }
+        if !shown_progress {
+            mid.push(Line::from(match app.oracle_view_src {
+                OracleViewSrc::FixedOracle => "fixed_oracle: not started / no progress yet",
+                OracleViewSrc::GateOracle => "gate_oracle: no breakdown yet (available after gating completes)",
+            }));
             mid.push(Line::from(""));
             mid.push(Line::from(Span::styled(
-                "Tip: this is aggregated from per-shard progress files under runs/<id>/oracle_fixed/.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            mid.push(Line::from("fixed_oracle: not started / no progress yet"));
-            mid.push(Line::from(""));
-            mid.push(Line::from(Span::styled(
-                "Tip: fixed oracle eval is async; it may arrive later.",
+                match app.oracle_view_src {
+                    OracleViewSrc::FixedOracle => "Tip: fixed oracle eval is async; it may arrive later.",
+                    OracleViewSrc::GateOracle => {
+                        "Tip: gate oracle breakdown is computed by controller from gate-worker logs."
+                    }
+                },
                 Style::default().fg(Color::DarkGray),
             )));
         }
