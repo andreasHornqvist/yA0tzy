@@ -793,6 +793,48 @@ pub struct MetricsGateSummaryV1 {
     pub oracle_keepall_ignored: u64,
 }
 
+/// Gate oracle diagnostics summary (computed from gate-worker oracle_diag logs).
+///
+/// This mirrors the fixed-oracle per-iteration breakdown so the TUI can render
+/// Aggregates + Actions for gating as well.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsGateOracleSummaryV1 {
+    pub event: &'static str, // "gate_oracle_summary_v1"
+    pub ts_ms: u64,
+    pub v: VersionInfoV1,
+    pub run_id: String,
+    pub git_hash: Option<String>,
+    pub config_snapshot: Option<String>,
+
+    pub iter_idx: u32,
+
+    pub match_rate_overall: f64,
+    pub match_rate_mark: f64,
+    pub match_rate_reroll: f64,
+    pub keepall_ignored: u64,
+
+    // Buckets by rerolls_left (2/1/0). Each is (total, matched).
+    pub r2_total: u64,
+    pub r2_matched: u64,
+    pub r1_total: u64,
+    pub r1_matched: u64,
+    pub r0_total: u64,
+    pub r0_matched: u64,
+
+    /// Per-action counts for the oracle-optimal action index (0..A-1).
+    pub action_total: Vec<u64>,
+    pub action_matched: Vec<u64>,
+    pub chosen_total: Vec<u64>,
+
+    /// Per-turn counts (turn index 0..14).
+    pub turn_total: Vec<u64>,
+    pub turn_matched: Vec<u64>,
+
+    /// Context (optional but useful for UI/diagnostics).
+    pub gate_games: u32,
+    pub steps_total: u64,
+}
+
 /// Fixed-set oracle diagnostics summary (async; may arrive after gating/promotion).
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricsOracleFixedSummaryV1 {
