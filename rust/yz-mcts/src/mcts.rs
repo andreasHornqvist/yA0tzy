@@ -774,7 +774,7 @@ impl Mcts {
                     // Random tie-break: derive a reproducible seed from mode seed + node state.
                     let tie_seed = seed
                         ^ (n_sum_eff as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                        ^ (node_id.0 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        ^ (node_id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
                     let mut rng = ChaCha8Rng::seed_from_u64(tie_seed);
                     let idx = rng.gen_range(0..tied_actions.len());
                     tied_actions[idx]
