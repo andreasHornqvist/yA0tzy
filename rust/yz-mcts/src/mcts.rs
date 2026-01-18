@@ -735,7 +735,8 @@ impl Mcts {
         }
 
         let mut best_score = f32::NEG_INFINITY;
-        let mut best_a: u8 = 0;
+        // Collect all tied actions for random tie-breaking in Rng mode.
+        let mut tied_actions: Vec<u8> = Vec::with_capacity(8);
 
         for a in 0..A {
             if !legal_ok(legal, a) {
@@ -755,14 +756,35 @@ impl Mcts {
 
             if score > best_score {
                 best_score = score;
-                best_a = a as u8;
+                tied_actions.clear();
+                tied_actions.push(a as u8);
             } else if score == best_score {
-                // Deterministic tie-break in eval mode.
-                if matches!(mode, ChanceMode::Deterministic { .. }) && (a as u8) < best_a {
-                    best_a = a as u8;
-                }
+                tied_actions.push(a as u8);
             }
         }
+
+        // Select from tied actions.
+        let best_a = if tied_actions.is_empty() {
+            0 // Shouldn't happen if legal mask has at least one action.
+        } else if tied_actions.len() == 1 {
+            tied_actions[0]
+        } else {
+            match mode {
+                ChanceMode::Rng { seed } => {
+                    // Random tie-break: derive a reproducible seed from mode seed + node state.
+                    let tie_seed = seed
+                        ^ (n_sum_eff as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ (node_id.0 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    let mut rng = ChaCha8Rng::seed_from_u64(tie_seed);
+                    let idx = rng.gen_range(0..tied_actions.len());
+                    tied_actions[idx]
+                }
+                ChanceMode::Deterministic { .. } => {
+                    // Deterministic tie-break: lowest action index.
+                    *tied_actions.iter().min().unwrap_or(&0)
+                }
+            }
+        };
 
         // Collision: chose an edge that already has a pending reservation.
         if use_virtual_counts && self.arena.get(node_id).vl_n[best_a as usize] > 0 {
