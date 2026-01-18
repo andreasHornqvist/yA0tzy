@@ -3302,6 +3302,10 @@ fn run_gate(
     let gate_workers_dir = run_dir.join("gate_workers");
     let logs_gate_workers_dir = run_dir.join("logs_gate_workers");
     std::fs::create_dir_all(&gate_workers_dir)?;
+    // Clear logs_gate_workers from previous iterations so oracle_diag.ndjson doesn't accumulate.
+    if logs_gate_workers_dir.exists() {
+        let _ = std::fs::remove_dir_all(&logs_gate_workers_dir);
+    }
     std::fs::create_dir_all(&logs_gate_workers_dir)?;
     // Remove any stale stop file from a previous run.
     let stop_path = gate_workers_dir.join("stop.json");
@@ -3641,7 +3645,24 @@ fn run_gate(
 
     // Oracle diagnostics: compute once in controller after workers finish.
     // This avoids building the oracle DP table in every gate-worker process.
-    let (oracle_overall, oracle_mark, oracle_reroll, oracle_keepall_ignored) = {
+    let (
+        oracle_overall,
+        oracle_mark,
+        oracle_reroll,
+        oracle_keepall_ignored,
+        oracle_r2_total,
+        oracle_r2_matched,
+        oracle_r1_total,
+        oracle_r1_matched,
+        oracle_r0_total,
+        oracle_r0_matched,
+        oracle_action_total,
+        oracle_action_matched,
+        oracle_chosen_total,
+        oracle_turn_total,
+        oracle_turn_matched,
+        oracle_steps_total,
+    ) = {
         let oracle = yz_oracle::oracle();
         let mut total: u64 = 0;
         let mut matched: u64 = 0;
@@ -3650,6 +3671,18 @@ fn run_gate(
         let mut total_reroll: u64 = 0;
         let mut matched_reroll: u64 = 0;
         let mut keepall_ignored: u64 = 0;
+        let mut r2_total: u64 = 0;
+        let mut r2_matched: u64 = 0;
+        let mut r1_total: u64 = 0;
+        let mut r1_matched: u64 = 0;
+        let mut r0_total: u64 = 0;
+        let mut r0_matched: u64 = 0;
+
+        let mut action_total: Vec<u64> = vec![0u64; yz_core::A];
+        let mut action_matched: Vec<u64> = vec![0u64; yz_core::A];
+        let mut chosen_total: Vec<u64> = vec![0u64; yz_core::A];
+        let mut turn_total: Vec<u64> = vec![0u64; yz_core::NUM_CATS];
+        let mut turn_matched: Vec<u64> = vec![0u64; yz_core::NUM_CATS];
 
         fn should_ignore(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
             matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
@@ -3675,18 +3708,78 @@ fn run_gate(
                 let Ok(ev) = serde_json::from_slice::<yz_eval::OracleDiagEvent>(line) else {
                     continue;
                 };
-                let chosen = yz_core::index_to_action(ev.chosen_action_idx);
+                let chosen0 = yz_core::index_to_action(ev.chosen_action_idx);
                 let (oa, _ev) =
                     oracle.best_action(ev.avail_mask, ev.upper_total_cap, ev.dice_sorted, ev.rerolls_left);
                 if should_ignore(oa, ev.rerolls_left) {
                     keepall_ignored += 1;
                     continue;
                 }
-                let expected = oracle_action_to_core(oa);
+                // Canonicalize keepmasks so action bucket keys are stable when dice have duplicates.
+                let expected0 = oracle_action_to_core(oa);
+                let expected = match expected0 {
+                    yz_core::Action::KeepMask(mask) => {
+                        yz_core::Action::KeepMask(yz_core::canonicalize_keepmask(ev.dice_sorted, mask))
+                    }
+                    x => x,
+                };
+                let chosen = match chosen0 {
+                    yz_core::Action::KeepMask(mask) => {
+                        yz_core::Action::KeepMask(yz_core::canonicalize_keepmask(ev.dice_sorted, mask))
+                    }
+                    x => x,
+                };
+                let expected_idx = yz_core::action_to_index(expected) as usize;
+                let chosen_idx = yz_core::action_to_index(chosen) as usize;
                 let is_match = expected == chosen;
                 total += 1;
                 if is_match {
                     matched += 1;
+                }
+
+                // Per-action totals (oracle-optimal frequency + match + chosen frequency).
+                if expected_idx < action_total.len() {
+                    action_total[expected_idx] += 1;
+                    if is_match {
+                        action_matched[expected_idx] += 1;
+                    }
+                }
+                if chosen_idx < chosen_total.len() {
+                    chosen_total[chosen_idx] += 1;
+                }
+
+                // Per-turn totals: turn_idx = number of filled categories, derived from avail_mask.
+                // avail_mask uses 15 bits for categories; filled = NUM_CATS - popcount(avail_mask).
+                let filled = (yz_core::NUM_CATS as i32) - (ev.avail_mask.count_ones() as i32);
+                let ti = filled.clamp(0, (yz_core::NUM_CATS as i32) - 1) as usize;
+                if ti < turn_total.len() {
+                    turn_total[ti] += 1;
+                    if is_match {
+                        turn_matched[ti] += 1;
+                    }
+                }
+
+                // By stage (rerolls_left = 2/1/0).
+                match ev.rerolls_left {
+                    2 => {
+                        r2_total += 1;
+                        if is_match {
+                            r2_matched += 1;
+                        }
+                    }
+                    1 => {
+                        r1_total += 1;
+                        if is_match {
+                            r1_matched += 1;
+                        }
+                    }
+                    0 => {
+                        r0_total += 1;
+                        if is_match {
+                            r0_matched += 1;
+                        }
+                    }
+                    _ => {}
                 }
                 match chosen {
                     yz_core::Action::Mark(_) => {
@@ -3716,7 +3809,25 @@ fn run_gate(
         } else {
             matched_reroll as f64 / total_reroll as f64
         };
-        (overall, mark, reroll, keepall_ignored)
+        let steps_total = total.saturating_add(keepall_ignored);
+        (
+            overall,
+            mark,
+            reroll,
+            keepall_ignored,
+            r2_total,
+            r2_matched,
+            r1_total,
+            r1_matched,
+            r0_total,
+            r0_matched,
+            action_total,
+            action_matched,
+            chosen_total,
+            turn_total,
+            turn_matched,
+            steps_total,
+        )
     };
 
     let wr = report.win_rate();
@@ -3848,6 +3959,40 @@ fn run_gate(
                 oracle_keepall_ignored: oracle_keepall_ignored,
             };
             let _ = metrics.write_event(&ev);
+
+            // Emit gate-oracle breakdown for the TUI Oracle screen (Aggregates + Actions).
+            let ev2 = yz_logging::MetricsGateOracleSummaryV1 {
+                event: "gate_oracle_summary_v1",
+                ts_ms: yz_logging::now_ms(),
+                v: yz_logging::VersionInfoV1 {
+                    protocol_version: m.protocol_version,
+                    feature_schema_id: m.feature_schema_id,
+                    action_space_id: "oracle_keepmask_v1",
+                    ruleset_id: "swedish_scandinavian_v1",
+                },
+                run_id: m.run_id.clone(),
+                git_hash: m.git_hash.clone(),
+                config_snapshot: m.config_snapshot.clone(),
+                iter_idx,
+                match_rate_overall: oracle_overall,
+                match_rate_mark: oracle_mark,
+                match_rate_reroll: oracle_reroll,
+                keepall_ignored: oracle_keepall_ignored,
+                r2_total: oracle_r2_total,
+                r2_matched: oracle_r2_matched,
+                r1_total: oracle_r1_total,
+                r1_matched: oracle_r1_matched,
+                r0_total: oracle_r0_total,
+                r0_matched: oracle_r0_matched,
+                action_total: oracle_action_total,
+                action_matched: oracle_action_matched,
+                chosen_total: oracle_chosen_total,
+                turn_total: oracle_turn_total,
+                turn_matched: oracle_turn_matched,
+                gate_games: report.games,
+                steps_total: oracle_steps_total,
+            };
+            let _ = metrics.write_event(&ev2);
             let _ = metrics.flush();
         }
     }
