@@ -171,6 +171,13 @@ See `.github/workflows/ci.yml` for details.
 - **Python** handles GPU-bound work: neural network inference and training
 - Communication via Unix domain sockets (or TCP) with a batched request/response protocol
 
+### Stochastic MCTS (decision vs chance)
+`yz-mcts` supports two equivalent ways to model dice randomness in search:
+- **Implicit stochastic transitions** (baseline): dice are sampled as part of `step(s,a)` and children are keyed by the realized next state.
+- **Explicit chance nodes for rerolls** (Story S1): KeepMask decisions transition to a `Chance(AfterState)` node, which samples a dice outcome and then transitions to the next decision state. (Fresh-roll chance after `Mark` remains implicit unless/ until extended.)
+
+For gating/eval, played-game dice remain deterministic via `yz-core`’s event-keyed chance stream; search randomness can still be made reproducible via seeded PRNG.
+
 ### Inference batching is a first-class performance feature (do not regress it)
 Most end-to-end throughput is determined by how efficiently the Python infer-server can form and execute large batches.
 

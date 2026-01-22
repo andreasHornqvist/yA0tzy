@@ -269,19 +269,31 @@ Per-game tree:
 * no heap allocations in select/backup loops
 * store NodeId indices, not references
 
-### 7.7 Stochastic dice transitions inside MCTS (no explicit chance nodes)
+### 7.7 Stochastic dice transitions inside MCTS (implicit vs explicit chance)
 
 Yatzy transitions are stochastic because dice outcomes are part of state.
-In v1, we keep the **fixed action space `A=47`** and do **not** introduce explicit chance nodes in the tree.
 
-Instead:
+We keep the **fixed action space `A=47`**. There are two supported ways to model dice inside MCTS:
+
+#### Option A (baseline): implicit stochastic transitions (decision nodes only)
 
 * MCTS stores **decision nodes only** (states with `player_to_move`, `dice`, `rerolls_left`, per-player boards/totals).
 * When traversing an edge for action `a`, the environment performs a stochastic transition:
   * self-play: sample dice outcomes using RNG
-  * eval/gating (option): use the event-keyed deterministic chance stream
+  * eval/gating: optionally use the event-keyed deterministic chance stream
 * The realized next state `s'` (including the new dice) is the child. Over many simulations, a single action edge may lead to **multiple distinct realized children**.
 * PUCT selection is still performed over actions `a ∈ {0..A-1}`; stochasticity is in `step(s, a) -> s'`.
+
+#### Option B (Story S1): explicit chance nodes for KeepMask afterstates
+
+* Keep decision nodes over the same action space `A=47`, but factor rerolls as:
+  * `Decision --KeepMask--> Chance(AfterState) --sample_roll--> Decision`
+* Afterstates are deterministic “post-decision, pre-roll” states (kept dice histogram + `k_to_roll` + scorecards + same player).
+* Chance node traversal samples dice outcomes from the true distribution and backs up values as usual; chance nodes accumulate Monte Carlo samples.
+* `Mark` transitions remain direct decision→decision in S1 (fresh-roll chance after Mark is still implicit; explicit fresh-roll chance is a later story).
+* Determinism:
+  * played games in gating/eval remain deterministic via the event-keyed stream (engine-level)
+  * search-internal chance sampling at KeepMask can be made reproducible via seeded PRNG (search-level)
 
 ---
 

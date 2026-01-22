@@ -15,6 +15,275 @@ This doc is intentionally “math-first” but anchored to the current codebase 
 
 ---
 
+## Epic stories (implementation plan)
+
+This section is the implementation-ready breakdown: each story is sized to land as a single PR/stack of commits, with concrete touchpoints, acceptance criteria, and end-to-end verification steps.
+
+### Story S0 — Prep: isolate chance sampling from `yz_core::apply_action`
+
+**Goal**
+
+Make it possible for `yz-mcts` to advance a reroll step **without** calling `yz_core::apply_action` for KeepMask transitions (since KeepMask will become deterministic at the decision edge).
+
+**Scope / implementation details**
+
+- Add a small set of pure helpers to build next `GameState` from:
+  - a base `GameState` (or afterstate)
+  - an outcome histogram `roll_hist[6]`
+- Keep all changes inside `yz-mcts` for now (preferred), to avoid destabilizing `yz-core`.
+
+**Touchpoints**
+
+- `rust/yz-mcts/src/` (new module, e.g. `afterstate.rs` / `chance_hist.rs`)
+- `rust/yz-core/src/action.rs` (use existing `canonicalize_keepmask` – already exported)
+- `rust/yz-features` unchanged (still consumes `dice_sorted`).
+
+**Tests**
+
+- Unit tests in `rust/yz-mcts/src/mcts_tests.rs` or a new `afterstate_tests.rs`:
+  - histogram materialization produces sorted dice
+  - sum constraints hold (`sum(counts)=5`, `sum(roll_hist)=k_to_roll`)
+  - deterministic sampling under fixed seed (stable outputs)
+
+**Acceptance criteria**
+
+- [ ] A helper exists to construct `kept_hist` from `(dice_sorted, canonical_keepmask)`.
+- [ ] A helper exists to sample `roll_hist` for a given `k_to_roll` from a seeded PRNG.
+- [ ] A helper exists to build `dice_sorted` from a histogram.
+- [ ] Unit tests cover the above and pass.
+
+**End-to-end verification**
+
+- No functional behavior change yet; `cargo test -p yz-mcts` passes.
+
+---
+
+### Story S1 — NodeKind + AfterState: Decision→Chance factoring for KeepMask
+
+**Goal**
+
+Introduce explicit chance nodes keyed by afterstate for KeepMask decisions:
+
+- Decision node picks action with PUCT.
+- If KeepMask: deterministically compute `AfterState` and descend into a `Chance` node.
+- Chance node samples an outcome and transitions to a Decision node with realized dice.
+
+**Key design choice**
+
+- NN is evaluated on **decision states only** (i.e., on `GameState`), not on afterstates/chance nodes.
+
+**Scope / implementation details**
+
+**Implementation status**
+
+- Implemented in `yz-mcts` behind `MctsConfig.explicit_keepmask_chance` (default: `false`).
+- Instrumentation counters are exposed via `SearchStats`:
+  - `chance_nodes_created`, `chance_visits`, `chance_children_created`, `chance_k_hist`.
+
+1) **Node representation**
+   - Refactor `rust/yz-mcts/src/node.rs` so the arena can store:
+     - `Decision` (existing arrays: `n,w,p,vl_*`)
+     - `Chance` (afterstate + aggregate stats like `visits`, `w_sum`, `num_children`)
+   - Keep terminal detection via `yz_core::is_terminal(&GameState)` (no explicit terminal node necessary).
+
+2) **AfterState definition** (Option A baked into chance node)
+   - Fields:
+     - `players: [yz_core::PlayerState; 2]`
+     - `player_to_act: u8`
+     - `rerolls_left: u8` (already decremented)
+     - `kept_hist: [u8; 6]`
+     - `k_to_roll: u8`
+
+3) **Child maps**
+   - Split child lookup into:
+     - decision→chance: `(decision_node_id, keepmask_action_idx) -> chance_node_id`
+     - chance→decision: `(chance_node_id, outcome_hist_key) -> decision_node_id`
+     - decision→decision for Mark: keep existing `(decision_node_id, action_idx, StateKey(next_state)) -> decision_node_id`
+
+4) **Traversal**
+   - Update `select_leaf_and_reserve`:
+     - At Decision:
+       - if Mark: keep today’s path (still uses `yz_core::apply_action`).
+       - if KeepMask:
+         - compute afterstate (canonical keepmask)
+         - descend into chance node (create if missing)
+     - At Chance:
+       - sample `roll_hist` from true distribution (iid uniform dice)
+       - compute next `GameState` and descend into decision child keyed by outcome key
+
+5) **Backup + virtual loss**
+   - Decision edges: unchanged stats update (N/W).
+   - Chance nodes: accumulate sample mean (`visits += 1`, `w_sum += g`).
+   - Virtual loss only applies to decision edges (PUCT-selection edges).
+
+**Seeding (search reproducibility)**
+
+Chance sampling inside tree uses a deterministic seed derived from:
+
+- base: search seed (`ChanceMode::Rng { seed }`)
+- mix: leaf selection counter (`sel_counter`)
+- mix: chance node id (or stable afterstate hash)
+
+This keeps search stochastic but repeatable under gating/fixed-oracle eval.
+
+**Touchpoints**
+
+- `rust/yz-mcts/src/node.rs`
+- `rust/yz-mcts/src/mcts.rs`
+- `rust/yz-mcts/src/state_key.rs` (add an `OutcomeHistKey` type; decision `StateKey` remains)
+- `rust/yz-mcts/src/mcts_tests.rs`
+
+**Acceptance criteria**
+
+- [ ] KeepMask transitions in-tree no longer call `yz_core::apply_action` to sample dice.
+- [ ] For each `(decision_state, KeepMask action)`, there is exactly **one** chance node keyed by afterstate.
+- [ ] Chance node sampling uses iid dice, but is deterministic for fixed `search_seed`.
+- [ ] Existing async inference pipeline remains intact (no deadlocks; `max_inflight` logic still works).
+- [ ] Add instrumentation counters (at least in `SearchStats`) for:
+  - chance nodes created
+  - chance visits
+  - chance outcome children created
+  - (optional) histogram of `k_to_roll` encountered
+- [ ] The explicit chance-node implementation is gated behind a config flag (default off until stable).
+
+**End-to-end verification**
+
+- [ ] `cargo test -p yz-core -p yz-mcts -p yz-eval -p yz-cli` passes.
+- [ ] Gating seeded test still passes: `cargo test -p yz-cli --test gate`.
+- [ ] Fixed oracle eval unit tests still pass: `cargo test -p yz-eval`.
+- [ ] Determinism check (gating/eval): run the same gating seed set twice and verify the produced `gate_report.json` (or summary metrics) is identical.
+  - Suggested workflow:
+    - use `configs/seed_sets/dev_small_v1.txt`
+    - enable `gating.deterministic_chance=true`
+    - run twice and compare the reports (byte-identical) or compare a stable hash.
+
+**Manual E2E (optional, “real run”)**
+
+This is the closest end-to-end check (Rust workers + Python infer-server) without needing training:
+
+- Start an inference server (CPU dummy models are fine for plumbing checks):
+
+```bash
+cd python
+uv run python -m yatzy_az infer-server --bind unix:///tmp/yatzy_infer.sock --device cpu --best dummy --cand dummy
+```
+
+- Run gating twice with the same seed set and deterministic chance:
+  - Use any small gating config (e.g. one of the `configs/*smoke*.yaml`) and ensure it points at:
+    - `infer_endpoint: unix:///tmp/yatzy_infer.sock`
+    - `gating.seed_set_id: dev_small_v1`
+    - `gating.deterministic_chance: true`
+    - low `gating.games` for speed
+  - Compare the generated `gate_report.json` (or the `gate_summary` metrics) across the two runs.
+
+- Optional quick “MCTS-in-the-loop” smoke via the existing E2E bench harness:
+
+```bash
+cargo run -p yz-cli --bin yz -- bench e2e -- --seconds 5 --parallel 2 --simulations 16 --max-inflight 2 --chance deterministic
+```
+
+---
+
+### Story S2 — Progressive widening at chance nodes (bounded tree growth)
+
+**Goal**
+
+Prevent chance nodes from accumulating too many stored outcome children (especially when `k_to_roll=5` → 252 hist outcomes).
+
+**Scope / implementation details**
+
+- Add per-chance-node counters:
+  - `visits`
+  - `num_children`
+- Add config knobs to `MctsConfig`:
+  - `chance_pw_enabled: bool`
+  - `chance_pw_c: f32`
+  - `chance_pw_alpha: f32`
+  - optionally `chance_pw_max_children: u16` as a hard cap
+- Widening rule:
+  - allow at most \(K(N)=c N^{\alpha}\) stored outcome children
+  - on a sampled new outcome:
+    - if below cap: create + store child
+    - else: do **transient** evaluation (no insertion)
+
+**Async inference integration note**
+
+Transient evaluation needs a “leaf eval without storing a node” pathway. Two viable implementations:
+
+- **S2A (simpler, first)**: cap children, but still **store** new nodes until cap; once cap hit, **reuse** an existing child by sampling again until hit (approximate; biased) — NOT preferred for “true distribution”.
+- **S2B (correct)**: implement ephemeral pending-eval items (store ticket + leaf_state + path) without inserting a node into the arena. This keeps sampling unbiased.
+
+This epic prefers **S2B**, but it’s more code.
+
+**Acceptance criteria**
+
+- [ ] A chance node does not exceed configured child limit schedule.
+- [ ] Sampling remains unbiased w.r.t. true distribution (no “resample until hit”).
+- [ ] Metrics include chance widening counters (created children vs transient outcomes).
+
+**End-to-end verification**
+
+- [ ] Run gating on a seed set with high reroll rate; verify chance child counts remain bounded.
+- [ ] Compare `SearchStats.node_count` / expansions before vs after (should not regress badly).
+- [ ] Verify unbiasedness: sample counts over outcomes at a fixed afterstate should match the multinomial distribution (statistical test / sanity bands; non-flaky).
+
+---
+
+### Story S3 — Hybrid exact enumeration for small k (variance reduction)
+
+**Goal**
+
+When `k_to_roll` is small (e.g. 1–2), compute exact expectation at the chance node rather than Monte Carlo sampling.
+
+**Scope / implementation details**
+
+- Add config: `chance_exact_k_max: u8` (default 0/off; typical 2).
+- For `k_to_roll <= chance_exact_k_max`:
+  - enumerate all hist outcomes `h` (or all sequences, but hist enumeration is smaller)
+  - compute \(p(h)\) via multinomial coefficient
+  - evaluate downstream values `V(T(as,h))`
+  - back up expectation
+
+**Important integration note**
+
+Exact enumeration implies multiple leaf evals per chance visit. With async batching this can be a net win, but requires careful budgeting to avoid blowing `max_inflight`. A clean first version:
+
+- only do exact enumeration when the resulting decision states are terminal or already expanded/cacheable, otherwise fall back to sampling.
+
+**Acceptance criteria**
+
+- [ ] When enabled and `k_to_roll` small, chance value matches exact expectation (unit-tested on toy states).
+- [ ] No regressions in async pipeline / inflight caps.
+
+**End-to-end verification**
+
+- [ ] Compare variance of root value estimates on a fixed state with `k_to_roll=1/2` with vs without exact enumeration (diagnostic logging).
+
+---
+
+### Story S4 — Full fidelity: explicit chance for fresh-roll after `Mark`
+
+**Goal**
+
+Extend explicit chance separation to the “fresh roll” chance event after `Mark`.
+
+**Scope**
+
+- Decision(Mark) → Chance(FreshRoll) → Decision(next player with dice)
+- This makes the entire turn structure “decision + chance alternating” and removes remaining implicit chance from MCTS.
+
+**Acceptance criteria**
+
+- [ ] No dice sampling occurs inside decision edges (neither KeepMask nor Mark).
+- [ ] Gating/eval determinism of played episodes remains unchanged.
+- [ ] Tree size remains controlled (likely requires progressive widening for fresh-roll chance nodes too).
+
+**End-to-end verification**
+
+- [ ] Same as S1 plus performance regression check on representative selfplay/gating workloads.
+
+---
+
 ## Goals
 
 - **G1: Decision/Chance separation**: introduce explicit chance nodes so MCTS estimates \(\mathbb{E}[\cdot]\) over dice outcomes.
