@@ -33,13 +33,14 @@ except Exception:  # noqa: BLE001
     _TorchIterableDataset = object  # type: ignore[misc,assignment]
     _TorchDataset = object  # type: ignore[misc,assignment]
 
-# v1 ids (must match Rust yz-replay / PRD §10.3)
+# v2 ids (must match Rust yz-replay / PRD §10.3)
+# v2: mark-only-at-roll-3 rules (KeepMask(31) legal, Mark illegal at rerolls>0).
 PROTOCOL_VERSION: int = 1
 FEATURE_SCHEMA_ID: int = 1
 FEATURE_LEN: int = 45
-ACTION_SPACE_ID: str = "oracle_keepmask_v1"
+ACTION_SPACE_ID: str = "oracle_keepmask_v2"
 ACTION_SPACE_A: int = 47
-RULESET_ID: str = "swedish_scandinavian_v1"
+RULESET_ID: str = "swedish_scandinavian_mark_at_r3_v1"
 
 T_FEATURES = "features"
 T_LEGAL_MASK = "legal_mask"

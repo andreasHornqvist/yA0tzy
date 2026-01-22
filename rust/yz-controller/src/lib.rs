@@ -403,7 +403,6 @@ fn try_finalize_oracle_fixed_job(
             c.matched_mark += rep.matched_mark;
             c.total_reroll += rep.total_reroll;
             c.matched_reroll += rep.matched_reroll;
-            c.keepall_ignored += rep.keepall_ignored;
             for i in 0..3 {
                 c.total_by_r[i] += rep.total_by_r[i];
                 c.matched_by_r[i] += rep.matched_by_r[i];
@@ -453,8 +452,8 @@ fn try_finalize_oracle_fixed_job(
             v: yz_logging::VersionInfoV1 {
                 protocol_version: m.as_ref().map(|m| m.protocol_version).unwrap_or(2),
                 feature_schema_id: m.as_ref().map(|m| m.feature_schema_id).unwrap_or(1),
-                action_space_id: "oracle_keepmask_v1",
-                ruleset_id: "swedish_scandinavian_v1",
+                action_space_id: "oracle_keepmask_v2",
+                ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
             },
             run_id: m
                 .as_ref()
@@ -468,7 +467,6 @@ fn try_finalize_oracle_fixed_job(
             match_rate_overall: rep.match_rate_overall(),
             match_rate_mark: rep.match_rate_mark(),
             match_rate_reroll: rep.match_rate_reroll(),
-            keepall_ignored: rep.keepall_ignored,
             r2_total: rep.total_by_r[0],
             r2_matched: rep.matched_by_r[0],
             r1_total: rep.total_by_r[1],
@@ -891,7 +889,6 @@ pub fn extend_run(
         gate_oracle_match_rate_overall: None,
         gate_oracle_match_rate_mark: None,
         gate_oracle_match_rate_reroll: None,
-        gate_oracle_keepall_ignored: None,
         controller_phase: Some(Phase::Idle.as_str().to_string()),
         controller_status: Some(format!(
             "extended from {src_run_id} (continue at iter {})",
@@ -930,8 +927,8 @@ fn ensure_manifest(
             created_ts_ms: yz_logging::now_ms(),
             protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
             feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-            action_space_id: "oracle_keepmask_v1".to_string(),
-            ruleset_id: "swedish_scandinavian_v1".to_string(),
+            action_space_id: "oracle_keepmask_v2".to_string(),
+            ruleset_id: "swedish_scandinavian_mark_at_r3_v1".to_string(),
             git_hash: yz_logging::try_git_hash(),
             config_hash: None,
             config_snapshot: None,
@@ -962,7 +959,6 @@ fn ensure_manifest(
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
             gate_oracle_match_rate_reroll: None,
-            gate_oracle_keepall_ignored: None,
             controller_phase: Some(Phase::Idle.as_str().to_string()),
             controller_status: Some("initialized".to_string()),
             controller_last_ts_ms: Some(yz_logging::now_ms()),
@@ -1449,8 +1445,8 @@ mod extend_run_tests {
             created_ts_ms: yz_logging::now_ms(),
             protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
             feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-            action_space_id: "oracle_keepmask_v1".to_string(),
-            ruleset_id: "swedish_scandinavian_v1".to_string(),
+            action_space_id: "oracle_keepmask_v2".to_string(),
+            ruleset_id: "swedish_scandinavian_mark_at_r3_v1".to_string(),
             git_hash: None,
             config_hash: None,
             config_snapshot: Some("config.yaml".to_string()),
@@ -1481,7 +1477,6 @@ mod extend_run_tests {
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
             gate_oracle_match_rate_reroll: None,
-            gate_oracle_keepall_ignored: None,
             controller_phase: Some("idle".to_string()),
             controller_status: Some("src".to_string()),
             controller_last_ts_ms: Some(yz_logging::now_ms()),
@@ -1559,7 +1554,6 @@ fn begin_iteration(
         it.oracle.match_rate_overall = None;
         it.oracle.match_rate_mark = None;
         it.oracle.match_rate_reroll = None;
-        it.oracle.keepall_ignored = None;
         it.train.started_ts_ms = None;
         it.train.ended_ts_ms = None;
         it.train.steps_completed = None;
@@ -1808,7 +1802,6 @@ fn finalize_iteration(
         it.oracle.match_rate_overall = manifest.gate_oracle_match_rate_overall;
         it.oracle.match_rate_mark = manifest.gate_oracle_match_rate_mark;
         it.oracle.match_rate_reroll = manifest.gate_oracle_match_rate_reroll;
-        it.oracle.keepall_ignored = manifest.gate_oracle_keepall_ignored;
         it.promoted = promoted;
         it.promoted_model = promoted.map(|p| {
             if p {
@@ -1832,8 +1825,8 @@ fn finalize_iteration(
             v: yz_logging::VersionInfoV1 {
                 protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
                 feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-                action_space_id: "oracle_keepmask_v1",
-                ruleset_id: "swedish_scandinavian_v1",
+                action_space_id: "oracle_keepmask_v2",
+                ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
             },
             run_id: manifest.run_id.clone(),
             git_hash: manifest.git_hash.clone(),
@@ -2099,8 +2092,8 @@ fn emit_selfplay_summary_metrics(
             v: yz_logging::VersionInfoV1 {
                 protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
                 feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-                action_space_id: "oracle_keepmask_v1",
-                ruleset_id: "swedish_scandinavian_v1",
+                action_space_id: "oracle_keepmask_v2",
+                ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
             },
             run_id: manifest.run_id.clone(),
             git_hash: manifest.git_hash.clone(),
@@ -2943,8 +2936,8 @@ impl InferSnapshotPoller {
             v: yz_logging::VersionInfoV1 {
                 protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
                 feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-                action_space_id: "oracle_keepmask_v1",
-                ruleset_id: "swedish_scandinavian_v1",
+                action_space_id: "oracle_keepmask_v2",
+                ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
             },
             run_id: self.run_id.clone(),
             git_hash: self.git_hash.clone(),
@@ -3649,7 +3642,6 @@ fn run_gate(
         oracle_overall,
         oracle_mark,
         oracle_reroll,
-        oracle_keepall_ignored,
         oracle_r2_total,
         oracle_r2_matched,
         oracle_r1_total,
@@ -3670,7 +3662,6 @@ fn run_gate(
         let mut matched_mark: u64 = 0;
         let mut total_reroll: u64 = 0;
         let mut matched_reroll: u64 = 0;
-        let mut keepall_ignored: u64 = 0;
         let mut r2_total: u64 = 0;
         let mut r2_matched: u64 = 0;
         let mut r1_total: u64 = 0;
@@ -3684,11 +3675,13 @@ fn run_gate(
         let mut turn_total: Vec<u64> = vec![0u64; yz_core::NUM_CATS];
         let mut turn_matched: Vec<u64> = vec![0u64; yz_core::NUM_CATS];
 
-        fn should_ignore(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
-            matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
-        }
-        fn oracle_action_to_core(oa: yz_oracle::Action) -> yz_core::Action {
+        /// Convert oracle action to AZ action, mapping oracle's "mark at rerolls>0" to KeepMask(31).
+        fn oracle_action_to_az_action(oa: yz_oracle::Action, rerolls_left: u8) -> yz_core::Action {
             match oa {
+                yz_oracle::Action::Mark { cat } if rerolls_left > 0 => {
+                    // Oracle's Mark at rerolls>0 means keep-all is optimal -> KeepMask(31)
+                    yz_core::Action::KeepMask(31)
+                }
                 yz_oracle::Action::Mark { cat } => yz_core::Action::Mark(cat),
                 yz_oracle::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
             }
@@ -3711,12 +3704,8 @@ fn run_gate(
                 let chosen0 = yz_core::index_to_action(ev.chosen_action_idx);
                 let (oa, _ev) =
                     oracle.best_action(ev.avail_mask, ev.upper_total_cap, ev.dice_sorted, ev.rerolls_left);
-                if should_ignore(oa, ev.rerolls_left) {
-                    keepall_ignored += 1;
-                    continue;
-                }
                 // Canonicalize keepmasks so action bucket keys are stable when dice have duplicates.
-                let expected0 = oracle_action_to_core(oa);
+                let expected0 = oracle_action_to_az_action(oa, ev.rerolls_left);
                 let expected = match expected0 {
                     yz_core::Action::KeepMask(mask) => {
                         yz_core::Action::KeepMask(yz_core::canonicalize_keepmask(ev.dice_sorted, mask))
@@ -3809,12 +3798,11 @@ fn run_gate(
         } else {
             matched_reroll as f64 / total_reroll as f64
         };
-        let steps_total = total.saturating_add(keepall_ignored);
+        let steps_total = total;
         (
             overall,
             mark,
             reroll,
-            keepall_ignored,
             r2_total,
             r2_matched,
             r1_total,
@@ -3897,7 +3885,6 @@ fn run_gate(
     m.gate_oracle_match_rate_overall = Some(oracle_overall);
     m.gate_oracle_match_rate_mark = Some(oracle_mark);
     m.gate_oracle_match_rate_reroll = Some(oracle_reroll);
-    m.gate_oracle_keepall_ignored = Some(oracle_keepall_ignored);
 
     // Emit gate_summary metrics event (best-effort).
     {
@@ -3934,8 +3921,8 @@ fn run_gate(
                 v: yz_logging::VersionInfoV1 {
                     protocol_version: m.protocol_version,
                     feature_schema_id: m.feature_schema_id,
-                    action_space_id: "oracle_keepmask_v1",
-                    ruleset_id: "swedish_scandinavian_v1",
+                    action_space_id: "oracle_keepmask_v2",
+                    ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
                 },
                 run_id: m.run_id.clone(),
                 git_hash: m.git_hash.clone(),
@@ -3956,7 +3943,6 @@ fn run_gate(
                 oracle_match_rate_overall: oracle_overall,
                 oracle_match_rate_mark: oracle_mark,
                 oracle_match_rate_reroll: oracle_reroll,
-                oracle_keepall_ignored: oracle_keepall_ignored,
             };
             let _ = metrics.write_event(&ev);
 
@@ -3967,8 +3953,8 @@ fn run_gate(
                 v: yz_logging::VersionInfoV1 {
                     protocol_version: m.protocol_version,
                     feature_schema_id: m.feature_schema_id,
-                    action_space_id: "oracle_keepmask_v1",
-                    ruleset_id: "swedish_scandinavian_v1",
+                    action_space_id: "oracle_keepmask_v2",
+                    ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
                 },
                 run_id: m.run_id.clone(),
                 git_hash: m.git_hash.clone(),
@@ -3977,7 +3963,6 @@ fn run_gate(
                 match_rate_overall: oracle_overall,
                 match_rate_mark: oracle_mark,
                 match_rate_reroll: oracle_reroll,
-                keepall_ignored: oracle_keepall_ignored,
                 r2_total: oracle_r2_total,
                 r2_matched: oracle_r2_matched,
                 r1_total: oracle_r1_total,
@@ -4015,7 +4000,6 @@ fn run_gate(
         it.oracle.match_rate_overall = Some(oracle_overall);
         it.oracle.match_rate_mark = Some(oracle_mark);
         it.oracle.match_rate_reroll = Some(oracle_reroll);
-        it.oracle.keepall_ignored = Some(oracle_keepall_ignored);
     }
     yz_logging::write_manifest_atomic(&run_json, &m)?;
 
@@ -4041,8 +4025,8 @@ mod cancel_tests {
                 created_ts_ms: yz_logging::now_ms(),
                 protocol_version: 2,
                 feature_schema_id: 1,
-                action_space_id: "oracle_keepmask_v1".to_string(),
-                ruleset_id: "swedish_scandinavian_v1".to_string(),
+                action_space_id: "oracle_keepmask_v2".to_string(),
+                ruleset_id: "swedish_scandinavian_mark_at_r3_v1".to_string(),
                 git_hash: None,
                 config_hash: None,
                 config_snapshot: None,
@@ -4073,7 +4057,6 @@ mod cancel_tests {
                 gate_oracle_match_rate_overall: None,
                 gate_oracle_match_rate_mark: None,
                 gate_oracle_match_rate_reroll: None,
-                gate_oracle_keepall_ignored: None,
                 controller_phase: None,
                 controller_status: None,
                 controller_last_ts_ms: None,

@@ -2154,8 +2154,8 @@ OPTIONS:
     let v = yz_logging::VersionInfoV1 {
         protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
         feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-        action_space_id: "oracle_keepmask_v1",
-        ruleset_id: "swedish_scandinavian_v1",
+        action_space_id: "oracle_keepmask_v2",
+        ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
     };
     let mut agg = Agg::new(
         manifest.run_id.clone(),
@@ -2498,8 +2498,8 @@ OPTIONS:
         created_ts_ms: yz_logging::now_ms(),
         protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
         feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-        action_space_id: "oracle_keepmask_v1".to_string(),
-        ruleset_id: "swedish_scandinavian_v1".to_string(),
+        action_space_id: "oracle_keepmask_v2".to_string(),
+        ruleset_id: "swedish_scandinavian_mark_at_r3_v1".to_string(),
         git_hash: yz_logging::try_git_hash(),
         config_hash: Some(config_hash),
         config_snapshot: None,
@@ -2530,7 +2530,6 @@ OPTIONS:
         gate_oracle_match_rate_overall: None,
         gate_oracle_match_rate_mark: None,
         gate_oracle_match_rate_reroll: None,
-        gate_oracle_keepall_ignored: None,
         controller_phase: None,
         controller_status: None,
         controller_last_ts_ms: None,
@@ -2558,7 +2557,6 @@ OPTIONS:
         manifest.gate_oracle_match_rate_overall = existing.gate_oracle_match_rate_overall;
         manifest.gate_oracle_match_rate_mark = existing.gate_oracle_match_rate_mark;
         manifest.gate_oracle_match_rate_reroll = existing.gate_oracle_match_rate_reroll;
-        manifest.gate_oracle_keepall_ignored = existing.gate_oracle_keepall_ignored;
         manifest.config_snapshot = existing.config_snapshot;
         manifest.config_snapshot_hash = existing.config_snapshot_hash;
         manifest.controller_phase = existing.controller_phase;
@@ -2635,8 +2633,8 @@ OPTIONS:
     let v = yz_logging::VersionInfoV1 {
         protocol_version: yz_infer::protocol::PROTOCOL_VERSION,
         feature_schema_id: yz_features::schema::FEATURE_SCHEMA_ID,
-        action_space_id: "oracle_keepmask_v1",
-        ruleset_id: "swedish_scandinavian_v1",
+        action_space_id: "oracle_keepmask_v2",
+        ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
     };
     let iter_log_path = logs_dir.join("iteration_stats.ndjson");
     let roots_log_path = logs_dir.join("mcts_roots.ndjson");
@@ -3551,7 +3549,6 @@ OPTIONS:
                 m.gate_oracle_match_rate_overall = Some(report.oracle_match_rate_overall);
                 m.gate_oracle_match_rate_mark = Some(report.oracle_match_rate_mark);
                 m.gate_oracle_match_rate_reroll = Some(report.oracle_match_rate_reroll);
-                m.gate_oracle_keepall_ignored = Some(report.oracle_keepall_ignored);
 
                 // E10.5S1: ensure run-local config snapshot exists (normalized).
                 if m.config_snapshot.is_none() || !run_dir.join("config.yaml").exists() {
@@ -3574,8 +3571,8 @@ OPTIONS:
                         v: yz_logging::VersionInfoV1 {
                             protocol_version: m.protocol_version,
                             feature_schema_id: m.feature_schema_id,
-                            action_space_id: "oracle_keepmask_v1",
-                            ruleset_id: "swedish_scandinavian_v1",
+                            action_space_id: "oracle_keepmask_v2",
+                            ruleset_id: "swedish_scandinavian_mark_at_r3_v1",
                         },
                         run_id: m.run_id.clone(),
                         git_hash: m.git_hash.clone(),
@@ -3596,7 +3593,6 @@ OPTIONS:
                         oracle_match_rate_overall: report.oracle_match_rate_overall,
                         oracle_match_rate_mark: report.oracle_match_rate_mark,
                         oracle_match_rate_reroll: report.oracle_match_rate_reroll,
-                        oracle_keepall_ignored: report.oracle_keepall_ignored,
                     };
                     let _ = w.write_event(&ev);
                     let _ = w.flush();
@@ -3633,7 +3629,6 @@ OPTIONS:
                 oracle_match_rate_overall: report.oracle_match_rate_overall,
                 oracle_match_rate_mark: report.oracle_match_rate_mark,
                 oracle_match_rate_reroll: report.oracle_match_rate_reroll,
-                oracle_keepall_ignored: report.oracle_keepall_ignored,
             },
         );
     }
@@ -3667,7 +3662,6 @@ struct GateReportJson {
     oracle_match_rate_overall: f64,
     oracle_match_rate_mark: f64,
     oracle_match_rate_reroll: f64,
-    oracle_keepall_ignored: u64,
 }
 
 fn write_gate_report_atomic(path: &PathBuf, report: &GateReportJson) -> std::io::Result<()> {

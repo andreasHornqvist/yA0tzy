@@ -572,8 +572,6 @@ struct OracleFixedSummaryNdjsonV1 {
     #[serde(default)]
     match_rate_reroll: Option<f64>,
     #[serde(default)]
-    keepall_ignored: Option<u64>,
-    #[serde(default)]
     r2_total: Option<u64>,
     #[serde(default)]
     r2_matched: Option<u64>,
@@ -615,8 +613,6 @@ struct GateOracleSummaryNdjsonV1 {
     #[allow(dead_code)]
     #[serde(default)]
     match_rate_reroll: Option<f64>,
-    #[serde(default)]
-    keepall_ignored: Option<u64>,
     #[serde(default)]
     r2_total: Option<u64>,
     #[serde(default)]
@@ -1143,7 +1139,6 @@ impl App {
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
             gate_oracle_match_rate_reroll: None,
-            gate_oracle_keepall_ignored: None,
             controller_phase: Some("idle".to_string()),
             controller_status: Some(format!(
                 "extended from {src_id} (continue at iter {cur}, total_iterations={new_total})"
@@ -6639,7 +6634,6 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     let mut left: Vec<Line> = Vec::new();
     const W_ITER: usize = 4;
     const W_TRM: usize = 24; // e.g. header "fixed_oracle (acc t/k/m)"
-    const W_KEEPALL: usize = 7;
 
     let fmt_trm = |a: Option<f64>, b: Option<f64>, c: Option<f64>| -> String {
         if a.is_none() && b.is_none() && c.is_none() {
@@ -6654,14 +6648,12 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
 
     left.push(Line::from(Span::styled(
         format!(
-            "  {:>W_ITER$} {:>W_TRM$} {:>W_TRM$} {:>W_KEEPALL$}",
+            "  {:>W_ITER$} {:>W_TRM$} {:>W_TRM$}",
             "iter",
             "gate_oracle (acc t/k/m)",
             "fixed_oracle (acc t/k/m)",
-            "keepall",
             W_ITER = W_ITER,
             W_TRM = W_TRM,
-            W_KEEPALL = W_KEEPALL
         ),
         Style::default().fg(Color::DarkGray),
     )));
@@ -6677,21 +6669,15 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         let fixed = fixed_row
             .map(|x| fmt_trm(x.match_rate_overall, x.match_rate_reroll, x.match_rate_mark))
             .unwrap_or_else(|| "-".to_string());
-        let keepall = fixed_row
-            .and_then(|x| x.keepall_ignored)
-            .map(|x| x.to_string())
-            .unwrap_or_else(|| "-".to_string());
 
         let marker = if it.idx == app.oracle_selected_iter { "▸" } else { " " };
         iter_rows.push(Line::from(format!(
-            "{marker} {:>W_ITER$} {:>W_TRM$} {:>W_TRM$} {:>W_KEEPALL$}",
+            "{marker} {:>W_ITER$} {:>W_TRM$} {:>W_TRM$}",
             it.idx,
             gate,
             fixed,
-            keepall,
             W_ITER = W_ITER,
             W_TRM = W_TRM,
-            W_KEEPALL = W_KEEPALL
         )));
     }
 
@@ -6745,7 +6731,6 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         let (
             header_line,
             match_rate_overall,
-            keepall_ignored,
             r2_total,
             r2_matched,
             r1_total,
@@ -6757,11 +6742,10 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             chosen_total,
             turn_total,
             turn_matched,
-        game_count,
+            game_count,
         ): (
             String,
             Option<f64>,
-            Option<u64>,
             Option<u64>,
             Option<u64>,
             Option<u64>,
@@ -6781,7 +6765,6 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
                 (
                     format!("fixed_set: {set_id}  n={ns}"),
                     v.match_rate_overall,
-                    v.keepall_ignored,
                     v.r2_total,
                     v.r2_matched,
                     v.r1_total,
@@ -6803,7 +6786,6 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
                     v.steps_total.unwrap_or(0)
                 ),
                 v.match_rate_overall,
-                v.keepall_ignored,
                 v.r2_total,
                 v.r2_matched,
                 v.r1_total,
@@ -6892,9 +6874,6 @@ fn draw_oracle(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             "{:<11} {:>16} {:>16}",
             "keep", keep_acc, keep_alloc
         )));
-        if let Some(x) = keepall_ignored {
-            mid.push(Line::from(format!("keepall_ignored: {x}")));
-        }
         mid.push(Line::from(""));
 
         let rate = |m: Option<u64>, t: Option<u64>| -> String {

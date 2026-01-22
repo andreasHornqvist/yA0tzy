@@ -77,7 +77,6 @@ pub struct OracleFixedReport {
     pub matched_mark: u64,
     pub total_reroll: u64,
     pub matched_reroll: u64,
-    pub keepall_ignored: u64,
     /// Bucketed by rerolls_left (2/1/0).
     pub total_by_r: [u64; 3],
     pub matched_by_r: [u64; 3],
@@ -130,12 +129,17 @@ fn connect_one_backend(
     Err(GateError::BadEndpoint(endpoint.to_string()))
 }
 
-fn should_ignore_oracle_action_v1(oa: yz_oracle::Action, rerolls_left: u8) -> bool {
-    matches!(oa, yz_oracle::Action::KeepMask { mask: 31 } if rerolls_left > 0)
-}
-
-fn oracle_action_to_core(oa: yz_oracle::Action) -> yz_core::Action {
+/// Convert oracle action to core action, mapping oracle's "mark at rerolls>0" to KeepMask(31).
+///
+/// The oracle returns Mark when keep-all is optimal because marking immediately is equivalent
+/// to keeping all dice and marking at the final roll. Under mark-only-at-roll-3 rules, we
+/// translate this to KeepMask(31) since Mark is illegal at rerolls_left > 0.
+fn oracle_action_to_az_action(oa: yz_oracle::Action, rerolls_left: u8) -> yz_core::Action {
     match oa {
+        yz_oracle::Action::Mark { cat } if rerolls_left > 0 => {
+            // Oracle's Mark at rerolls>0 means keep-all is optimal -> KeepMask(31)
+            yz_core::Action::KeepMask(31)
+        }
         yz_oracle::Action::Mark { cat } => yz_core::Action::Mark(cat),
         yz_oracle::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
     }
@@ -246,11 +250,7 @@ pub fn eval_fixed_oracle_set(
 
         let (oa, _ev) =
             oracle.best_action(st.avail_mask, st.upper_total_cap, st.dice_sorted, st.rerolls_left);
-        if should_ignore_oracle_action_v1(oa, st.rerolls_left) {
-            rep.keepall_ignored += 1;
-            continue;
-        }
-        let expected = oracle_action_to_core(oa);
+        let expected = oracle_action_to_az_action(oa, st.rerolls_left);
         let expected_canon = match expected {
             yz_core::Action::KeepMask(mask) => {
                 yz_core::Action::KeepMask(canonicalize_keepmask(st.dice_sorted, mask))
@@ -392,10 +392,14 @@ struct OracleDiagStep {
 }
 
 #[cfg(test)]
-fn should_ignore_oracle_action(a: oracle_mod::Action, rerolls_left: u8) -> bool {
-    match a {
-        oracle_mod::Action::KeepMask { mask } => mask == 31 && rerolls_left > 0,
-        oracle_mod::Action::Mark { .. } => false,
+fn oracle_action_to_az_action_test(oa: oracle_mod::Action, rerolls_left: u8) -> yz_core::Action {
+    match oa {
+        oracle_mod::Action::Mark { cat } if rerolls_left > 0 => {
+            // Oracle's Mark at rerolls>0 means keep-all is optimal -> KeepMask(31)
+            yz_core::Action::KeepMask(31)
+        }
+        oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
+        oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
     }
 }
 
@@ -889,7 +893,6 @@ pub struct GateReport {
     pub oracle_match_rate_overall: f64,
     pub oracle_match_rate_mark: f64,
     pub oracle_match_rate_reroll: f64,
-    pub oracle_keepall_ignored: u64,
     pub sprt: Option<SprtDiag>,
 }
 
@@ -1828,15 +1831,27 @@ gating:
     }
 
     #[test]
-    fn oracle_ignore_rule_keepall_is_enabled_only_when_rerolls_left_is_positive() {
-        assert!(should_ignore_oracle_action(
-            oracle_mod::Action::KeepMask { mask: 31 },
-            2
-        ));
-        assert!(!should_ignore_oracle_action(
-            oracle_mod::Action::KeepMask { mask: 31 },
-            0
-        ));
+    fn oracle_action_mapping_mark_at_rerolls_gt0_becomes_keepall() {
+        // Oracle's Mark at rerolls>0 should map to KeepMask(31)
+        let result = oracle_action_to_az_action_test(
+            oracle_mod::Action::Mark { cat: 5 },
+            2,
+        );
+        assert_eq!(result, yz_core::Action::KeepMask(31));
+
+        // Oracle's Mark at rerolls==0 stays as Mark
+        let result = oracle_action_to_az_action_test(
+            oracle_mod::Action::Mark { cat: 5 },
+            0,
+        );
+        assert_eq!(result, yz_core::Action::Mark(5));
+
+        // KeepMask is always passed through
+        let result = oracle_action_to_az_action_test(
+            oracle_mod::Action::KeepMask { mask: 15 },
+            2,
+        );
+        assert_eq!(result, yz_core::Action::KeepMask(15));
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -1847,7 +1862,6 @@ gating:
         matched_mark: u64,
         total_reroll: u64,
         matched_reroll: u64,
-        oracle_keepall_ignored: u64,
     }
 
     fn compute_oracle_diag_counts(steps: &[OracleDiagStep]) -> OracleDiagCounts {
@@ -1860,15 +1874,8 @@ gating:
                 s.dice_sorted,
                 s.rerolls_left,
             );
-            if should_ignore_oracle_action(oa, s.rerolls_left) {
-                c.oracle_keepall_ignored += 1;
-                continue;
-            }
 
-            let expected: yz_core::Action = match oa {
-                oracle_mod::Action::Mark { cat } => yz_core::Action::Mark(cat),
-                oracle_mod::Action::KeepMask { mask } => yz_core::Action::KeepMask(mask),
-            };
+            let expected = oracle_action_to_az_action_test(oa, s.rerolls_left);
             let is_match = expected == s.chosen_action;
 
             c.total += 1;
@@ -1906,7 +1913,6 @@ gating:
         }];
         let a = compute_oracle_diag_counts(&steps);
         let b = compute_oracle_diag_counts(&steps);
-        assert_eq!(a.oracle_keepall_ignored, b.oracle_keepall_ignored);
         assert_eq!(a.total, b.total);
         assert_eq!(a.matched, b.matched);
         assert_eq!(a.total_mark, b.total_mark);

@@ -95,7 +95,6 @@ pub struct RunManifestV1 {
     pub gate_oracle_match_rate_overall: Option<f64>,
     pub gate_oracle_match_rate_mark: Option<f64>,
     pub gate_oracle_match_rate_reroll: Option<f64>,
-    pub gate_oracle_keepall_ignored: Option<u64>,
 
     // Controller/TUI (optional).
     pub controller_phase: Option<String>, // "idle" | "selfplay" | "train" | "gate" | "done" | "error"
@@ -248,7 +247,6 @@ pub struct IterOracleSummaryV1 {
     pub match_rate_overall: Option<f64>,
     pub match_rate_mark: Option<f64>,
     pub match_rate_reroll: Option<f64>,
-    pub keepall_ignored: Option<u64>,
 }
 
 pub fn now_ms() -> u64 {
@@ -790,7 +788,6 @@ pub struct MetricsGateSummaryV1 {
     pub oracle_match_rate_overall: f64,
     pub oracle_match_rate_mark: f64,
     pub oracle_match_rate_reroll: f64,
-    pub oracle_keepall_ignored: u64,
 }
 
 /// Gate oracle diagnostics summary (computed from gate-worker oracle_diag logs).
@@ -811,7 +808,6 @@ pub struct MetricsGateOracleSummaryV1 {
     pub match_rate_overall: f64,
     pub match_rate_mark: f64,
     pub match_rate_reroll: f64,
-    pub keepall_ignored: u64,
 
     // Buckets by rerolls_left (2/1/0). Each is (total, matched).
     pub r2_total: u64,
@@ -852,7 +848,6 @@ pub struct MetricsOracleFixedSummaryV1 {
     pub match_rate_overall: f64,
     pub match_rate_mark: f64,
     pub match_rate_reroll: f64,
-    pub keepall_ignored: u64,
 
     // Buckets by rerolls_left (2/1/0). Each is (total, matched).
     pub r2_total: u64,
@@ -864,7 +859,7 @@ pub struct MetricsOracleFixedSummaryV1 {
 
     /// Per-action counts for the chosen action index (0..A-1).
     ///
-    /// Stored as vectors for schema stability across languages; expected length is 47 (oracle_keepmask_v1).
+    /// Stored as vectors for schema stability across languages; expected length is 47 (oracle_keepmask_v2).
     pub action_total: Vec<u64>,
     pub action_matched: Vec<u64>,
     pub chosen_total: Vec<u64>,
@@ -1222,7 +1217,6 @@ mod tests {
             oracle_match_rate_overall: 0.1,
             oracle_match_rate_mark: 0.2,
             oracle_match_rate_reroll: 0.3,
-            oracle_keepall_ignored: 4,
         };
         w.write_event(&ev).unwrap();
         w.flush().unwrap();
@@ -1232,7 +1226,6 @@ mod tests {
         assert_eq!(vals[0]["event"], "gate_summary");
         assert_eq!(vals[0]["games"], 2);
         assert_eq!(vals[0]["decision"], "promote");
-        assert_eq!(vals[0]["oracle_keepall_ignored"], 4);
     }
 
     #[test]
@@ -1278,7 +1271,6 @@ mod tests {
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
             gate_oracle_match_rate_reroll: None,
-            gate_oracle_keepall_ignored: None,
             controller_phase: None,
             controller_status: None,
             controller_last_ts_ms: None,
@@ -1343,7 +1335,6 @@ mod tests {
             gate_oracle_match_rate_overall: None,
             gate_oracle_match_rate_mark: None,
             gate_oracle_match_rate_reroll: None,
-            gate_oracle_keepall_ignored: None,
             controller_phase: None,
             controller_status: None,
             controller_last_ts_ms: None,
