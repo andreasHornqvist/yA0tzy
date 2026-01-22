@@ -112,11 +112,7 @@ pub enum ChanceMode {
 // multiple masks are semantically equivalent (keep the same multiset) but occupy different action
 // indices. This inflates branching and injects policy-target noise. We prune redundant KeepMasks
 // for all modes to keep self-play and eval/gating behavior identical while retaining the same
-// action space id (oracle_keepmask_v1).
-
-const KEEP_MASK_ACTIONS_MASK: u64 = (1u64 << 32) - 1; // actions 0..31
-const ALL_ACTIONS_MASK: u64 = (1u64 << 47) - 1; // actions 0..46
-const MARK_ACTIONS_MASK: u64 = ALL_ACTIONS_MASK ^ KEEP_MASK_ACTIONS_MASK; // actions 32..46
+// action space id (oracle_keepmask_v2).
 
 #[inline]
 fn dice_key(dice_sorted: [u8; 5]) -> u32 {
@@ -170,12 +166,14 @@ fn allowed_canonical_keepmask_bits(dice_sorted: [u8; 5]) -> u32 {
                         for e in d..=6 {
                             let dice = [a, b, c, d, e];
                             let mut bits: u32 = 0;
-                            // KeepMask(31) is illegal (dominated); only consider 0..=30.
+                            // KeepMask(0..30): only canonical masks are legal.
                             for mask in 0u8..=30u8 {
                                 if canonicalize_keepmask(dice, mask) == mask {
                                     bits |= 1u32 << (mask as u32);
                                 }
                             }
+                            // KeepMask(31) = "keep all" is always canonical (no duplicates matter).
+                            bits |= 1u32 << 31;
                             out.insert(dice_key(dice), bits);
                         }
                     }
@@ -188,6 +186,10 @@ fn allowed_canonical_keepmask_bits(dice_sorted: [u8; 5]) -> u32 {
 }
 
 /// Legal action mask, with KeepMask symmetry pruning applied when rerolls_left>0.
+///
+/// Mark-only-at-roll-3 rules:
+/// - rerolls_left == 0: only Mark actions (from base mask)
+/// - rerolls_left > 0: only canonical KeepMask(0..31) actions
 pub fn legal_action_mask_for_mode(state: &GameState, mode: ChanceMode) -> LegalMask {
     let _ = mode;
     let base = yz_core::legal_action_mask(
@@ -195,12 +197,12 @@ pub fn legal_action_mask_for_mode(state: &GameState, mode: ChanceMode) -> LegalM
         state.rerolls_left,
     );
     if state.rerolls_left == 0 {
+        // Roll 3: only Mark actions (base already has only marks)
         return base;
     }
+    // Rolls 1-2: only canonical KeepMask actions (base has all 0..31, prune to canonical)
     let allowed = allowed_canonical_keepmask_bits(state.dice_sorted) as u64;
-    let keep = (base & KEEP_MASK_ACTIONS_MASK) & allowed;
-    let marks = base & MARK_ACTIONS_MASK;
-    keep | marks
+    base & allowed
 }
 
 #[derive(Clone, Copy)]

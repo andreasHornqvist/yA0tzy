@@ -28,29 +28,68 @@ fn legality_enforcement_basic() {
     let err = apply_action(s, Action::KeepMask(0), &mut ctx).unwrap_err();
     assert!(matches!(err, ApplyError::IllegalAction { .. }));
 
-    // rerolls_left > 0 => KeepMask(31) illegal (dominated)
+    // rerolls_left > 0 => Mark illegal (mark-only-at-roll-3 rule)
     let s2 = initial_state(&mut ctx);
-    let err = apply_action(s2, Action::KeepMask(31), &mut ctx).unwrap_err();
+    assert!(s2.rerolls_left > 0);
+    let err = apply_action(s2, Action::Mark(0), &mut ctx).unwrap_err();
     assert!(matches!(err, ApplyError::IllegalAction { .. }));
 
-    // Marking an unavailable category is illegal.
-    let mut s3 = initial_state(&mut ctx);
+    // rerolls_left > 0 => KeepMask(31) is now legal (keep-all)
+    let s3 = initial_state(&mut ctx);
+    let result = apply_action(s3, Action::KeepMask(31), &mut ctx);
+    assert!(result.is_ok(), "KeepMask(31) should be legal at rerolls>0");
+    let s3_next = result.unwrap();
+    assert_eq!(s3_next.rerolls_left, 1); // rerolls decremented
+
+    // Marking an unavailable category is illegal at rerolls_left == 0.
+    let mut s4 = initial_state(&mut ctx);
+    s4.rerolls_left = 0; // must be at roll 3 to mark
     // Make cat 0 unavailable for current player.
-    s3.players[s3.player_to_move as usize].avail_mask &= !crate::avail_bit_for_cat(0);
-    let err = apply_action(s3, Action::Mark(0), &mut ctx).unwrap_err();
+    s4.players[s4.player_to_move as usize].avail_mask &= !crate::avail_bit_for_cat(0);
+    let err = apply_action(s4, Action::Mark(0), &mut ctx).unwrap_err();
     assert!(matches!(err, ApplyError::IllegalAction { .. }));
+}
+
+#[test]
+fn keepmask_31_keeps_dice_unchanged() {
+    // KeepMask(31) should advance to next roll stage without changing dice.
+    let mut ctx = TurnContext::new_deterministic(42);
+    let s = crate::GameState {
+        players: [
+            crate::PlayerState {
+                avail_mask: crate::FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+            crate::PlayerState {
+                avail_mask: crate::FULL_MASK,
+                upper_total_cap: 0,
+                total_score: 0,
+            },
+        ],
+        dice_sorted: [1, 2, 3, 4, 5],
+        rerolls_left: 2,
+        player_to_move: 0,
+    };
+
+    let next = apply_action(s, Action::KeepMask(31), &mut ctx).unwrap();
+    assert_eq!(next.dice_sorted, [1, 2, 3, 4, 5], "dice should not change on keep-all");
+    assert_eq!(next.rerolls_left, 1);
+    assert_eq!(next.player_to_move, 0);
 }
 
 #[test]
 fn deterministic_reproducibility_same_seed_same_actions() {
     let episode_seed = 999u64;
 
+    // Under mark-only-at-roll-3 rules: must do KeepMask to reach rerolls=0 before Mark.
     let actions = [
-        Action::KeepMask(0),
-        Action::KeepMask(0),
-        Action::Mark(0),
-        Action::KeepMask(0),
-        Action::Mark(1),
+        Action::KeepMask(0),  // rerolls 2→1
+        Action::KeepMask(0),  // rerolls 1→0
+        Action::Mark(0),      // mark (resets to rerolls=2 for next player)
+        Action::KeepMask(0),  // rerolls 2→1 (new player's turn)
+        Action::KeepMask(0),  // rerolls 1→0
+        Action::Mark(1),      // mark (legal at rerolls=0)
     ];
 
     let mut ctx1 = TurnContext::new_deterministic(episode_seed);

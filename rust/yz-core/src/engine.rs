@@ -154,7 +154,19 @@ pub fn apply_action(
 
     match action {
         Action::KeepMask(mask) => {
-            // Legal mask already enforced mask<=30 and rerolls_left>0.
+            // KeepMask(31) = "keep all": advance to next roll without changing dice.
+            if mask == 31 {
+                state.rerolls_left =
+                    state
+                        .rerolls_left
+                        .checked_sub(1)
+                        .ok_or(ApplyError::InvalidState {
+                            msg: "rerolls_left underflow on KeepMask(31)",
+                        })?;
+                return Ok(state);
+            }
+
+            // KeepMask(0..30): reroll non-kept dice.
             let old_rerolls_left = state.rerolls_left;
             let new_roll_idx =
                 3u8.checked_sub(old_rerolls_left)

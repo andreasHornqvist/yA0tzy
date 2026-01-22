@@ -71,30 +71,50 @@ mod tests {
     }
 
     #[test]
-    fn legal_mask_rerolls_positive_keepmask_0_30_legal_31_illegal() {
-        // All categories available.
+    fn legal_mask_rerolls_positive_only_keepmask_legal() {
+        // Mark-only-at-roll-3 rules: at rerolls > 0, only KeepMask(0..31) legal, Mark illegal.
         let avail_mask = (1u16 << 15) - 1;
         let legal = legal_action_mask(avail_mask, 2);
 
-        // KeepMask 0..=30 legal
-        for idx in 0..=30usize {
+        // KeepMask 0..=31 all legal
+        for idx in 0..=31usize {
             assert!(
                 ((legal >> idx) & 1) != 0,
                 "KeepMask idx {} should be legal at rerolls>0",
                 idx
             );
         }
-        // KeepMask 31 illegal
-        assert!(
-            ((legal >> 31) & 1) == 0,
-            "KeepMask(31) should be illegal when rerolls>0"
-        );
 
-        // Marks all legal
+        // Marks all illegal at rerolls > 0
         for idx in 32..A {
             assert!(
+                ((legal >> idx) & 1) == 0,
+                "Mark idx {} should be illegal at rerolls>0 (mark-only-at-roll-3)",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn legal_mask_rerolls_one_still_keepmask_only() {
+        // Verify rule applies at rerolls_left=1 as well.
+        let avail_mask = (1u16 << 15) - 1;
+        let legal = legal_action_mask(avail_mask, 1);
+
+        // KeepMask 0..=31 all legal
+        for idx in 0..=31usize {
+            assert!(
                 ((legal >> idx) & 1) != 0,
-                "Mark idx {} should be legal when category available",
+                "KeepMask idx {} should be legal at rerolls=1",
+                idx
+            );
+        }
+
+        // Marks all illegal
+        for idx in 32..A {
+            assert!(
+                ((legal >> idx) & 1) == 0,
+                "Mark idx {} should be illegal at rerolls=1",
                 idx
             );
         }

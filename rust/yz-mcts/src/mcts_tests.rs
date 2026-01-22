@@ -445,14 +445,19 @@ fn keepmask_canonicalization_no_duplicates_keeps_all_masks_in_rng() {
     };
 
     let legal = crate::legal_action_mask_for_mode(&s, ChanceMode::Rng { seed: 123 });
-    for mask in 0u8..=30u8 {
+    for mask in 0u8..=31u8 {
         assert!(
             ((legal >> (mask as u64)) & 1) != 0,
             "expected KeepMask({mask}) to be legal for no-duplicate dice"
         );
     }
-    // KeepMask(31) is always illegal (dominated).
-    assert!(((legal >> 31) & 1) == 0);
+    // Mark actions should be illegal at rerolls > 0 (mark-only-at-roll-3).
+    for idx in 32..47 {
+        assert!(
+            ((legal >> idx) & 1) == 0,
+            "expected Mark to be illegal at rerolls>0"
+        );
+    }
 }
 
 #[test]
