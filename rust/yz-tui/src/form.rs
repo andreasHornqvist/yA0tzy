@@ -59,6 +59,7 @@ pub enum FieldId {
     MctsVirtualLossMode,
     MctsVirtualLoss,
     MctsKatagoExpansionLock,
+    MctsChanceNodes,
     MctsChancePwEnabled,
     MctsChancePwC,
     MctsChancePwAlpha,
@@ -142,6 +143,7 @@ impl FieldId {
             | FieldId::MctsVirtualLossMode
             | FieldId::MctsVirtualLoss
             | FieldId::MctsKatagoExpansionLock
+            | FieldId::MctsChanceNodes
             | FieldId::MctsChancePwEnabled
             | FieldId::MctsChancePwC
             | FieldId::MctsChancePwAlpha
@@ -213,6 +215,7 @@ impl FieldId {
             FieldId::MctsVirtualLossMode => "mcts.virtual_loss_mode",
             FieldId::MctsVirtualLoss => "mcts.virtual_loss",
             FieldId::MctsKatagoExpansionLock => "mcts.katago.expansion_lock",
+            FieldId::MctsChanceNodes => "mcts.chance_nodes",
             FieldId::MctsChancePwEnabled => "mcts.chance_pw.enabled",
             FieldId::MctsChancePwC => "mcts.chance_pw.c",
             FieldId::MctsChancePwAlpha => "mcts.chance_pw.alpha",
@@ -336,6 +339,7 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::MctsVirtualLossMode,
     FieldId::MctsVirtualLoss,
     FieldId::MctsKatagoExpansionLock,
+    FieldId::MctsChanceNodes,
     FieldId::MctsChancePwEnabled,
     FieldId::MctsChancePwC,
     FieldId::MctsChancePwAlpha,

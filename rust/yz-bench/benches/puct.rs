@@ -37,7 +37,7 @@ fn bench_puct_select(c: &mut Criterion) {
         virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
-        explicit_keepmask_chance: false,
+        chance_nodes: false,
         chance_pw_enabled: false,
         chance_pw_c: 2.0,
         chance_pw_alpha: 0.6,

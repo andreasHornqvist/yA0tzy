@@ -195,6 +195,12 @@ pub struct MctsConfig {
     #[serde(default = "default_virtual_loss")]
     pub virtual_loss: f32,
 
+    /// If true, enable explicit chance nodes for rerolls (Story S1).
+    ///
+    /// YAML key: `mcts.chance_nodes` (alias: `explicit_keepmask_chance`).
+    #[serde(default, alias = "explicit_keepmask_chance")]
+    pub chance_nodes: bool,
+
     /// KataGo-inspired parallel search knobs.
     ///
     /// This is intentionally optional/extendable without breaking existing configs.
@@ -567,6 +573,7 @@ impl Default for Config {
                 temperature_schedule: TemperatureSchedule::default(),
                 virtual_loss_mode: default_virtual_loss_mode(),
                 virtual_loss: default_virtual_loss(),
+                chance_nodes: false,
                 katago: MctsKatagoConfig::default(),
                 chance_pw: MctsChancePwConfig::default(),
             },

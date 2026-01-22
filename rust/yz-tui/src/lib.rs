@@ -3261,6 +3261,9 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
         FieldId::MctsKatagoExpansionLock => {
             app.cfg.mcts.katago.expansion_lock = !app.cfg.mcts.katago.expansion_lock;
         }
+        FieldId::MctsChanceNodes => {
+            app.cfg.mcts.chance_nodes = !app.cfg.mcts.chance_nodes;
+        }
         FieldId::MctsChancePwEnabled => {
             app.cfg.mcts.chance_pw.enabled = !app.cfg.mcts.chance_pw.enabled;
         }
@@ -3537,6 +3540,15 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 _ => Err("expansion_lock must be true|false".to_string()),
             }
         }
+        FieldId::MctsChanceNodes => {
+            let b = match buf.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => true,
+                "false" | "0" | "no" | "n" => false,
+                _ => return Err("mcts.chance_nodes must be true|false".to_string()),
+            };
+            cfg.mcts.chance_nodes = b;
+            Ok(())
+        }
         FieldId::MctsChancePwEnabled => {
             let b = match buf.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "y" => true,
@@ -3808,6 +3820,7 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::MctsVirtualLossMode => cfg.mcts.virtual_loss_mode.clone(),
         FieldId::MctsVirtualLoss => format!("{:.3}", cfg.mcts.virtual_loss),
         FieldId::MctsKatagoExpansionLock => cfg.mcts.katago.expansion_lock.to_string(),
+        FieldId::MctsChanceNodes => cfg.mcts.chance_nodes.to_string(),
         FieldId::MctsChancePwEnabled => cfg.mcts.chance_pw.enabled.to_string(),
         FieldId::MctsChancePwC => format!("{:.4}", cfg.mcts.chance_pw.c),
         FieldId::MctsChancePwAlpha => format!("{:.4}", cfg.mcts.chance_pw.alpha),
@@ -3894,6 +3907,10 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
         FieldId::MctsVirtualLoss => {
             let inc = if step == StepSize::Large { 1.0 } else { 0.1 };
             next.mcts.virtual_loss = (next.mcts.virtual_loss as f64 + d * inc).max(0.0) as f32;
+            true
+        }
+        FieldId::MctsChanceNodes => {
+            next.mcts.chance_nodes = !next.mcts.chance_nodes;
             true
         }
         FieldId::MctsChancePwEnabled => {

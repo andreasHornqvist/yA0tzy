@@ -228,8 +228,8 @@ pub struct MctsConfig {
     pub virtual_loss: f32,
     /// If true, avoid selecting in-flight reserved edges when any non-pending legal edge exists.
     pub expansion_lock: bool,
-    /// If true, model KeepMask rerolls as Decision→AfterState→Chance sampling (Story S1).
-    pub explicit_keepmask_chance: bool,
+    /// If true, enable explicit chance nodes for rerolls (Story S1).
+    pub chance_nodes: bool,
 
     /// If true, apply progressive widening at chance nodes (Story S2).
     pub chance_pw_enabled: bool,
@@ -263,7 +263,7 @@ impl Default for MctsConfig {
             virtual_loss_mode: VirtualLossMode::QPenalty,
             virtual_loss: 1.0,
             expansion_lock: false,
-            explicit_keepmask_chance: false,
+            chance_nodes: false,
             chance_pw_enabled: false,
             chance_pw_c: 2.0,
             chance_pw_alpha: 0.6,
@@ -687,7 +687,7 @@ impl Mcts {
             let action = index_to_action(a_idx as u8);
 
             // Story S1: if enabled and action is KeepMask, factor as Decision->Chance->Decision.
-            if self.cfg.explicit_keepmask_chance {
+            if self.cfg.chance_nodes {
                 if let yz_core::Action::KeepMask(mask) = action {
                     let as_ = afterstate_from_keepmask(&state, mask);
 

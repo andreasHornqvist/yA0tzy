@@ -64,6 +64,9 @@ class InferenceConfig(BaseModel):
 class MctsConfig(BaseModel):
     """MCTS algorithm configuration."""
 
+    # Allow backward-compatible keys in YAML.
+    model_config = {"populate_by_name": True}
+
     class ChancePwConfig(BaseModel):
         """Chance-node progressive widening knobs (Story S2)."""
 
@@ -129,6 +132,11 @@ class MctsConfig(BaseModel):
     virtual_loss: float = Field(
         default=1.0,
         description="Virtual loss magnitude (used when virtual_loss_mode != off).",
+    )
+    chance_nodes: bool = Field(
+        default=False,
+        validation_alias="explicit_keepmask_chance",
+        description="If true, enable explicit chance nodes for rerolls (Story S1).",
     )
     chance_pw: ChancePwConfig = Field(
         default_factory=ChancePwConfig,

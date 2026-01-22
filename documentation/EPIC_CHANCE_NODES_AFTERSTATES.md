@@ -76,7 +76,7 @@ Introduce explicit chance nodes keyed by afterstate for KeepMask decisions:
 
 **Implementation status**
 
-- Implemented in `yz-mcts` behind `MctsConfig.explicit_keepmask_chance` (default: `false`).
+- Implemented in `yz-mcts` behind `MctsConfig.chance_nodes` (default: `false`).
 - Instrumentation counters are exposed via `SearchStats`:
   - `chance_nodes_created`, `chance_visits`, `chance_children_created`, `chance_k_hist`.
 
