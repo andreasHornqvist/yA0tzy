@@ -7,6 +7,7 @@
 //! - Arena-backed node storage
 
 pub mod arena;
+pub mod afterstate;
 pub mod infer;
 pub mod infer_client;
 pub mod mcts;

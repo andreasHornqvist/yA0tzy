@@ -1,6 +1,10 @@
 //! Core PUCT MCTS (single-threaded) with stochastic transitions via `yz-core` engine.
 
 use crate::arena::Arena;
+use crate::afterstate::{
+    afterstate_from_keepmask, apply_roll_hist_to_afterstate, pack_outcome_key, sample_roll_hist,
+    OutcomeHistKey,
+};
 use crate::infer::Inference;
 use crate::infer_client::InferBackend;
 use crate::node::{Node, NodeId};
@@ -224,6 +228,8 @@ pub struct MctsConfig {
     pub virtual_loss: f32,
     /// If true, avoid selecting in-flight reserved edges when any non-pending legal edge exists.
     pub expansion_lock: bool,
+    /// If true, model KeepMask rerolls as Decision→AfterState→Chance sampling (Story S1).
+    pub explicit_keepmask_chance: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +254,7 @@ impl Default for MctsConfig {
             virtual_loss_mode: VirtualLossMode::QPenalty,
             virtual_loss: 1.0,
             expansion_lock: false,
+            explicit_keepmask_chance: false,
         }
     }
 }
@@ -265,6 +272,11 @@ pub struct SearchStats {
     pub fallbacks: u32,
     pub pending_count_max: usize,
     pub pending_collisions: u32,
+    pub chance_nodes_created: u32,
+    pub chance_visits: u32,
+    pub chance_children_created: u32,
+    /// Histogram of k_to_roll (0..=5) observed at chance visits.
+    pub chance_k_hist: [u32; 6],
 }
 
 pub struct SearchResult {
@@ -288,7 +300,7 @@ struct PendingEvalClient {
     ticket: yz_infer::Ticket,
     leaf_node: NodeId,
     leaf_state: GameState,
-    path: Vec<(NodeId, usize, u8, u8)>,
+    path: Vec<PathEdge>,
 }
 
 /// Incremental, non-blocking driver for one MCTS search (PRD E7S1).
@@ -317,15 +329,30 @@ pub struct SearchDriver {
     leaf_eval_submitted: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PathEdge {
+    Decision {
+        node_id: NodeId,
+        a_idx: usize,
+        parent_to_play: u8,
+        child_to_play: u8,
+    },
+    Chance {
+        node_id: NodeId,
+        parent_to_play: u8,
+        child_to_play: u8,
+    },
+}
+
 struct PendingEval {
     leaf_node: NodeId,
     leaf_state: GameState,
-    path: Vec<(NodeId, usize, u8, u8)>,
+    path: Vec<PathEdge>,
 }
 
 enum LeafSelection {
     Terminal {
-        path: Vec<(NodeId, usize, u8, u8)>,
+        path: Vec<PathEdge>,
         z: f32,
     },
     Pending(PendingEval),
@@ -334,8 +361,15 @@ enum LeafSelection {
 pub struct Mcts {
     cfg: MctsConfig,
     arena: Arena,
-    // Child mapping per parent: (parent_node_id, action_idx, state_key(child_state)) -> child_node_id.
+    // Realized decision children (legacy implicit stochastic transitions + Mark transitions).
+    // Key: (parent_decision_node_id, action_idx, state_key(child_state)) -> child_decision_node_id
     children: FxHashMap<(NodeId, u8, StateKey), NodeId>,
+    // For explicit chance nodes (Story S1): Decision(KeepMask) -> Chance(afterstate).
+    // Key: (parent_decision_node_id, keepmask_action_idx) -> chance_node_id
+    keep_to_chance: FxHashMap<(NodeId, u8), NodeId>,
+    // For explicit chance nodes (Story S1): Chance(afterstate) -> Decision(outcome).
+    // Key: (chance_node_id, outcome_hist_key) -> child_decision_node_id
+    chance_children: FxHashMap<(NodeId, OutcomeHistKey), NodeId>,
     stats: SearchStats,
     // If true, we force the returned root `pi` to uniform-over-legal as a guardrail.
     force_uniform_root_pi: bool,
@@ -367,6 +401,8 @@ impl Mcts {
             cfg,
             arena: Arena::new(),
             children: FxHashMap::default(),
+            keep_to_chance: FxHashMap::default(),
+            chance_children: FxHashMap::default(),
             stats: SearchStats::default(),
             force_uniform_root_pi: false,
         })
@@ -387,7 +423,7 @@ impl Mcts {
         self.stats = SearchStats::default();
         self.force_uniform_root_pi = false;
 
-        let root_id = self.arena.push(Node::new(root_state.player_to_move));
+        let root_id = self.arena.push(Node::new_decision(root_state.player_to_move));
         self.stats.node_count = self.arena.len();
 
         // Expand root immediately (priors available for PUCT).
@@ -444,7 +480,7 @@ impl Mcts {
                     }
                 };
 
-                match self.select_leaf_and_reserve(root_id, root_state, &mut ctx, mode) {
+                match self.select_leaf_and_reserve(root_id, root_state, &mut ctx, mode, sel_counter) {
                     LeafSelection::Terminal { path, z } => {
                         self.backup_with_virtual_loss(&path, z);
                         completed += 1;
@@ -533,7 +569,7 @@ impl Mcts {
         self.stats = SearchStats::default();
         self.force_uniform_root_pi = false;
 
-        let root_id = self.arena.push(Node::new(root_state.player_to_move));
+        let root_id = self.arena.push(Node::new_decision(root_state.player_to_move));
         self.stats.node_count = self.arena.len();
 
         let legal = legal_action_mask_for_mode(&root_state, mode);
@@ -563,6 +599,8 @@ impl Mcts {
     fn reset_tree(&mut self) {
         self.arena = Arena::new();
         self.children.clear();
+        self.keep_to_chance.clear();
+        self.chance_children.clear();
     }
 
     fn select_leaf_and_reserve(
@@ -571,8 +609,9 @@ impl Mcts {
         root_state: GameState,
         ctx: &mut yz_core::TurnContext,
         mode: ChanceMode,
+        sel_counter: u64,
     ) -> LeafSelection {
-        let mut path: Vec<(NodeId, usize, u8, u8)> = Vec::new();
+        let mut path: Vec<PathEdge> = Vec::new();
         let mut node_id = root_id;
         let mut state = root_state;
 
@@ -600,6 +639,81 @@ impl Mcts {
             let legal = legal_action_mask_for_mode(&state, mode);
             let a_idx = self.select_action(node_id, legal, mode) as usize;
             let action = index_to_action(a_idx as u8);
+
+            // Story S1: if enabled and action is KeepMask, factor as Decision->Chance->Decision.
+            if self.cfg.explicit_keepmask_chance {
+                if let yz_core::Action::KeepMask(mask) = action {
+                    let as_ = afterstate_from_keepmask(&state, mask);
+
+                    let chance_id = if let Some(&cid) = self.keep_to_chance.get(&(node_id, a_idx as u8))
+                    {
+                        cid
+                    } else {
+                        let cid = self.arena.push(Node::new_chance(as_));
+                        self.keep_to_chance.insert((node_id, a_idx as u8), cid);
+                        self.stats.node_count = self.arena.len();
+                        self.stats.chance_nodes_created += 1;
+                        cid
+                    };
+
+                    path.push(PathEdge::Decision {
+                        node_id,
+                        a_idx,
+                        parent_to_play: node_to_play,
+                        child_to_play: as_.player_to_act,
+                    });
+
+                    // Deterministic per-visit PRNG seed (stochastic but repeatable).
+                    let base_seed = match mode {
+                        ChanceMode::Rng { seed } => seed,
+                        ChanceMode::Deterministic { episode_seed } => episode_seed,
+                    };
+                    // Mix with selection counter + node id (stable; independent of wall-clock).
+                    let mixed_seed = {
+                        let x = base_seed
+                            ^ sel_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            ^ (chance_id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        // splitmix64 diffusion
+                        let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                        z ^ (z >> 31)
+                    };
+
+                    let mut rng = ChaCha8Rng::seed_from_u64(mixed_seed);
+                    let roll_hist = sample_roll_hist(as_.k_to_roll, &mut rng);
+                    let outcome_key = pack_outcome_key(roll_hist);
+
+                    self.stats.chance_visits += 1;
+                    self.stats.chance_k_hist[as_.k_to_roll as usize] += 1;
+
+                    let next_state = apply_roll_hist_to_afterstate(&as_, roll_hist);
+
+                    let child_id = if let Some(&cid) =
+                        self.chance_children.get(&(chance_id, outcome_key))
+                    {
+                        cid
+                    } else {
+                        let cid = self.arena.push(Node::new_decision(next_state.player_to_move));
+                        self.chance_children.insert((chance_id, outcome_key), cid);
+                        self.stats.node_count = self.arena.len();
+                        self.stats.chance_children_created += 1;
+                        cid
+                    };
+
+                    path.push(PathEdge::Chance {
+                        node_id: chance_id,
+                        parent_to_play: as_.player_to_act,
+                        child_to_play: next_state.player_to_move,
+                    });
+
+                    node_id = child_id;
+                    state = next_state;
+                    continue;
+                }
+            }
+
+            // Legacy (implicit stochastic transitions) and Mark transitions.
             let next_state = match yz_core::apply_action(state, action, ctx) {
                 Ok(s2) => s2,
                 Err(_) => {
@@ -614,26 +728,34 @@ impl Mcts {
             {
                 cid
             } else {
-                let cid = self.arena.push(Node::new(next_state.player_to_move));
+                let cid = self.arena.push(Node::new_decision(next_state.player_to_move));
                 self.children.insert((node_id, a_idx as u8, child_key), cid);
                 self.stats.node_count = self.arena.len();
                 cid
             };
 
-            path.push((node_id, a_idx, node_to_play, next_state.player_to_move));
+            path.push(PathEdge::Decision {
+                node_id,
+                a_idx,
+                parent_to_play: node_to_play,
+                child_to_play: next_state.player_to_move,
+            });
             node_id = child_id;
             state = next_state;
         }
     }
 
-    fn apply_virtual_loss_path(&mut self, path: &[(NodeId, usize, u8, u8)]) {
+    fn apply_virtual_loss_path(&mut self, path: &[PathEdge]) {
         if self.cfg.virtual_loss_mode == VirtualLossMode::Off {
             return;
         }
         if path.is_empty() {
             return;
         }
-        for &(node_id, a_idx, _pt, _ct) in path {
+        for e in path {
+            let PathEdge::Decision { node_id, a_idx, .. } = *e else {
+                continue; // no reservations on chance edges
+            };
             let n = self.arena.get_mut(node_id);
             n.vl_n[a_idx] = n.vl_n[a_idx].saturating_add(1);
             if self.cfg.virtual_loss_mode == VirtualLossMode::QPenalty {
@@ -643,11 +765,14 @@ impl Mcts {
         }
     }
 
-    fn remove_virtual_loss_path(&mut self, path: &[(NodeId, usize, u8, u8)]) {
+    fn remove_virtual_loss_path(&mut self, path: &[PathEdge]) {
         if self.cfg.virtual_loss_mode == VirtualLossMode::Off {
             return;
         }
-        for &(node_id, a_idx, _pt, _ct) in path.iter().rev() {
+        for e in path.iter().rev() {
+            let PathEdge::Decision { node_id, a_idx, .. } = *e else {
+                continue; // no reservations on chance edges
+            };
             let n = self.arena.get_mut(node_id);
             n.vl_n[a_idx] = n.vl_n[a_idx].saturating_sub(1);
             if self.cfg.virtual_loss_mode == VirtualLossMode::QPenalty {
@@ -657,7 +782,7 @@ impl Mcts {
         }
     }
 
-    fn backup_with_virtual_loss(&mut self, path: &[(NodeId, usize, u8, u8)], v_leaf: f32) {
+    fn backup_with_virtual_loss(&mut self, path: &[PathEdge], v_leaf: f32) {
         if self.cfg.virtual_loss_mode != VirtualLossMode::Off {
             self.remove_virtual_loss_path(path);
         }
@@ -690,7 +815,7 @@ impl Mcts {
         &mut self,
         leaf_node: NodeId,
         leaf_state: &GameState,
-        path: &[(NodeId, usize, u8, u8)],
+        path: &[PathEdge],
         mode: ChanceMode,
         resp: yz_infer::protocol::InferResponseV1,
     ) {
@@ -796,22 +921,46 @@ impl Mcts {
         best_a
     }
 
-    fn backup(&mut self, path: &[(NodeId, usize, u8, u8)], mut v_leaf: f32) {
+    fn backup(&mut self, path: &[PathEdge], mut v_leaf: f32) {
         // v_leaf is from POV of the leaf state's player_to_move.
-        for &(node_id, a_idx, parent_to_play, child_to_play) in path.iter().rev() {
-            // Express value in the parent node's POV.
-            let mut v_parent = v_leaf;
-            if parent_to_play != child_to_play {
-                v_parent = -v_parent;
+        for e in path.iter().rev() {
+            match *e {
+                PathEdge::Decision {
+                    node_id,
+                    a_idx,
+                    parent_to_play,
+                    child_to_play,
+                } => {
+                    // Express value in the parent node's POV.
+                    let mut v_parent = v_leaf;
+                    if parent_to_play != child_to_play {
+                        v_parent = -v_parent;
+                    }
+
+                    let n = self.arena.get_mut(node_id);
+                    n.n[a_idx] += 1;
+                    n.w[a_idx] += v_parent;
+                    n.n_sum += 1;
+
+                    // For next step up, the leaf value POV becomes the parent's POV at this edge.
+                    v_leaf = v_parent;
+                }
+                PathEdge::Chance {
+                    node_id,
+                    parent_to_play,
+                    child_to_play,
+                } => {
+                    let mut v_parent = v_leaf;
+                    if parent_to_play != child_to_play {
+                        v_parent = -v_parent;
+                    }
+                    let n = self.arena.get_mut(node_id);
+                    n.chance_visits += 1;
+                    n.chance_w_sum += v_parent;
+                    // For next step up, POV becomes chance-node POV.
+                    v_leaf = v_parent;
+                }
             }
-
-            let n = self.arena.get_mut(node_id);
-            n.n[a_idx] += 1;
-            n.w[a_idx] += v_parent;
-            n.n_sum += 1;
-
-            // For next step up, the leaf value POV becomes the parent's POV at this edge.
-            v_leaf = v_parent;
         }
     }
 
@@ -1077,6 +1226,7 @@ impl SearchDriver {
                     self.root_state,
                     &mut ctx,
                     self.mode,
+                    self.sel_counter,
                 ) {
                     LeafSelection::Terminal { path, z } => {
                         mcts.backup_with_virtual_loss(&path, z);

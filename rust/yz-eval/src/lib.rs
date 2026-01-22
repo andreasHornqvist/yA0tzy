@@ -1820,6 +1820,7 @@ gating:
                     virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
                     virtual_loss: 1.0,
                     expansion_lock: false,
+                    explicit_keepmask_chance: false,
                 },
             },
         )

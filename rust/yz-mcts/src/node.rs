@@ -1,11 +1,19 @@
 //! Node and edge statistics for PUCT.
 
+use crate::afterstate::AfterState;
 use yz_core::A;
 
 pub type NodeId = u32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Decision,
+    Chance,
+}
+
 #[derive(Clone)]
 pub struct Node {
+    pub kind: NodeKind,
     pub to_play: u8,
     pub is_terminal: bool,
     pub terminal_z: f32,
@@ -21,11 +29,18 @@ pub struct Node {
     pub vl_n: [u32; A],
     pub vl_w: [f32; A],
     pub vl_sum: u32,
+
+    // Chance-node aggregate stats (used only when kind==Chance).
+    pub chance_visits: u32,
+    pub chance_w_sum: f32,
+    pub chance_num_children: u16,
+    pub afterstate: Option<AfterState>,
 }
 
 impl Node {
-    pub fn new(to_play: u8) -> Self {
+    pub fn new_decision(to_play: u8) -> Self {
         Self {
+            kind: NodeKind::Decision,
             to_play,
             is_terminal: false,
             terminal_z: 0.0,
@@ -37,6 +52,32 @@ impl Node {
             vl_n: [0u32; A],
             vl_w: [0.0f32; A],
             vl_sum: 0,
+            chance_visits: 0,
+            chance_w_sum: 0.0,
+            chance_num_children: 0,
+            afterstate: None,
+        }
+    }
+
+    pub fn new_chance(afterstate: AfterState) -> Self {
+        Self {
+            kind: NodeKind::Chance,
+            to_play: afterstate.player_to_act,
+            is_terminal: false,
+            terminal_z: 0.0,
+            // Chance nodes are never NN-expanded.
+            is_expanded: true,
+            n: [0u32; A],
+            w: [0.0f32; A],
+            p: [0.0f32; A],
+            n_sum: 0,
+            vl_n: [0u32; A],
+            vl_w: [0.0f32; A],
+            vl_sum: 0,
+            chance_visits: 0,
+            chance_w_sum: 0.0,
+            chance_num_children: 0,
+            afterstate: Some(afterstate),
         }
     }
 

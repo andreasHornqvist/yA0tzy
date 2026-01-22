@@ -5,7 +5,7 @@ use yz_mcts::{bench_select_action_v1, ChanceMode, MctsConfig};
 
 fn make_node() -> yz_mcts::node::Node {
     // Use a fully initialized node with representative priors and visit stats.
-    let mut n = yz_mcts::node::Node::new(0);
+    let mut n = yz_mcts::node::Node::new_decision(0);
     n.is_expanded = true;
     n.n_sum = 10_000;
     for a in 0..A {
@@ -37,6 +37,7 @@ fn bench_puct_select(c: &mut Criterion) {
         virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     };
     let node = make_node();
     let legal = make_legal();

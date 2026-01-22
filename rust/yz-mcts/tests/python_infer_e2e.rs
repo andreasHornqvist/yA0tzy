@@ -144,6 +144,7 @@ fn python_infer_server_real_checkpoint_e2e_opt_in() {
         virtual_loss_mode: yz_mcts::VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     })
     .unwrap();
 

@@ -874,6 +874,7 @@ USAGE:
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
         expansion_lock: cfg.mcts.katago.expansion_lock,
+        explicit_keepmask_chance: false,
     };
 
     if cancel_file.exists() {
@@ -1610,6 +1611,7 @@ OPTIONS:
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
         expansion_lock: cfg.mcts.katago.expansion_lock,
+        explicit_keepmask_chance: false,
     };
 
     // Replay output is worker-local to avoid collisions.
@@ -2611,6 +2613,7 @@ OPTIONS:
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
         expansion_lock: cfg.mcts.katago.expansion_lock,
+        explicit_keepmask_chance: false,
     };
 
     let mut tasks = Vec::new();
@@ -2910,6 +2913,7 @@ OPTIONS:
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
         expansion_lock: cfg.mcts.katago.expansion_lock,
+        explicit_keepmask_chance: false,
     };
 
     // Progress + output directories (mirrors selfplay-worker layout, but under logs_gate_workers).
@@ -3432,6 +3436,7 @@ OPTIONS:
         },
         virtual_loss: cfg.mcts.virtual_loss.max(0.0),
         expansion_lock: cfg.mcts.katago.expansion_lock,
+        explicit_keepmask_chance: false,
     };
 
     let report = yz_eval::gate(

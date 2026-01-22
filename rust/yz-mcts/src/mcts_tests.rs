@@ -1,8 +1,13 @@
 use crate::{
     apply_temperature, ChanceMode, InferBackend, Mcts, MctsConfig, UniformInference, VirtualLossMode,
 };
+use crate::afterstate::{
+    afterstate_from_keepmask, apply_roll_hist_to_afterstate, dice_sorted_from_hist, pack_outcome_key,
+    sample_roll_hist, unpack_outcome_key,
+};
 use yz_core::{GameState, LegalMask, PlayerState, A, FULL_MASK};
 use yz_infer::ClientOptions;
+use rand::SeedableRng;
 
 struct BadInference;
 
@@ -68,6 +73,7 @@ fn pi_is_valid_distribution_and_respects_legality() {
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     })
     .unwrap();
     let infer = UniformInference;
@@ -125,6 +131,7 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     })
     .unwrap();
 
@@ -160,6 +167,47 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
 }
 
 #[test]
+fn outcome_hist_key_roundtrips_and_dice_materializes_sorted() {
+    let h = [2u8, 0, 1, 0, 2, 0]; // sum=5
+    let key = pack_outcome_key(h);
+    let back = unpack_outcome_key(key);
+    assert_eq!(back, h);
+
+    let dice = dice_sorted_from_hist(h);
+    assert!(dice.windows(2).all(|w| w[0] <= w[1]));
+    assert_eq!(dice.len(), 5);
+    for &d in &dice {
+        assert!((1..=6).contains(&d));
+    }
+}
+
+#[test]
+fn afterstate_and_roll_hist_produce_valid_next_state() {
+    let mut ctx = yz_core::TurnContext::new_deterministic(7);
+    let s = yz_core::initial_state(&mut ctx);
+    assert!(s.rerolls_left > 0);
+
+    // Pick a mask and build afterstate (canonicalization is internal).
+    let as_ = afterstate_from_keepmask(&s, 0);
+    assert_eq!(as_.player_to_act, s.player_to_move);
+    assert_eq!(as_.rerolls_left, s.rerolls_left - 1);
+    assert!(as_.k_to_roll <= 5);
+
+    // Deterministic sampling under fixed seed
+    let mut rng1 = rand_chacha::ChaCha8Rng::seed_from_u64(123);
+    let mut rng2 = rand_chacha::ChaCha8Rng::seed_from_u64(123);
+    let r1 = sample_roll_hist(as_.k_to_roll, &mut rng1);
+    let r2 = sample_roll_hist(as_.k_to_roll, &mut rng2);
+    assert_eq!(r1, r2);
+
+    let s2 = apply_roll_hist_to_afterstate(&as_, r1);
+    assert_eq!(s2.players, s.players);
+    assert_eq!(s2.player_to_move, s.player_to_move);
+    assert_eq!(s2.rerolls_left, s.rerolls_left - 1);
+    assert!(s2.dice_sorted.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
 fn eval_mode_is_deterministic() {
     let cfg = MctsConfig {
         c_puct: 1.5,
@@ -171,6 +219,7 @@ fn eval_mode_is_deterministic() {
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     };
     let infer = UniformInference;
 
@@ -195,6 +244,52 @@ fn eval_mode_is_deterministic() {
 }
 
 #[test]
+fn explicit_keepmask_chance_is_deterministic_and_records_stats() {
+    let cfg = MctsConfig {
+        c_puct: 1.5,
+        simulations_mark: 16,
+        simulations_reroll: 16,
+        dirichlet_alpha: 0.3,
+        dirichlet_epsilon: 0.0,
+        max_inflight: 4,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
+        virtual_loss: 1.0,
+        expansion_lock: false,
+        explicit_keepmask_chance: true,
+    };
+    let infer = UniformInference;
+
+    let mut ctx = yz_core::TurnContext::new_deterministic(999);
+    let root = yz_core::initial_state(&mut ctx);
+    assert!(root.rerolls_left > 0, "test requires KeepMask phase");
+
+    let mut m1 = Mcts::new(cfg).unwrap();
+    let r1 = m1.run_search(
+        root,
+        ChanceMode::Deterministic { episode_seed: 999 },
+        &infer,
+    );
+    let s1 = r1.stats.clone();
+
+    let mut m2 = Mcts::new(cfg).unwrap();
+    let r2 = m2.run_search(
+        root,
+        ChanceMode::Deterministic { episode_seed: 999 },
+        &infer,
+    );
+
+    assert_eq!(r1.pi, r2.pi);
+    assert!(s1.chance_nodes_created > 0, "expected chance nodes to be created");
+    assert!(s1.chance_visits > 0, "expected chance nodes to be visited");
+    assert!(
+        s1.chance_children_created > 0,
+        "expected some outcome children to be created"
+    );
+    let hist_sum: u32 = s1.chance_k_hist.iter().sum();
+    assert_eq!(hist_sum, s1.chance_visits);
+}
+
+#[test]
 fn root_noise_is_only_applied_in_rng_mode() {
     let cfg = MctsConfig {
         c_puct: 1.5,
@@ -206,6 +301,7 @@ fn root_noise_is_only_applied_in_rng_mode() {
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     };
     let infer = UniformInference;
 
@@ -243,6 +339,7 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     };
     let infer = UniformInference;
 
@@ -284,6 +381,7 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
         virtual_loss_mode: VirtualLossMode::QPenalty,
         virtual_loss: 1.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     };
 
     let mut ctx = yz_core::TurnContext::new_deterministic(42);
@@ -389,6 +487,7 @@ fn virtual_loss_modes_affect_pending_collision_tracking() {
         virtual_loss_mode: VirtualLossMode::Off,
         virtual_loss: 0.0,
         expansion_lock: false,
+        explicit_keepmask_chance: false,
     };
     let cfg_nv = MctsConfig {
         virtual_loss_mode: VirtualLossMode::NVirtualOnly,
