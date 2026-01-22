@@ -59,6 +59,10 @@ pub enum FieldId {
     MctsVirtualLossMode,
     MctsVirtualLoss,
     MctsKatagoExpansionLock,
+    MctsChancePwEnabled,
+    MctsChancePwC,
+    MctsChancePwAlpha,
+    MctsChancePwMaxChildren,
 
     // selfplay
     SelfplayGamesPerIteration,
@@ -137,7 +141,11 @@ impl FieldId {
             | FieldId::MctsTempCutoffTurn
             | FieldId::MctsVirtualLossMode
             | FieldId::MctsVirtualLoss
-            | FieldId::MctsKatagoExpansionLock => Section::Search,
+            | FieldId::MctsKatagoExpansionLock
+            | FieldId::MctsChancePwEnabled
+            | FieldId::MctsChancePwC
+            | FieldId::MctsChancePwAlpha
+            | FieldId::MctsChancePwMaxChildren => Section::Search,
 
             // Pipeline: Controller + Self-play + Training + Gating
             FieldId::ControllerTotalIterations
@@ -205,6 +213,10 @@ impl FieldId {
             FieldId::MctsVirtualLossMode => "mcts.virtual_loss_mode",
             FieldId::MctsVirtualLoss => "mcts.virtual_loss",
             FieldId::MctsKatagoExpansionLock => "mcts.katago.expansion_lock",
+            FieldId::MctsChancePwEnabled => "mcts.chance_pw.enabled",
+            FieldId::MctsChancePwC => "mcts.chance_pw.c",
+            FieldId::MctsChancePwAlpha => "mcts.chance_pw.alpha",
+            FieldId::MctsChancePwMaxChildren => "mcts.chance_pw.max_children",
 
             FieldId::SelfplayGamesPerIteration => "selfplay.games_per_iteration",
             FieldId::SelfplayWorkers => "selfplay.workers",
@@ -324,6 +336,10 @@ pub const ALL_FIELDS: &[FieldId] = &[
     FieldId::MctsVirtualLossMode,
     FieldId::MctsVirtualLoss,
     FieldId::MctsKatagoExpansionLock,
+    FieldId::MctsChancePwEnabled,
+    FieldId::MctsChancePwC,
+    FieldId::MctsChancePwAlpha,
+    FieldId::MctsChancePwMaxChildren,
 
     // Pipeline
     FieldId::ControllerTotalIterations,

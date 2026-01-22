@@ -230,6 +230,15 @@ pub struct MctsConfig {
     pub expansion_lock: bool,
     /// If true, model KeepMask rerolls as Decision→AfterState→Chance sampling (Story S1).
     pub explicit_keepmask_chance: bool,
+
+    /// If true, apply progressive widening at chance nodes (Story S2).
+    pub chance_pw_enabled: bool,
+    /// Power-law scale for K(N)=ceil(c*N^alpha).
+    pub chance_pw_c: f32,
+    /// Power-law exponent for K(N)=ceil(c*N^alpha).
+    pub chance_pw_alpha: f32,
+    /// Hard cap on number of stored chance outcome children.
+    pub chance_pw_max_children: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +264,10 @@ impl Default for MctsConfig {
             virtual_loss: 1.0,
             expansion_lock: false,
             explicit_keepmask_chance: false,
+            chance_pw_enabled: false,
+            chance_pw_c: 2.0,
+            chance_pw_alpha: 0.6,
+            chance_pw_max_children: 64,
         }
     }
 }
@@ -275,6 +288,8 @@ pub struct SearchStats {
     pub chance_nodes_created: u32,
     pub chance_visits: u32,
     pub chance_children_created: u32,
+    pub chance_transient_evals: u32,
+    pub chance_pw_blocked: u32,
     /// Histogram of k_to_roll (0..=5) observed at chance visits.
     pub chance_k_hist: [u32; 6],
 }
@@ -298,7 +313,7 @@ pub struct SearchResult {
 #[derive(Debug)]
 struct PendingEvalClient {
     ticket: yz_infer::Ticket,
-    leaf_node: NodeId,
+    leaf_node: Option<NodeId>,
     leaf_state: GameState,
     path: Vec<PathEdge>,
 }
@@ -345,7 +360,7 @@ enum PathEdge {
 }
 
 struct PendingEval {
-    leaf_node: NodeId,
+    leaf_node: Option<NodeId>,
     leaf_state: GameState,
     path: Vec<PathEdge>,
 }
@@ -355,7 +370,8 @@ enum LeafSelection {
         path: Vec<PathEdge>,
         z: f32,
     },
-    Pending(PendingEval),
+    PendingStored(PendingEval),
+    PendingTransient(PendingEval),
 }
 
 pub struct Mcts {
@@ -376,6 +392,17 @@ pub struct Mcts {
 }
 
 impl Mcts {
+    fn chance_pw_k_allowed(&self, chance_visits_before: u32) -> u16 {
+        // K(N)=min(max_children, ceil(c * N^alpha)), where N is effective visits.
+        // We use N = chance_visits_before + 1 for the current traversal.
+        let n_eff = (chance_visits_before as f32) + 1.0;
+        let raw = (self.cfg.chance_pw_c * n_eff.powf(self.cfg.chance_pw_alpha)).ceil();
+        let k = raw
+            .max(1.0)
+            .min(self.cfg.chance_pw_max_children as f32) as u16;
+        k
+    }
+
     pub fn new(cfg: MctsConfig) -> Result<Self, MctsError> {
         if !(cfg.c_puct.is_finite() && cfg.c_puct > 0.0) {
             return Err(MctsError::InvalidConfig {
@@ -396,6 +423,23 @@ impl Mcts {
             return Err(MctsError::InvalidConfig {
                 msg: "virtual_loss must be finite and >= 0",
             });
+        }
+        if cfg.chance_pw_enabled {
+            if !(cfg.chance_pw_c.is_finite() && cfg.chance_pw_c > 0.0) {
+                return Err(MctsError::InvalidConfig {
+                    msg: "chance_pw_c must be finite and > 0 when chance_pw_enabled",
+                });
+            }
+            if !(cfg.chance_pw_alpha.is_finite() && cfg.chance_pw_alpha > 0.0 && cfg.chance_pw_alpha < 1.0) {
+                return Err(MctsError::InvalidConfig {
+                    msg: "chance_pw_alpha must be in (0,1) when chance_pw_enabled",
+                });
+            }
+            if cfg.chance_pw_max_children < 1 {
+                return Err(MctsError::InvalidConfig {
+                    msg: "chance_pw_max_children must be >= 1 when chance_pw_enabled",
+                });
+            }
         }
         Ok(Self {
             cfg,
@@ -480,12 +524,13 @@ impl Mcts {
                     }
                 };
 
-                match self.select_leaf_and_reserve(root_id, root_state, &mut ctx, mode, sel_counter) {
+                match self.select_leaf_and_reserve(root_id, root_state, &mut ctx, mode, sel_counter)
+                {
                     LeafSelection::Terminal { path, z } => {
                         self.backup_with_virtual_loss(&path, z);
                         completed += 1;
                     }
-                    LeafSelection::Pending(pe) => {
+                    LeafSelection::PendingStored(pe) | LeafSelection::PendingTransient(pe) => {
                         pending.push_back(pe);
                         self.stats.pending_count_max =
                             self.stats.pending_count_max.max(pending.len());
@@ -497,13 +542,14 @@ impl Mcts {
                 let legal = legal_action_mask_for_mode(&pe.leaf_state, mode);
                 let features = yz_features::encode_state_v1(&pe.leaf_state);
                 let (logits, v) = infer.eval(&features, legal);
-                let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
-
-                let leaf = self.arena.get_mut(pe.leaf_node);
-                if !leaf.is_expanded {
-                    leaf.is_expanded = true;
-                    leaf.to_play = pe.leaf_state.player_to_move;
-                    leaf.p = priors;
+                if let Some(leaf_node) = pe.leaf_node {
+                    let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
+                    let leaf = self.arena.get_mut(leaf_node);
+                    if !leaf.is_expanded {
+                        leaf.is_expanded = true;
+                        leaf.to_play = pe.leaf_state.player_to_move;
+                        leaf.p = priors;
+                    }
                 }
                 self.backup_with_virtual_loss(&pe.path, v.clamp(-1.0, 1.0));
                 completed += 1;
@@ -629,11 +675,11 @@ impl Mcts {
                 // Leaf node to be evaluated.
                 self.apply_virtual_loss_path(&path);
                 let pe = PendingEval {
-                    leaf_node: node_id,
+                    leaf_node: Some(node_id),
                     leaf_state: state,
                     path,
                 };
-                return LeafSelection::Pending(pe);
+                return LeafSelection::PendingStored(pe);
             }
 
             let legal = legal_action_mask_for_mode(&state, mode);
@@ -684,21 +730,44 @@ impl Mcts {
                     let roll_hist = sample_roll_hist(as_.k_to_roll, &mut rng);
                     let outcome_key = pack_outcome_key(roll_hist);
 
-                    self.stats.chance_visits += 1;
-                    self.stats.chance_k_hist[as_.k_to_roll as usize] += 1;
-
                     let next_state = apply_roll_hist_to_afterstate(&as_, roll_hist);
 
-                    let child_id = if let Some(&cid) =
-                        self.chance_children.get(&(chance_id, outcome_key))
-                    {
-                        cid
+                    // Chance-node stats are updated on backup; here we only decide whether to
+                    // store a new outcome child (progressive widening) or do a transient eval.
+                    let is_new_outcome = !self
+                        .chance_children
+                        .contains_key(&(chance_id, outcome_key));
+                    let allow_store_new = if !self.cfg.chance_pw_enabled {
+                        true
+                    } else if !is_new_outcome {
+                        true
                     } else {
-                        let cid = self.arena.push(Node::new_decision(next_state.player_to_move));
-                        self.chance_children.insert((chance_id, outcome_key), cid);
-                        self.stats.node_count = self.arena.len();
-                        self.stats.chance_children_created += 1;
-                        cid
+                        let chance_node = self.arena.get(chance_id);
+                        let k_allowed = self.chance_pw_k_allowed(chance_node.chance_visits);
+                        chance_node.chance_num_children < k_allowed
+                    };
+
+                    if !allow_store_new && is_new_outcome {
+                        self.stats.chance_pw_blocked += 1;
+                    }
+
+                    let child_id = if allow_store_new {
+                        if let Some(&cid) = self.chance_children.get(&(chance_id, outcome_key)) {
+                            cid
+                        } else {
+                            let cid =
+                                self.arena.push(Node::new_decision(next_state.player_to_move));
+                            self.chance_children.insert((chance_id, outcome_key), cid);
+                            // Track bounded growth on the node itself.
+                            self.arena.get_mut(chance_id).chance_num_children =
+                                self.arena.get(chance_id).chance_num_children.saturating_add(1);
+                            self.stats.node_count = self.arena.len();
+                            self.stats.chance_children_created += 1;
+                            cid
+                        }
+                    } else {
+                        // Transient: no stored child.
+                        0
                     };
 
                     path.push(PathEdge::Chance {
@@ -706,6 +775,23 @@ impl Mcts {
                         parent_to_play: as_.player_to_act,
                         child_to_play: next_state.player_to_move,
                     });
+
+                    // If transient, we stop here and request a leaf eval for next_state.
+                    if !allow_store_new && is_new_outcome {
+                        self.stats.chance_transient_evals += 1;
+                        if yz_core::is_terminal(&next_state) {
+                            let z =
+                                yz_core::terminal_z_from_player_to_move(&next_state).unwrap_or(0.0);
+                            self.apply_virtual_loss_path(&path);
+                            return LeafSelection::Terminal { path, z };
+                        }
+                        self.apply_virtual_loss_path(&path);
+                        return LeafSelection::PendingTransient(PendingEval {
+                            leaf_node: None,
+                            leaf_state: next_state,
+                            path,
+                        });
+                    }
 
                     node_id = child_id;
                     state = next_state;
@@ -813,22 +899,24 @@ impl Mcts {
 
     fn apply_infer_response(
         &mut self,
-        leaf_node: NodeId,
+        leaf_node: Option<NodeId>,
         leaf_state: &GameState,
         path: &[PathEdge],
         mode: ChanceMode,
         resp: yz_infer::protocol::InferResponseV1,
     ) {
-        let legal = legal_action_mask_for_mode(leaf_state, mode);
-        let logits = vec_logits_to_array(&resp.policy_logits);
-        let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
+        if let Some(leaf_node) = leaf_node {
+            let legal = legal_action_mask_for_mode(leaf_state, mode);
+            let logits = vec_logits_to_array(&resp.policy_logits);
+            let (priors, _used_fallback) = masked_softmax(&logits, legal, &mut self.stats);
 
-        let leaf = self.arena.get_mut(leaf_node);
-        if !leaf.is_expanded {
-            leaf.is_expanded = true;
-            leaf.to_play = leaf_state.player_to_move;
-            leaf.p = priors;
-            self.stats.expansions += 1;
+            let leaf = self.arena.get_mut(leaf_node);
+            if !leaf.is_expanded {
+                leaf.is_expanded = true;
+                leaf.to_play = leaf_state.player_to_move;
+                leaf.p = priors;
+                self.stats.expansions += 1;
+            }
         }
 
         self.backup_with_virtual_loss(path, resp.value.clamp(-1.0, 1.0));
@@ -953,6 +1041,10 @@ impl Mcts {
                     let mut v_parent = v_leaf;
                     if parent_to_play != child_to_play {
                         v_parent = -v_parent;
+                    }
+                    self.stats.chance_visits += 1;
+                    if let Some(as_) = self.arena.get(node_id).afterstate {
+                        self.stats.chance_k_hist[as_.k_to_roll as usize] += 1;
                     }
                     let n = self.arena.get_mut(node_id);
                     n.chance_visits += 1;
@@ -1238,7 +1330,7 @@ impl SearchDriver {
                         }
                         // endregion agent log
                     }
-                    LeafSelection::Pending(pe) => {
+                    LeafSelection::PendingStored(pe) | LeafSelection::PendingTransient(pe) => {
                         let legal = legal_action_mask_for_mode(&pe.leaf_state, self.mode);
                         let ticket = match backend.submit(&pe.leaf_state, legal) {
                             Ok(t) => t,

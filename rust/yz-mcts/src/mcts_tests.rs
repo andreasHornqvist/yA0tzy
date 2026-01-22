@@ -74,6 +74,10 @@ fn pi_is_valid_distribution_and_respects_legality() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     })
     .unwrap();
     let infer = UniformInference;
@@ -132,6 +136,10 @@ fn async_leaf_pipeline_works_end_to_end_via_inference_client() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     })
     .unwrap();
 
@@ -220,6 +228,10 @@ fn eval_mode_is_deterministic() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     };
     let infer = UniformInference;
 
@@ -256,6 +268,10 @@ fn explicit_keepmask_chance_is_deterministic_and_records_stats() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: true,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     };
     let infer = UniformInference;
 
@@ -290,6 +306,53 @@ fn explicit_keepmask_chance_is_deterministic_and_records_stats() {
 }
 
 #[test]
+fn chance_progressive_widening_caps_children_and_uses_transient_eval() {
+    let cfg = MctsConfig {
+        c_puct: 1.5,
+        simulations_mark: 64,
+        simulations_reroll: 256,
+        dirichlet_alpha: 0.3,
+        dirichlet_epsilon: 0.0,
+        max_inflight: 8,
+        virtual_loss_mode: VirtualLossMode::QPenalty,
+        virtual_loss: 1.0,
+        expansion_lock: false,
+        explicit_keepmask_chance: true,
+        chance_pw_enabled: true,
+        // Keep widening tight so we force transient evals quickly.
+        chance_pw_c: 1.0,
+        chance_pw_alpha: 0.5,
+        chance_pw_max_children: 4,
+    };
+    let infer = UniformInference;
+
+    let mut ctx = yz_core::TurnContext::new_deterministic(2026);
+    let root = yz_core::initial_state(&mut ctx);
+    assert!(root.rerolls_left > 0, "test requires KeepMask phase");
+
+    let mut m = Mcts::new(cfg).unwrap();
+    let r = m.run_search(
+        root,
+        ChanceMode::Deterministic { episode_seed: 2026 },
+        &infer,
+    );
+
+    // With a small max_children, we should see transient evals and blocked stores.
+    assert!(r.stats.chance_nodes_created > 0);
+    assert!(r.stats.chance_children_created > 0);
+    assert!(
+        r.stats.chance_children_created
+            <= (cfg.chance_pw_max_children as u32) * r.stats.chance_nodes_created.max(1),
+        "expected stored chance outcome children to be capped per chance node"
+    );
+    assert!(
+        r.stats.chance_transient_evals > 0,
+        "expected transient evals when widening blocks storing"
+    );
+    assert!(r.stats.chance_pw_blocked > 0);
+}
+
+#[test]
 fn root_noise_is_only_applied_in_rng_mode() {
     let cfg = MctsConfig {
         c_puct: 1.5,
@@ -302,6 +365,10 @@ fn root_noise_is_only_applied_in_rng_mode() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     };
     let infer = UniformInference;
 
@@ -340,6 +407,10 @@ fn temperature_changes_exec_distribution_but_not_pi_target() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     };
     let infer = UniformInference;
 
@@ -382,6 +453,10 @@ fn fallback_can_be_triggered_and_returns_uniform_pi() {
         virtual_loss: 1.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     };
 
     let mut ctx = yz_core::TurnContext::new_deterministic(42);
@@ -488,6 +563,10 @@ fn virtual_loss_modes_affect_pending_collision_tracking() {
         virtual_loss: 0.0,
         expansion_lock: false,
         explicit_keepmask_chance: false,
+        chance_pw_enabled: false,
+        chance_pw_c: 2.0,
+        chance_pw_alpha: 0.6,
+        chance_pw_max_children: 64,
     };
     let cfg_nv = MctsConfig {
         virtual_loss_mode: VirtualLossMode::NVirtualOnly,

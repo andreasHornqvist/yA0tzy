@@ -190,6 +190,14 @@ cargo run -p yz-cli --bin yz -- bench e2e -- --seconds 5 --parallel 2 --simulati
 
 Prevent chance nodes from accumulating too many stored outcome children (especially when `k_to_roll=5` → 252 hist outcomes).
 
+**Implementation status**
+
+- Implemented in `yz-mcts` behind `MctsConfig.chance_pw_*` (default: disabled).
+- Exposed via shared YAML + Python validation + TUI config editor under `mcts.chance_pw.*`.
+- Unbiased behavior is supported: when widening blocks storing a sampled-new outcome, MCTS does a **transient (non-stored) leaf eval + backup**.
+- Instrumentation counters are exposed via `SearchStats`:
+  - `chance_transient_evals`, `chance_pw_blocked` (in addition to S1 counters).
+
 **Scope / implementation details**
 
 - Add per-chance-node counters:

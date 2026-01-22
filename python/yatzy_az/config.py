@@ -64,6 +64,28 @@ class InferenceConfig(BaseModel):
 class MctsConfig(BaseModel):
     """MCTS algorithm configuration."""
 
+    class ChancePwConfig(BaseModel):
+        """Chance-node progressive widening knobs (Story S2)."""
+
+        enabled: bool = Field(
+            default=False,
+            description=(
+                "If true, cap stored outcome children at chance nodes using a widening schedule."
+            ),
+        )
+        c: float = Field(
+            default=2.0,
+            description="Power-law scale for K(N)=ceil(c * N^alpha).",
+        )
+        alpha: float = Field(
+            default=0.6,
+            description="Power-law exponent for K(N)=ceil(c * N^alpha), typically in (0,1).",
+        )
+        max_children: int = Field(
+            default=64,
+            description="Hard cap on number of stored chance outcome children.",
+        )
+
     class KataGoConfig(BaseModel):
         """KataGo-inspired parallel search knobs."""
 
@@ -107,6 +129,10 @@ class MctsConfig(BaseModel):
     virtual_loss: float = Field(
         default=1.0,
         description="Virtual loss magnitude (used when virtual_loss_mode != off).",
+    )
+    chance_pw: ChancePwConfig = Field(
+        default_factory=ChancePwConfig,
+        description="Chance-node progressive widening knobs (Story S2).",
     )
     katago: KataGoConfig = Field(
         default_factory=KataGoConfig,

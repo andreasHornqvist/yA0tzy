@@ -1821,6 +1821,10 @@ gating:
                     virtual_loss: 1.0,
                     expansion_lock: false,
                     explicit_keepmask_chance: false,
+                    chance_pw_enabled: false,
+                    chance_pw_c: 2.0,
+                    chance_pw_alpha: 0.6,
+                    chance_pw_max_children: 64,
                 },
             },
         )

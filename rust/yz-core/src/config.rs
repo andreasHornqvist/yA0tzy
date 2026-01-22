@@ -200,6 +200,51 @@ pub struct MctsConfig {
     /// This is intentionally optional/extendable without breaking existing configs.
     #[serde(default)]
     pub katago: MctsKatagoConfig,
+
+    /// Chance-node progressive widening knobs (Story S2).
+    ///
+    /// Nested under `mcts.chance_pw.*` in YAML.
+    #[serde(default)]
+    pub chance_pw: MctsChancePwConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MctsChancePwConfig {
+    /// If true, cap stored outcome children at chance nodes using a widening schedule.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Power-law scale for K(N)=ceil(c * N^alpha).
+    #[serde(default = "default_chance_pw_c")]
+    pub c: f32,
+    /// Power-law exponent for K(N)=ceil(c * N^alpha), typically in (0,1).
+    #[serde(default = "default_chance_pw_alpha")]
+    pub alpha: f32,
+    /// Hard cap on number of stored chance outcome children.
+    #[serde(default = "default_chance_pw_max_children")]
+    pub max_children: u16,
+}
+
+impl Default for MctsChancePwConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            c: default_chance_pw_c(),
+            alpha: default_chance_pw_alpha(),
+            max_children: default_chance_pw_max_children(),
+        }
+    }
+}
+
+fn default_chance_pw_c() -> f32 {
+    2.0
+}
+
+fn default_chance_pw_alpha() -> f32 {
+    0.6
+}
+
+fn default_chance_pw_max_children() -> u16 {
+    64
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -523,6 +568,7 @@ impl Default for Config {
                 virtual_loss_mode: default_virtual_loss_mode(),
                 virtual_loss: default_virtual_loss(),
                 katago: MctsKatagoConfig::default(),
+                chance_pw: MctsChancePwConfig::default(),
             },
             selfplay: SelfplayConfig {
                 games_per_iteration: 50,

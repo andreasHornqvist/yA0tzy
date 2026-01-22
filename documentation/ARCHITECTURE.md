@@ -175,6 +175,7 @@ See `.github/workflows/ci.yml` for details.
 `yz-mcts` supports two equivalent ways to model dice randomness in search:
 - **Implicit stochastic transitions** (baseline): dice are sampled as part of `step(s,a)` and children are keyed by the realized next state.
 - **Explicit chance nodes for rerolls** (Story S1): KeepMask decisions transition to a `Chance(AfterState)` node, which samples a dice outcome and then transitions to the next decision state. (Fresh-roll chance after `Mark` remains implicit unless/ until extended.)
+- **Progressive widening at chance nodes** (Story S2): chance nodes can cap stored outcome children via a power-law schedule and use transient (non-stored) leaf evaluations to keep sampling unbiased. Configured via `mcts.chance_pw.*`.
 
 For gating/eval, played-game dice remain deterministic via `yz-core`’s event-keyed chance stream; search randomness can still be made reproducible via seeded PRNG.
 

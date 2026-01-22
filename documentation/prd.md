@@ -290,6 +290,10 @@ We keep the **fixed action space `A=47`**. There are two supported ways to model
   * `Decision --KeepMask--> Chance(AfterState) --sample_roll--> Decision`
 * Afterstates are deterministic “post-decision, pre-roll” states (kept dice histogram + `k_to_roll` + scorecards + same player).
 * Chance node traversal samples dice outcomes from the true distribution and backs up values as usual; chance nodes accumulate Monte Carlo samples.
+* To keep chance branching bounded while preserving unbiased sampling, chance nodes may use **progressive widening** (Story S2):
+  * cap stored outcome children with \(K(N)=\min(\text{max\_children}, \lceil c N^{\alpha}\rceil)\)
+  * when capped, still sample from the true distribution and do **transient leaf evaluation + backup** without storing a child
+  * configured via `mcts.chance_pw.{enabled,c,alpha,max_children}`
 * `Mark` transitions remain direct decision→decision in S1 (fresh-roll chance after Mark is still implicit; explicit fresh-roll chance is a later story).
 * Determinism:
   * played games in gating/eval remain deterministic via the event-keyed stream (engine-level)

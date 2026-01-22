@@ -3261,6 +3261,9 @@ fn toggle_or_cycle(app: &mut App, field: FieldId) {
         FieldId::MctsKatagoExpansionLock => {
             app.cfg.mcts.katago.expansion_lock = !app.cfg.mcts.katago.expansion_lock;
         }
+        FieldId::MctsChancePwEnabled => {
+            app.cfg.mcts.chance_pw.enabled = !app.cfg.mcts.chance_pw.enabled;
+        }
         FieldId::TrainingMode => {
             // Toggle between epochs mode (steps_per_iteration=None) and steps mode
             if app.cfg.training.steps_per_iteration.is_some() {
@@ -3534,6 +3537,28 @@ fn apply_input_to_cfg(cfg: &mut yz_core::Config, field: FieldId, buf: &str) -> R
                 _ => Err("expansion_lock must be true|false".to_string()),
             }
         }
+        FieldId::MctsChancePwEnabled => {
+            let b = match buf.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => true,
+                "false" | "0" | "no" | "n" => false,
+                _ => return Err("mcts.chance_pw.enabled must be true|false".to_string()),
+            };
+            cfg.mcts.chance_pw.enabled = b;
+            Ok(())
+        }
+        FieldId::MctsChancePwC => {
+            cfg.mcts.chance_pw.c = buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
+            Ok(())
+        }
+        FieldId::MctsChancePwAlpha => {
+            cfg.mcts.chance_pw.alpha = buf.parse::<f32>().map_err(|_| "invalid f32".to_string())?;
+            Ok(())
+        }
+        FieldId::MctsChancePwMaxChildren => {
+            cfg.mcts.chance_pw.max_children =
+                buf.parse::<u16>().map_err(|_| "invalid u16".to_string())?;
+            Ok(())
+        }
 
         FieldId::SelfplayGamesPerIteration => {
             cfg.selfplay.games_per_iteration =
@@ -3783,6 +3808,10 @@ fn field_value_string(cfg: &yz_core::Config, field: FieldId) -> String {
         FieldId::MctsVirtualLossMode => cfg.mcts.virtual_loss_mode.clone(),
         FieldId::MctsVirtualLoss => format!("{:.3}", cfg.mcts.virtual_loss),
         FieldId::MctsKatagoExpansionLock => cfg.mcts.katago.expansion_lock.to_string(),
+        FieldId::MctsChancePwEnabled => cfg.mcts.chance_pw.enabled.to_string(),
+        FieldId::MctsChancePwC => format!("{:.4}", cfg.mcts.chance_pw.c),
+        FieldId::MctsChancePwAlpha => format!("{:.4}", cfg.mcts.chance_pw.alpha),
+        FieldId::MctsChancePwMaxChildren => cfg.mcts.chance_pw.max_children.to_string(),
 
         FieldId::SelfplayGamesPerIteration => cfg.selfplay.games_per_iteration.to_string(),
         FieldId::SelfplayWorkers => cfg.selfplay.workers.to_string(),
@@ -3865,6 +3894,28 @@ fn step_field(app: &mut App, field: FieldId, dir: i32, step: StepSize) {
         FieldId::MctsVirtualLoss => {
             let inc = if step == StepSize::Large { 1.0 } else { 0.1 };
             next.mcts.virtual_loss = (next.mcts.virtual_loss as f64 + d * inc).max(0.0) as f32;
+            true
+        }
+        FieldId::MctsChancePwEnabled => {
+            next.mcts.chance_pw.enabled = !next.mcts.chance_pw.enabled;
+            true
+        }
+        FieldId::MctsChancePwC => {
+            let inc = if step == StepSize::Large { 1.0 } else { 0.1 };
+            next.mcts.chance_pw.c = (next.mcts.chance_pw.c as f64 + d * inc).max(0.0) as f32;
+            true
+        }
+        FieldId::MctsChancePwAlpha => {
+            let inc = if step == StepSize::Large { 0.1 } else { 0.01 };
+            next.mcts.chance_pw.alpha =
+                (next.mcts.chance_pw.alpha as f64 + d * inc).max(0.0) as f32;
+            true
+        }
+        FieldId::MctsChancePwMaxChildren => {
+            let inc: i32 = if step == StepSize::Large { 8 } else { 1 };
+            let cur = next.mcts.chance_pw.max_children as i32;
+            let v = (cur + dir.signum() * inc).max(1) as u16;
+            next.mcts.chance_pw.max_children = v;
             true
         }
         FieldId::InferMaxBatch => {

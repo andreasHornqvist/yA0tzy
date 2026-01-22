@@ -72,6 +72,19 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if !(cfg.mcts.virtual_loss.is_finite() && cfg.mcts.virtual_loss >= 0.0) {
         return Err("mcts.virtual_loss must be finite and >= 0".to_string());
     }
+    // mcts.chance_pw
+    if cfg.mcts.chance_pw.enabled {
+        if !(cfg.mcts.chance_pw.c.is_finite() && cfg.mcts.chance_pw.c > 0.0) {
+            return Err("mcts.chance_pw.c must be finite and > 0 when enabled".to_string());
+        }
+        let a = cfg.mcts.chance_pw.alpha;
+        if !(a.is_finite() && a > 0.0 && a < 1.0) {
+            return Err("mcts.chance_pw.alpha must be in (0,1) when enabled".to_string());
+        }
+        if cfg.mcts.chance_pw.max_children < 1 {
+            return Err("mcts.chance_pw.max_children must be >= 1 when enabled".to_string());
+        }
+    }
 
     // model
     match cfg.model.kind.as_str() {
